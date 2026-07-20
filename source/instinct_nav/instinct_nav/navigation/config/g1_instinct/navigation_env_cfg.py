@@ -1,0 +1,202 @@
+from __future__ import annotations
+
+import copy
+import os
+from pathlib import Path
+
+from isaaclab.managers import ObservationGroupCfg as ObsGroup
+from isaaclab.managers import ObservationTermCfg as ObsTerm
+from isaaclab.managers import SceneEntityCfg
+from isaaclab.sensors import RayCasterCfg, patterns
+from isaaclab.utils import configclass
+from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
+
+import instinct_nav.navigation.mdp as nav_mdp
+from instinct_nav.navigation.navigation_env_cfg import NavigationEnvCfg
+
+import instinctlab.tasks.parkour.mdp as instinct_mdp
+from instinctlab.assets.unitree_g1 import beyondmimic_action_scale
+from instinctlab.tasks.parkour.config.g1.g1_parkour_target_amp_cfg import G1_with_shoe_CFG
+from instinctlab.tasks.parkour.config.parkour_env_cfg import SceneCfg as InstinctParkourSceneCfg
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[6]
+INSTINCT_G1_CHECKPOINT = os.environ.get(
+    "SRU_G1_INSTINCT_CHECKPOINT",
+    str(_PROJECT_ROOT / "artifacts" / "low_level" / "g1_parkour" / "model_30000.pt"),
+)
+INSTINCT_RL_ROOT = os.environ.get("SRU_INSTINCT_RL_ROOT", str(_PROJECT_ROOT / "external" / "instinct_rl"))
+
+
+
+@configclass
+class G1InstinctNavigationEnvCfg(NavigationEnvCfg):
+    """SRU navigation task with the exact frozen InstinctLab G1 parkour low-level policy interface."""
+
+    def __post_init__(self):
+        from instinct_nav.navigation.mdp.observations import initialize_depth_noise_generator
+
+        super().__post_init__()
+        initialize_depth_noise_generator(robot_name="g1", use_jit_precompiled=False)
+
+        self.commands.base_velocity = nav_mdp.InjectedVelocityCommandCfg()
+        self.commands.robot_goal.debug_vis = False
+        self.commands.robot_goal.sync_robot_root_to_spawn_origin = True
+
+        self.scene.robot = copy.deepcopy(G1_with_shoe_CFG).replace(prim_path="{ENV_REGEX_NS}/Robot")
+        self.scene.robot.spawn.merge_fixed_joints = True
+        self.scene.robot.init_state.pos = (0.0, 0.0, 0.9)
+
+        self.events.reset_base.params = {
+            "pose_range": {"x": (-0.1, 0.1), "y": (-0.1, 0.1), "yaw": (-0.1, 0.1)},
+            "velocity_range": {
+                "x": (-0.2, 0.2),
+                "y": (-0.2, 0.2),
+                "z": (-0.2, 0.2),
+                "roll": (-0.2, 0.2),
+                "pitch": (-0.2, 0.2),
+                "yaw": (-0.2, 0.2),
+            },
+        }
+        self.events.reset_robot_joints.func = nav_mdp.reset_joints_by_offset
+        self.events.reset_robot_joints.params = {"position_range": (0.0, 0.0), "velocity_range": (0.0, 0.0)}
+        self.events.randomize_camera_height = None
+        self.events.randomize_action_scale = None
+        self.events.reset_delay_buffer = None
+        self.events.randomize_low_pass_filter_alpha = None
+        self.events.push_robot = None
+
+        self.scene.camera = copy.deepcopy(InstinctParkourSceneCfg(num_envs=self.scene.num_envs, env_spacing=self.scene.env_spacing).camera)
+        self.scene.camera.prim_path = "{ENV_REGEX_NS}/Robot/torso_link"
+
+        self.scene.raycast_camera.prim_path = "{ENV_REGEX_NS}/Robot/torso_link"
+        self.scene.height_scanner_critic.prim_path = "{ENV_REGEX_NS}/Robot/torso_link"
+        self.scene.height_scanner = RayCasterCfg(
+            prim_path="{ENV_REGEX_NS}/Robot/torso_link",
+            offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 20.0)),
+            ray_alignment="yaw",
+            pattern_cfg=patterns.GridPatternCfg(resolution=0.1, size=[1.6, 1.0]),
+            debug_vis=False,
+            mesh_prim_paths=["/World/ground"],
+        )
+
+        self.actions.velocity_command = nav_mdp.InstinctFrozenNavigationSE2ActionCfg(
+            asset_name="robot",
+            low_level_position_action=instinct_mdp.JointPositionActionCfg(
+                asset_name="robot",
+                joint_names=[".*"],
+                scale=beyondmimic_action_scale,
+                use_default_offset=True,
+            ),
+            low_level_decimation=4,
+            policy_scaling=[1.0, 1.0, 1.0],
+            use_raw_actions=True,
+            policy_distr_type="gaussian",
+            enable_low_pass_filter=True,
+            low_pass_filter_alpha=0.5,
+            observation_group="instinct_low_level_policy",
+            command_name="base_velocity",
+            checkpoint_path=INSTINCT_G1_CHECKPOINT,
+            instinct_rl_root=INSTINCT_RL_ROOT,
+        )
+
+        self.observations.instinct_low_level_policy = InstinctLowLevelPolicyCfg()
+
+        self.rewards.joint_acc_l2_joint.params = {
+            "asset_cfg": SceneEntityCfg("robot", joint_names=[".*"]),
+        }
+        self.terminations.base_contact.params = {
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names="torso_link"),
+            "threshold": 1.0,
+        }
+        self.terminations.large_pitch_angle.func = nav_mdp.bad_orientation
+        self.terminations.large_pitch_angle.params = {"limit_angle": 1.0}
+        if self.scene.height_scanner is not None:
+            self.scene.height_scanner.update_period = self.low_level_decimation * self.sim.dt
+
+        # Match the original SRU navigation terrain start difficulty.
+        self.scene.terrain.max_init_terrain_level = 10
+        self.scene.terrain.terrain_generator.difficulty_range = [0.5, 1.0]
+        self.scene.terrain.terrain_generator.curriculum = False
+
+
+
+@configclass
+class InstinctLowLevelPolicyCfg(ObsGroup):
+    base_ang_vel = ObsTerm(
+        func=instinct_mdp.base_ang_vel,
+        noise=Unoise(n_min=-0.2, n_max=0.2),
+        history_length=8,
+        flatten_history_dim=True,
+        scale=0.25,
+    )
+    projected_gravity = ObsTerm(
+        func=instinct_mdp.projected_gravity,
+        noise=Unoise(n_min=-0.05, n_max=0.05),
+        history_length=8,
+        flatten_history_dim=True,
+    )
+    velocity_commands = ObsTerm(
+        func=instinct_mdp.generated_commands,
+        history_length=8,
+        flatten_history_dim=True,
+        params={"command_name": "base_velocity"},
+        noise=None,
+    )
+    joint_pos = ObsTerm(
+        func=instinct_mdp.joint_pos_rel,
+        noise=Unoise(n_min=-0.01, n_max=0.01),
+        history_length=8,
+        flatten_history_dim=True,
+    )
+    joint_vel = ObsTerm(
+        func=instinct_mdp.joint_vel_rel,
+        noise=Unoise(n_min=-0.5, n_max=0.5),
+        scale=0.05,
+        history_length=8,
+        flatten_history_dim=True,
+    )
+    actions = ObsTerm(
+        func=nav_mdp.last_low_level_action,
+        params={"action_term": "velocity_command"},
+        history_length=8,
+        flatten_history_dim=True,
+    )
+    depth_image = ObsTerm(
+        func=instinct_mdp.delayed_visualizable_image,
+        params={
+            "data_type": "distance_to_image_plane_noised_history",
+            "sensor_cfg": SceneEntityCfg("camera"),
+            "history_skip_frames": 5,
+            "num_output_frames": 8,
+            "delayed_frame_ranges": (0, 1),
+            "debug_vis": False,
+        },
+        noise=None,
+    )
+
+    def __post_init__(self):
+        self.enable_corruption = True
+        self.concatenate_terms = False
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_DEV(G1InstinctNavigationEnvCfg):
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.num_envs = 1
+        self.scene.terrain.terrain_generator.num_rows = 1
+        self.scene.terrain.terrain_generator.num_cols = 8
+        self.scene.terrain.max_init_terrain_level = 0
+        self.scene.terrain.terrain_generator.difficulty_range = [0.0, 0.0]
+        self.scene.terrain.terrain_generator.curriculum = False
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_PLAY(G1InstinctNavigationEnvCfg):
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.num_envs = 20
+        self.scene.env_spacing = 2.5
+        self.observations.policy.enable_corruption = False
+        self.events.base_external_force_torque = None
+        self.events.push_robot = None

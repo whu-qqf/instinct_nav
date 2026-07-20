@@ -1,0 +1,44 @@
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local/runtime caches
+.cache/
+.wandb/
+wandb/
+
+# Training outputs
+logs/
+runs/
+videos/
+*.mp4
+*.gif
+*.avi
+*.mov
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Editor/system files
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*.swo
+
+# Isaac/Omniverse generated files
+*.usd~
+*.tmp
+*.log
+
+# Environment files
+.env
+.venv/
+venv/

@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "instinct-nav"
+version = "0.1.0"
+description = "Clean-room navigation project on top of InstinctLab."
+requires-python = ">=3.11"
+
+[tool.setuptools.packages.find]
+where = ["source/instinct_nav", "source/rsl_rl", "external/instinctlab", "external/instinct_rl"]
+include = ["instinct_nav*", "isaaclab_nav_task*", "rsl_rl*", "instinctlab*", "instinct_rl*"]
