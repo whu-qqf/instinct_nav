@@ -2,6 +2,9 @@
 
 `instinct_nav` 是当前用于 **G1 人形机器人高层导航 + 冻结 InstinctLab parkour 低层 locomotion** 的主实验项目。项目目标不是继续修补 `sru_new`，而是把 SRU 导航思想适配到 G1/InstinctLab 体系中，并保持底层运动能力复用、上层导航策略独立训练。
 
+当前冻结基线结果、checkpoint、评估表格和复现命令见 [RESULTS.md](./RESULTS.md)。
+方法设计说明见 [METHOD.md](./METHOD.md)，代码阅读路线见 [CodeReading.md](./CodeReading.md)。
+
 当前主线：
 
 ```text
