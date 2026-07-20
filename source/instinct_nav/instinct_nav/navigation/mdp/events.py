@@ -163,6 +163,16 @@ def reset_and_randomize_delay_buffer(
         visibility_manager.reset(env_ids)
 
 
+def reset_visibility_map(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor,
+):
+    """Reset local visibility-map memory without changing observation-delay lags."""
+    visibility_manager = getattr(env, "local_visibility_map_manager", None)
+    if visibility_manager is not None:
+        visibility_manager.reset(env_ids)
+
+
 def randomize_low_pass_filter_alpha(
     env: ManagerBasedEnv,
     env_ids: torch.Tensor,

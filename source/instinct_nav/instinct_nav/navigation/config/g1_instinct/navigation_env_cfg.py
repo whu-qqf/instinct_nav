@@ -4,6 +4,7 @@ import copy
 import os
 from pathlib import Path
 
+from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import SceneEntityCfg
@@ -193,6 +194,51 @@ class G1InstinctNavigationEnvCfg_DEV(G1InstinctNavigationEnvCfg):
 
 @configclass
 class G1InstinctNavigationEnvCfg_PLAY(G1InstinctNavigationEnvCfg):
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.num_envs = 20
+        self.scene.env_spacing = 2.5
+        self.observations.policy.enable_corruption = False
+        self.events.base_external_force_torque = None
+        self.events.push_robot = None
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_VIS(G1InstinctNavigationEnvCfg):
+    """G1 navigation config with actor-side local visibility-map observation enabled."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.observations.policy.visibility_map = ObsTerm(
+            func=nav_mdp.local_visibility_map,
+            params={
+                "sensor_cfg": SceneEntityCfg("raycast_camera"),
+                "size_m": 6.4,
+                "grid_size": 64,
+                "depth_min_m": 0.5,
+                "depth_max_m": 8.0,
+                "pixel_stride": 2,
+                "decay": 1.0,
+            },
+        )
+        # Reuse the existing reset-delay event slot, but only reset visibility-map memory.
+        self.events.reset_delay_buffer = EventTerm(func=nav_mdp.reset_visibility_map, mode="reset")
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_VIS_DEV(G1InstinctNavigationEnvCfg_VIS):
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.num_envs = 1
+        self.scene.terrain.terrain_generator.num_rows = 1
+        self.scene.terrain.terrain_generator.num_cols = 8
+        self.scene.terrain.max_init_terrain_level = 0
+        self.scene.terrain.terrain_generator.difficulty_range = [0.0, 0.0]
+        self.scene.terrain.terrain_generator.curriculum = False
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_VIS_PLAY(G1InstinctNavigationEnvCfg_VIS):
     def __post_init__(self):
         super().__post_init__()
         self.scene.num_envs = 20

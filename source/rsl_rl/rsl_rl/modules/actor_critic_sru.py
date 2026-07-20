@@ -64,6 +64,7 @@ class ActorCriticSRU(nn.Module):
         time_embed_dim: int = 8,
         num_cameras: int = 1,
         use_actor_visibility_map: bool = False,
+        use_actor_visibility_early_fusion: bool = False,
         visibility_map_input_dims: tuple[int, int, int] = (1, 64, 64),
         visibility_map_feature_dim: int = 64,
         use_actor_visibility_query_attention: bool = False,
@@ -86,8 +87,18 @@ class ActorCriticSRU(nn.Module):
         self.height_input_dims = height_input_dims
         self.num_cameras = num_cameras
         self.use_actor_visibility_map = bool(use_actor_visibility_map)
+        self.use_actor_visibility_early_fusion = (
+            bool(use_actor_visibility_early_fusion) and self.use_actor_visibility_map
+        )
+        if self.use_actor_visibility_early_fusion and use_actor_visibility_query_attention:
+            print(
+                "[ActorCriticSRU] Warning: early fusion and query attention are mutually exclusive; "
+                "using early fusion."
+            )
         self.use_actor_visibility_query_attention = (
-            bool(use_actor_visibility_query_attention) and self.use_actor_visibility_map
+            bool(use_actor_visibility_query_attention)
+            and self.use_actor_visibility_map
+            and not self.use_actor_visibility_early_fusion
         )
         self.visibility_map_input_dims = visibility_map_input_dims
         self.visibility_map_feature_dim = int(visibility_map_feature_dim) if self.use_actor_visibility_map else 0
@@ -118,11 +129,15 @@ class ActorCriticSRU(nn.Module):
             "Actor and Critic proprioceptive input dims must match"
         )
 
-        # The actor SRU keeps the original proprioception+depth recurrent stream.
-        # Optional visibility-map features are fused after the SRU so they do not
-        # become part of the recurrent hidden state.
+        # Baseline actor stream is proprioception+depth. Early fusion appends
+        # visibility-map features before the SRU; late/query fusion append them
+        # after it so explicit spatial memory stays out of the recurrent state.
         self.mlp_input_dim_actor = self.actor_proprioceptive_input_dim + image_input_dims[0]
-        self.actor_post_recurrent_input_dim = rnn_hidden_size + self.visibility_map_feature_dim
+        if self.use_actor_visibility_early_fusion:
+            self.mlp_input_dim_actor += self.visibility_map_feature_dim
+            self.actor_post_recurrent_input_dim = rnn_hidden_size
+        else:
+            self.actor_post_recurrent_input_dim = rnn_hidden_size + self.visibility_map_feature_dim
         self.mlp_input_dim_critic = (
             self.critic_proprioceptive_input_dim + height_input_dims[0] + image_input_dims[0]
         )
@@ -261,7 +276,12 @@ class ActorCriticSRU(nn.Module):
         print(f"[ActorCriticSRU] Critic RNN: {self.memory_c}")
         print(f"[ActorCriticSRU] Num cameras: {self.num_cameras}")
         if self.use_actor_visibility_map:
-            branch_name = "query-attention late fusion" if self.use_actor_visibility_query_attention else "late fusion"
+            if self.use_actor_visibility_early_fusion:
+                branch_name = "early fusion"
+            elif self.use_actor_visibility_query_attention:
+                branch_name = "query-attention late fusion"
+            else:
+                branch_name = "late fusion"
             print(
                 f"[ActorCriticSRU] Actor visibility map branch: {branch_name}, "
                 f"input={self.visibility_map_input_dims}, feature_dim={self.visibility_map_feature_dim}"
@@ -441,8 +461,13 @@ class ActorCriticSRU(nn.Module):
                 visibility_tokens = visibility_tokens.reshape(seq_len, batch_size, -1)
             other_obs = other_obs.view(seq_len, batch_size, -1)
 
-        # The recurrent actor state is based on the baseline observation stream.
-        combined_features = torch.cat([image_features, other_obs], dim=-1)
+        # The recurrent actor state is based on the baseline observation stream,
+        # except in early fusion where visibility features are recurrent input.
+        if self.use_actor_visibility_early_fusion and visibility_features is not None:
+            combined_features = torch.cat([image_features, other_obs, visibility_features], dim=-1)
+            visibility_features = None
+        else:
+            combined_features = torch.cat([image_features, other_obs], dim=-1)
 
         # RNN processing
         combined_features = self.memory_a(combined_features, masks, hidden_states)

@@ -391,7 +391,7 @@ overall success_rate: 0.902
 冻结当前 baseline 后，可以做以下独立实验：
 
 - Two-camera vs one-camera depth input.
-- Visibility map / query attention on vs off.
+- Visibility-map fusion strategy: `Early`, `Late`, and `Query` using the registered `Instinct-Nav-G1-SRU-Visibility-*` tasks.
 - Low-pass filter alpha sweep.
 - Goal noise and observation delay ablation.
 - Reward weight sweep for `action_rate_l1` and `episode_termination`.

@@ -4,6 +4,7 @@
 
 当前冻结基线结果、checkpoint、评估表格和复现命令见 [RESULTS.md](./RESULTS.md)。
 方法设计说明见 [METHOD.md](./METHOD.md)，代码阅读路线见 [CodeReading.md](./CodeReading.md)。
+汇报版摘要见 [REPORT.md](./REPORT.md)。
 
 当前主线：
 
@@ -160,6 +161,32 @@ Frozen InstinctLab G1 parkour locomotion policy @ 50 Hz
   --camera_mode topdown_follow \
   --camera_follow_height 12.0
 ```
+
+## 当前独立项目任务 ID
+
+正式 baseline：
+
+```text
+Instinct-Nav-G1-SRU-v0
+Instinct-Nav-G1-SRU-Dev-v0
+Instinct-Nav-G1-SRU-Play-v0
+```
+
+Visibility-map fusion ablation：
+
+```text
+Instinct-Nav-G1-SRU-Visibility-Early-v0
+Instinct-Nav-G1-SRU-Visibility-Early-Dev-v0
+Instinct-Nav-G1-SRU-Visibility-Early-Play-v0
+Instinct-Nav-G1-SRU-Visibility-Late-v0
+Instinct-Nav-G1-SRU-Visibility-Late-Dev-v0
+Instinct-Nav-G1-SRU-Visibility-Late-Play-v0
+Instinct-Nav-G1-SRU-Visibility-Query-v0
+Instinct-Nav-G1-SRU-Visibility-Query-Dev-v0
+Instinct-Nav-G1-SRU-Visibility-Query-Play-v0
+```
+
+这些是当前 `source/instinct_nav` 独立项目内注册的任务。下面早期 `Frozen-SruMaze` 任务名只作为历史迁移记录，不作为当前主线使用。
 
 ## 当前主要任务 ID
 

@@ -59,6 +59,9 @@ class RslRlPpoActorCriticCfg:
     use_actor_visibility_map: bool = False
     """Whether the actor observation contains a local visibility map after the depth features."""
 
+    use_actor_visibility_early_fusion: bool = False
+    """Whether to concatenate the visibility-map feature into the actor recurrent input."""
+
     visibility_map_input_dims: tuple[int, int, int] = (1, 64, 64)
     """Actor visibility map shape as (C, H, W)."""
 
