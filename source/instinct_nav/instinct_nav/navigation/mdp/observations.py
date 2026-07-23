@@ -5,13 +5,29 @@
 
 """Observation functions for navigation tasks.
 
-These functions can be passed to :class:`isaaclab.managers.ObservationTermCfg`
-to specify observations for the policy.
+This module is the observation-side glue between IsaacLab managers, the SRU
+high-level navigation policy, and the frozen low-level locomotion policies.
+Functions in this file are referenced by ``ObservationTermCfg`` entries in the
+environment config. IsaacLab calls them every environment step when it builds an
+observation group.
+
+Important conventions used throughout this file:
+
+- ``env.scene[...]`` reads simulation state from IsaacLab assets and sensors.
+- Actor observations may be noisy and delayed; critic observations are usually
+  cleaner and may include privileged information such as encoded height scans.
+- Depth observations are not fed to the SRU as raw pixels. They are encoded by a
+  pre-trained depth encoder into ``[64, 5, 8]`` features and then flattened.
+- The local visibility map is actor-side explicit memory built from the same
+  noisy/delayed depth stream. It is a binary "observed / not observed" BEV map;
+  it is not an occupancy map, traversability map, or height map.
+- Tensor shapes are documented in comments because network slicing in
+  ``ActorCriticSRU`` assumes these exact layouts.
 """
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING, Optional, cast
+from typing import TYPE_CHECKING, Literal, Optional, cast
 
 import torch
 import torch.nn.functional as F
@@ -19,7 +35,8 @@ import matplotlib.pyplot as plt
 
 from isaaclab.assets import Articulation, RigidObject
 from isaaclab.envs import ManagerBasedEnv, ManagerBasedRLEnv
-from isaaclab.managers import SceneEntityCfg
+from isaaclab.envs.mdp.events import _randomize_prop_by_op
+from isaaclab.managers import ManagerTermBase, ManagerTermBaseCfg, SceneEntityCfg
 
 import instinct_nav.navigation.mdp as mdp
 
@@ -31,31 +48,53 @@ if TYPE_CHECKING:
     from instinct_nav.navigation.mdp import PerceptiveNavigationSE2Action
     from instinct_nav.navigation.mdp.navigation.goal_commands import RobotNavigationGoalCommand
 
-# Visualization state
+# Matplotlib windows used only by optional single-env depth visualization.
+# They are kept globally so repeated observation calls update the same window
+# instead of opening a new one at every step.
 _DEPTH_VIZ_WINDOWS: dict[str, dict] = {}
 
-# Global depth noise generator - will be initialized with camera config
+# Depth encoder singleton.
+#
+# The encoder is expensive to construct and has fixed weights, so all envs in a
+# process share one instance. ``initialize_depth_noise_generator(...)`` should be
+# called from the environment config with the robot/camera-specific parameters
+# before the first observation call. Observation functions still call
+# ``_ensure_depth_noise_generator_initialized`` defensively in case the config did
+# not initialize it explicitly.
 DEPTH_NOISE_GENERATOR: Optional[DepthNoiseEncoder] = None
 JIT_DEPTH_NOISE_GENERATOR: Optional[torch.jit.ScriptModule] = None
 
-# Global height scan encoder - initialized once on first use
+# Height-scan encoder singleton used by the critic. It is initialized lazily the
+# first time ``height_scan_feat`` is requested.
 HEIGHTSCAN_FEAT_ENCODER: Optional[HeightScanFeatEncoder] = None
 JIT_HEIGHTSCAN_FEAT_ENCODER: Optional[torch.jit.ScriptModule] = None
 
-# Global flags/params for depth encoding
+# Runtime depth preprocessing flags copied from the selected camera config.
+# ``min_depth`` and ``max_depth`` define what the depth encoder considers a valid
+# range; invalid values are set to 0.0 before encoding when JIT mode is used.
 use_jit = True
 min_depth = 0.0
 max_depth = 0.0
 
 
 def _quat_wxyz_to_yaw(quat: torch.Tensor) -> torch.Tensor:
-    """Return yaw from quaternions in wxyz convention."""
+    """Return yaw from quaternions in wxyz convention.
+
+    IsaacLab stores root orientation as ``[w, x, y, z]``. Visibility maps are
+    robot-centric but yaw-aligned: we care about the robot's heading in the
+    horizontal plane, not roll/pitch. This helper extracts that yaw angle.
+    """
     w, x, y, z = quat.unbind(dim=-1)
     return torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
 
 
 def _quat_wxyz_to_matrix(quat: torch.Tensor) -> torch.Tensor:
-    """Convert quaternions in wxyz convention to rotation matrices."""
+    """Convert quaternions in wxyz convention to rotation matrices.
+
+    The visibility map construction back-projects depth pixels into camera-frame
+    3D points and then rotates them into world frame. This helper builds that
+    rotation matrix for every environment in the vectorized batch.
+    """
     quat = F.normalize(quat, dim=-1)
     w, x, y, z = quat.unbind(dim=-1)
     two = 2.0
@@ -73,12 +112,27 @@ def _quat_wxyz_to_matrix(quat: torch.Tensor) -> torch.Tensor:
 
 
 class LocalVisibilityMapManager:
-    """Maintain a robot-centric visibility map from noisy, delayed depth samples.
+    """Maintain a robot-centric local visibility map.
 
-    The map stores only whether nearby terrain has been observed. It intentionally
-    does not encode height, danger, terrain-generator information, or confidence.
-    Previous map state is warped into the current robot-yaw frame and re-binarized
-    so memory remains spatially meaningful as the robot moves.
+    This is the explicit-memory component used by the visibility-map fusion
+    ablations. It turns the actor's depth stream into a 2D binary BEV grid:
+
+    - Shape kept internally: ``[num_envs, 1, grid_size, grid_size]``.
+    - Shape returned to the actor: ``[num_envs, grid_size * grid_size]``.
+    - Default coverage: ``6.4m x 6.4m`` around the robot.
+    - Default resolution: ``64 x 64``, so each grid cell is ``0.1m x 0.1m``.
+
+    Semantics are deliberately weak and non-privileged:
+
+    - ``1`` means this local cell has been hit/observed by delayed depth.
+    - ``0`` means the cell has not been observed recently/in this episode.
+    - It does NOT mean obstacle/free space/traversable/unsafe/height.
+
+    The map is stored in the robot's current yaw-aligned frame. When the robot
+    moves, old map values are warped from the previous robot frame into the new
+    frame before current depth hits are inserted. This keeps explicit memory
+    spatially meaningful without exposing global terrain coordinates to the
+    policy.
     """
 
     def __init__(
@@ -92,30 +146,54 @@ class LocalVisibilityMapManager:
         pixel_stride: int = 2,
         decay: float = 1.0,
     ):
+        # Store all map state on the simulation device. Visibility map update is
+        # called inside the observation pipeline, so moving tensors to CPU here
+        # would severely slow training.
         self.num_envs = int(num_envs)
         self.device = torch.device(device)
+
+        # Clamp config values to avoid degenerate maps. In normal G1 runs these
+        # remain: size_m=6.4, grid_size=64, cell_size=0.1m.
         self.size_m = max(float(size_m), 0.5)
         self.grid_size = max(int(grid_size), 8)
         self.depth_min_m = max(float(depth_min_m), 0.0)
         self.depth_max_m = max(float(depth_max_m), self.depth_min_m + 1.0e-3)
         self.pixel_stride = max(int(pixel_stride), 1)
+
+        # ``decay`` is kept in the API for ablations, but the current paper-style
+        # visibility map uses no decay: once a cell is observed in the local map,
+        # it remains observed until reset or until warping moves it out of frame.
         self.decay = 1.0
         self.cell_size = self.size_m / float(self.grid_size)
         self.half_size = self.size_m / 2.0
 
+        # Binary map memory. ``pose_valid`` marks whether a map has a previous
+        # robot pose; without it we cannot warp old memory into the new frame.
         self.map = torch.zeros((self.num_envs, 1, self.grid_size, self.grid_size), device=self.device)
         self.last_root_pos_w = torch.zeros((self.num_envs, 3), device=self.device)
         self.last_root_yaw = torch.zeros((self.num_envs,), device=self.device)
         self.pose_valid = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
 
+        # Precompute each BEV cell center in the robot-local frame. The indexing
+        # convention is chosen so row 0 is in front of the robot and later rows
+        # move backward; columns span left/right in robot yaw frame.
         rows = torch.arange(self.grid_size, device=self.device, dtype=torch.float32)
         cols = torch.arange(self.grid_size, device=self.device, dtype=torch.float32)
         row_grid, col_grid = torch.meshgrid(rows, cols, indexing="ij")
         self.cell_x_local = self.half_size - (row_grid + 0.5) * self.cell_size
         self.cell_y_local = self.half_size - (col_grid + 0.5) * self.cell_size
+
+        # Pixel grids depend only on camera resolution and stride. Cache them so
+        # every observation call does not rebuild the same meshgrid.
         self._pixel_cache: dict[tuple[int, int, int], tuple[torch.Tensor, torch.Tensor]] = {}
 
     def reset(self, env_ids: torch.Tensor | None = None):
+        """Clear visibility memory for all envs or a subset of reset envs.
+
+        This must run on episode reset. Otherwise a new episode could inherit a
+        map built at another spawn/goal, leaking invalid spatial memory into the
+        actor observation.
+        """
         if env_ids is None:
             self.map.zero_()
             self.pose_valid.zero_()
@@ -125,6 +203,13 @@ class LocalVisibilityMapManager:
         self.pose_valid[env_ids] = False
 
     def _pixel_grid(self, height: int, width: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return flattened image row/column coordinates for sampled pixels.
+
+        ``pixel_stride`` subsamples the depth image. With a 40x64 depth image and
+        stride=2, only 20x32 rays are inserted into the map each policy step.
+        That is enough for coarse visibility memory and keeps the observation
+        path cheap for thousands of envs.
+        """
         key = (int(height), int(width), self.pixel_stride)
         if key not in self._pixel_cache:
             rows = torch.arange(0, height, self.pixel_stride, device=self.device, dtype=torch.float32)
@@ -134,9 +219,22 @@ class LocalVisibilityMapManager:
         return self._pixel_cache[key]
 
     def _warp_memory_to_current_frame(self, root_pos_w: torch.Tensor, root_yaw: torch.Tensor):
+        """Warp the previous robot-centric map into the current robot frame.
+
+        The map is stored in local robot coordinates, not world coordinates. If
+        the robot moves forward or turns, the same world point should appear at a
+        different local cell. Before inserting new depth hits, we therefore sample
+        the old map at the previous-frame coordinates corresponding to each
+        current-frame cell.
+
+        This is the key step that turns per-frame depth observations into short
+        horizon explicit memory.
+        """
         if not torch.any(self.pose_valid):
             return
 
+        # Current local BEV cell centers -> world XY. These are the world points
+        # represented by each cell if the robot is at its current pose.
         x_cur = self.cell_x_local.unsqueeze(0)
         y_cur = self.cell_y_local.unsqueeze(0)
         cos_cur = torch.cos(root_yaw).view(-1, 1, 1)
@@ -144,6 +242,9 @@ class LocalVisibilityMapManager:
         world_x = root_pos_w[:, 0].view(-1, 1, 1) + cos_cur * x_cur - sin_cur * y_cur
         world_y = root_pos_w[:, 1].view(-1, 1, 1) + sin_cur * x_cur + cos_cur * y_cur
 
+        # World XY -> previous robot-local frame. We ask: where did this current
+        # cell's world point live in the old map? That previous coordinate is the
+        # sampling location used by grid_sample below.
         prev_pos = torch.where(self.pose_valid[:, None], self.last_root_pos_w, root_pos_w)
         prev_yaw = torch.where(self.pose_valid, self.last_root_yaw, root_yaw)
         rel_x = world_x - prev_pos[:, 0].view(-1, 1, 1)
@@ -153,15 +254,26 @@ class LocalVisibilityMapManager:
         x_prev = cos_prev * rel_x + sin_prev * rel_y
         y_prev = -sin_prev * rel_x + cos_prev * rel_y
 
+        # Previous local meters -> previous image/grid coordinates. grid_sample
+        # expects normalized coordinates in [-1, 1], where x indexes columns and
+        # y indexes rows.
         row_prev = (self.half_size - x_prev) / self.cell_size - 0.5
         col_prev = (self.half_size - y_prev) / self.cell_size - 0.5
         norm_x = 2.0 * col_prev / max(self.grid_size - 1, 1) - 1.0
         norm_y = 2.0 * row_prev / max(self.grid_size - 1, 1) - 1.0
         sample_grid = torch.stack((norm_x, norm_y), dim=-1)
+
+        # Bilinear sampling can produce fractional values near cell boundaries.
+        # The map semantics are binary, so threshold back to {0, 1} after warp.
+        # Invalid envs use an all-zero map until their first valid pose arrives.
         warped = F.grid_sample(
             self.map, sample_grid, mode="bilinear", padding_mode="zeros", align_corners=True
         )
-        self.map = torch.where(self.pose_valid.view(-1, 1, 1, 1), (warped > 0.5).to(warped.dtype), torch.zeros_like(warped))
+        self.map = torch.where(
+            self.pose_valid.view(-1, 1, 1, 1),
+            (warped > 0.5).to(warped.dtype),
+            torch.zeros_like(warped),
+        )
 
     def update(
         self,
@@ -172,6 +284,17 @@ class LocalVisibilityMapManager:
         root_pos_w: torch.Tensor,
         root_quat_w: torch.Tensor,
     ) -> torch.Tensor:
+        """Insert one delayed depth frame into the local visibility map.
+
+        Inputs are batched over environments. The function performs the complete
+        geometry pipeline:
+
+        ``depth pixel -> camera-frame 3D -> world-frame 3D -> robot-local BEV cell``
+
+        It returns the flattened actor observation ``[num_envs, grid_size^2]``.
+        """
+        # Accept either [B, 1, H, W] or [B, H, W]. Internally we use [B, H, W]
+        # before flattening sampled pixels.
         depth = depth.to(self.device)
         if depth.dim() == 4:
             depth = depth[:, 0]
@@ -179,6 +302,8 @@ class LocalVisibilityMapManager:
         if num_envs != self.num_envs:
             raise ValueError(f"Expected {self.num_envs} envs, got {num_envs}")
 
+        # Keep all tensors on the map device and extract yaw-only robot heading.
+        # Roll/pitch are deliberately ignored for BEV memory alignment.
         camera_pos_w = camera_pos_w.to(self.device)
         camera_quat_w = camera_quat_w.to(self.device)
         intrinsics = intrinsics.to(self.device)
@@ -186,12 +311,20 @@ class LocalVisibilityMapManager:
         root_quat_w = root_quat_w.to(self.device)
         root_yaw = _quat_wxyz_to_yaw(root_quat_w)
 
+        # First move previous memory into the current robot frame. Then current
+        # frame observations can be accumulated by a simple max operation.
         self._warp_memory_to_current_frame(root_pos_w, root_yaw)
 
+        # Subsample the depth image to reduce update cost. The row/col grids are
+        # the pixel centers that correspond to each selected depth value.
         depth_sub = depth[:, :: self.pixel_stride, :: self.pixel_stride].reshape(num_envs, -1)
         row_grid, col_grid = self._pixel_grid(height, width)
         valid_depth = torch.isfinite(depth_sub) & (depth_sub >= self.depth_min_m) & (depth_sub <= self.depth_max_m)
 
+        # Back-project pinhole-camera depth to camera-frame 3D points.
+        # This raycaster camera uses distance_to_image_plane; in this coordinate
+        # convention the forward axis is x_cam. The signs for y/z match the
+        # camera frame convention used by IsaacLab raycast camera intrinsics.
         fx = intrinsics[:, 0, 0].clamp_min(1.0e-6).unsqueeze(1)
         fy = intrinsics[:, 1, 1].clamp_min(1.0e-6).unsqueeze(1)
         cx = intrinsics[:, 0, 2].unsqueeze(1)
@@ -201,16 +334,23 @@ class LocalVisibilityMapManager:
         z_cam = -((row_grid - cy) / fy) * depth_sub
         points_cam = torch.stack((x_cam, y_cam, z_cam), dim=-1)
 
+        # Camera frame -> world frame using delayed camera pose. It is important
+        # that depth, camera pose, and intrinsics come from the same delayed
+        # sample; otherwise moving/turning robots would smear the map.
         rotation = _quat_wxyz_to_matrix(camera_quat_w)
         points_w = torch.bmm(points_cam, rotation.transpose(1, 2)) + camera_pos_w.unsqueeze(1)
         finite_points = torch.isfinite(points_w).all(dim=-1)
 
+        # World frame -> current robot yaw-aligned local frame. x_local points
+        # forward, y_local points laterally in the robot frame.
         rel = points_w - root_pos_w.unsqueeze(1)
         cos_yaw = torch.cos(root_yaw).unsqueeze(1)
         sin_yaw = torch.sin(root_yaw).unsqueeze(1)
         x_local = cos_yaw * rel[..., 0] + sin_yaw * rel[..., 1]
         y_local = -sin_yaw * rel[..., 0] + cos_yaw * rel[..., 1]
 
+        # Local meters -> BEV grid row/column. Points outside the square map or
+        # outside valid depth range are ignored.
         row = torch.floor((self.half_size - x_local) / self.cell_size).long()
         col = torch.floor((self.half_size - y_local) / self.cell_size).long()
         valid = (
@@ -221,12 +361,21 @@ class LocalVisibilityMapManager:
             & (col >= 0)
             & (col < self.grid_size)
         )
+
+        # Scatter all valid depth hits into a flat [B, grid_size^2] update map.
+        # scatter_reduce(..., reduce="amax") implements a vectorized OR: if any
+        # depth point lands in a cell, that cell becomes visible.
         linear_idx = (row.clamp(0, self.grid_size - 1) * self.grid_size + col.clamp(0, self.grid_size - 1))
         updates = torch.zeros((self.num_envs, self.grid_size * self.grid_size), device=self.device)
         values = valid.to(dtype=updates.dtype)
         updates.scatter_reduce_(1, linear_idx, values, reduce="amax", include_self=True)
+
+        # Accumulate visibility over time. This is not occupancy integration: no
+        # negative evidence is inserted and cells are simply remembered as seen.
         self.map = torch.maximum(self.map, updates.view_as(self.map))
 
+        # Save current pose for next-step warping and re-binarize to remove any
+        # fractional interpolation values introduced by grid_sample.
         self.last_root_pos_w.copy_(root_pos_w)
         self.last_root_yaw.copy_(root_yaw)
         self.pose_valid[:] = True
@@ -260,6 +409,21 @@ def _get_or_create_visibility_map_manager(
 
 
 def _cache_noisy_depth_sample(env, camera_name: str, noisy_depth: torch.Tensor, depth_camera) -> None:
+    """Cache the noisy raw depth sample used by actor observations.
+
+    ``depth_image_noisy_delayed`` already computes noisy raw depth before encoding
+    it. The visibility map should be built from the same noisy camera sample,
+    otherwise the actor would receive depth features and visibility memory from
+    two different sensor distributions. We therefore cache:
+
+    - noisy raw depth: ``[B, 1, H, W]``
+    - camera world position: ``[B, 3]``
+    - camera world quaternion: ``[B, 4]`` in wxyz convention
+    - camera intrinsics: ``[B, 3, 3]``
+
+    ``detach`` is intentional: observations do not need gradients and this cache
+    must not keep autograd graphs alive during PPO collection.
+    """
     cache = getattr(env, "_nav_noisy_depth_cache", None)
     if cache is None:
         cache = {}
@@ -273,6 +437,14 @@ def _cache_noisy_depth_sample(env, camera_name: str, noisy_depth: torch.Tensor, 
 
 
 def _get_noisy_depth_sample(env, sensor_cfg) -> dict[str, torch.Tensor]:
+    """Return the noisy raw depth sample for visibility-map construction.
+
+    Preferred path: reuse the cache written by ``depth_image_noisy_delayed`` in
+    the same observation pass. Fallback path: if visibility_map is evaluated
+    before depth_image, compute a compatible noisy depth sample here and cache it.
+    This makes observation term order robust while keeping the sensor distribution
+    consistent.
+    """
     camera_name = sensor_cfg.name if hasattr(sensor_cfg, "name") else "raycast_camera"
     cache = getattr(env, "_nav_noisy_depth_cache", {})
     if camera_name in cache:
@@ -287,11 +459,15 @@ def _get_noisy_depth_sample(env, sensor_cfg) -> dict[str, torch.Tensor]:
 
     model = cast(torch.jit.ScriptModule, JIT_DEPTH_NOISE_GENERATOR)
     if use_jit:
+        # In JIT mode we usually run the deterministic encoder path. Invalid
+        # ranges are masked to 0.0, matching depth_image_noisy_delayed.
         depth_tensor = depth_tensor.clone()
         depth_tensor[depth_tensor > max_depth] = 0.0
         depth_tensor[depth_tensor < min_depth] = 0.0
         noisy_depth_tensor = depth_tensor
     else:
+        # Non-JIT DepthNoiseEncoder returns both encoded features and noisy raw
+        # depth. Visibility map uses the noisy raw depth, not encoded features.
         _, noisy_depth_tensor = model(depth_tensor)
     _cache_noisy_depth_sample(env, camera_name, noisy_depth_tensor, depth_camera)
     return env._nav_noisy_depth_cache[camera_name]
@@ -442,6 +618,132 @@ def initialize_depth_noise_generator(
 # ============================================================================
 
 
+class delayed_visualizable_image(ManagerTermBase):
+    """Return delayed image-history frames from a noisy camera sensor.
+
+    This is the local instinct_nav copy of the small InstinctLab observation term
+    used by the frozen G1 parkour locomotion policy. The low-level checkpoint was
+    trained with ``NoisyGroupedRayCasterCamera`` history data, so the observation
+    must read from the sensor's history buffer instead of from the high-level SRU
+    ``raycast_camera`` path.
+
+    Expected sensor output shape is ``[num_envs, history, H, W, C]``. Current G1
+    config uses ``distance_to_image_plane_noised_history`` with one channel, so
+    this term squeezes the channel dimension and returns:
+
+    ``[num_envs, num_output_frames, H, W]``.
+
+    With the active low-level config that becomes ``[num_envs, 8, 18, 32]``.
+    """
+
+    def __init__(self, cfg: ManagerTermBaseCfg, env: ManagerBasedEnv):
+        super().__init__(cfg, env)
+        self.sensor_cfg = cfg.params.get("sensor_cfg", SceneEntityCfg("camera"))
+        self.data_type = cfg.params["data_type"]
+        if "history" not in self.data_type:
+            raise ValueError("data_type must contain 'history' so delayed frames can be sampled")
+
+        self.sensor = env.scene.sensors[self.sensor_cfg.name]
+        self.delayed_frame_ranges = cfg.params.get("delayed_frame_ranges", (0, 0))
+        self.delayed_frame_distribution: Literal["uniform", "log_uniform"] = cfg.params.get(
+            "delayed_frame_distribution", "uniform"
+        )
+        self._num_delayed_frames = torch.zeros(env.num_envs, device=env.device)
+        self.history_skip_frames = max(cfg.params.get("history_skip_frames", 1), 1)
+        self.num_output_frames = max(cfg.params.get("num_output_frames", 0), 1)
+
+        history_tensor = self.sensor.data.output[self.data_type]
+        if len(history_tensor.shape) < 5:
+            raise ValueError(
+                f"sensor data {self.data_type!r} should have [N, history, H, W, C] shape, "
+                f"got {tuple(history_tensor.shape)}"
+            )
+        self.sensor_history_length = history_tensor.shape[1]
+
+        # frame_offset is ordered old -> new. Because the newest sensor frame is
+        # stored at index -1, the first returned output frame uses the largest
+        # offset and the last returned output frame is closest to the present.
+        self.frame_offset = torch.flip(
+            torch.arange(
+                0,
+                self.num_output_frames * self.history_skip_frames,
+                self.history_skip_frames,
+                device=env.device,
+            ),
+            dims=(0,),
+        )
+        self.check_delay_bounds()
+
+    def check_delay_bounds(self) -> None:
+        """Validate that requested delay/history settings fit in sensor history."""
+        max_delayed_frames = self.delayed_frame_ranges[1]
+        frames_needed_if_no_delay = (self.num_output_frames - 1) * self.history_skip_frames + 1
+        total_needed = frames_needed_if_no_delay + max_delayed_frames
+        if total_needed > self.sensor_history_length:
+            raise ValueError(
+                "The delayed frame ranges are too large for the sensor history length. "
+                f"max_delay={max_delayed_frames}, frames_without_delay={frames_needed_if_no_delay}, "
+                f"total_needed={total_needed}, history_length={self.sensor_history_length}."
+            )
+
+    def reset(self, env_ids: torch.Tensor | None = None) -> None:
+        """Sample each environment's frame delay at episode reset."""
+        if env_ids is None:
+            env_ids = slice(None)
+        self._num_delayed_frames[env_ids] = _randomize_prop_by_op(
+            self._num_delayed_frames[env_ids].unsqueeze(-1),
+            self.delayed_frame_ranges,
+            None,
+            slice(None),
+            operation="abs",
+            distribution=self.delayed_frame_distribution,
+        ).squeeze(-1)
+
+    def __call__(
+        self,
+        env: ManagerBasedEnv,
+        data_type: str,
+        sensor_cfg: SceneEntityCfg = SceneEntityCfg("camera"),
+        history_skip_frames: int = 0,
+        num_output_frames: int = 0,
+        delayed_frame_ranges: tuple[int, int] = (0, 0),
+        delayed_frame_distribution: Literal["uniform", "log_uniform"] = "uniform",
+        debug_vis: bool = False,
+        scale_up_vis: int = 5,
+    ) -> torch.Tensor:
+        """Read delayed frames from the configured sensor history buffer."""
+        images = self.sensor.data.output[self.data_type].clone()
+        images = images.squeeze(-1)
+
+        frame_indices = (
+            self.sensor_history_length - self.frame_offset.unsqueeze(0) - self._num_delayed_frames.unsqueeze(1) - 1
+        ).to(torch.long)
+        if not (frame_indices >= 0).all():
+            raise RuntimeError(f"frame_indices should be non-negative, got {frame_indices}")
+        if not (frame_indices < self.sensor_history_length).all():
+            raise RuntimeError(
+                f"frame_indices should be less than sensor history length {self.sensor_history_length}, "
+                f"got {frame_indices}"
+            )
+
+        batch_indices = (
+            torch.arange(images.shape[0], device=images.device)
+            .unsqueeze(1)
+            .expand(-1, frame_indices.shape[1])
+            .to(torch.long)
+        )
+        delayed_frames = images[batch_indices, frame_indices]
+        if debug_vis and env.num_envs == 1:
+            _update_depth_window(
+                self.sensor_cfg.name,
+                delayed_frames[:, -1:].contiguous(),
+                delayed_frames.shape[-2],
+                delayed_frames.shape[-1],
+                title=f"Delayed Image - {self.sensor_cfg.name}",
+            )
+        return delayed_frames
+
+
 def generated_commands_reshaped(
     env: ManagerBasedRLEnv, command_name: str, unsqueeze_pos: int = 1, flatten: bool = False
 ) -> torch.Tensor:
@@ -518,18 +820,25 @@ def projected_gravity_delayed(
 def height_scan_feat(
     env: ManagerBasedEnv, sensor_cfg: SceneEntityCfg = SceneEntityCfg("height_scanner_critic"), offset: float = 0.5
 ) -> torch.Tensor:
-    """Height scan feature from a ray caster sensor, encoded using a pre-trained VAE encoder.
+    """Return critic-only encoded height scan features.
 
-    The height scan is reshaped to a 51x51 grid and encoded using a VAE encoder that
-    outputs a 64-channel, 7x7 spatial feature map (64*7*7 = 3136 features).
+    This is privileged terrain information for the value function. The actor does
+    not receive it. The raw ray caster produces a 51x51 grid around the robot;
+    the pre-trained heightscan VAE compresses it into ``[64, 7, 7]`` and the
+    observation manager flattens it to ``3136`` features.
+
+    Important distinction from visibility_map:
+
+    - height_scan_feat is a height/terrain feature and is critic-only.
+    - local_visibility_map is a binary observed/not-observed memory and is actor-side.
 
     Args:
         env: The environment object.
         sensor_cfg: The configuration of the height scanner sensor.
-        offset: Offset to subtract from the height values. Defaults to 0.5.
+        offset: Offset subtracted from height values before encoding.
 
     Returns:
-        The encoded height scan features of shape (num_envs, 3136).
+        Encoded height scan features with shape ``[num_envs, 3136]``.
     """
     global HEIGHTSCAN_FEAT_ENCODER, JIT_HEIGHTSCAN_FEAT_ENCODER
 
@@ -565,14 +874,22 @@ def height_scan_feat(
 
 
 def generated_actions(env: ManagerBasedRLEnv, action_name: str) -> torch.Tensor:
-    """The generated action from action term in the action manager with the given name.
+    """Return the high-level action after IsaacLab action-term processing.
+
+    In this project the trainable SRU policy does not directly output low-level
+    joint targets. It outputs a navigation/action command consumed by an action
+    term, and that action term may clamp, scale, or otherwise process the raw
+    policy output. This observation exposes the processed action, which is useful
+    when the actor/critic need action history or when logging reward terms such as
+    action-rate penalties.
 
     Args:
         env: The environment object.
         action_name: The name of the action term.
 
     Returns:
-        The processed actions from the action term.
+        Processed high-level action tensor with shape determined by the selected
+        action term.
     """
     return env.action_manager.get_term(action_name).processed_actions
 
@@ -583,19 +900,22 @@ def generated_commands_reshaped_delayed(
     unsqueeze_pos: int = 1,
     flatten: bool = False,
 ) -> torch.Tensor:
-    """The generated command with delay applied.
+    """Return a delayed command from the command manager.
 
-    Requires env.delay_manager to exist. Each environment has a random delay
-    sampled from [0, max_delay] at episode reset.
+    For navigation, the command is usually the target/goal representation used by
+    the policy. Applying delay here makes command perception consistent with the
+    delayed proprioception and delayed depth observations used by the actor.
 
     Args:
         env: The environment object (must have delay_manager attribute).
         command_name: The name of the command term.
-        unsqueeze_pos: Position to unsqueeze the command.
-        flatten: Whether to flatten the command.
+        unsqueeze_pos: Position to unsqueeze the command when a sequence/channel
+            dimension is expected by the observation group.
+        flatten: If True, keep the command as ``[num_envs, command_dim]``.
 
     Returns:
-        The delayed command.
+        Delayed command tensor. Shape is either flat ``[num_envs, command_dim]``
+        or unsqueezed according to ``unsqueeze_pos``.
     """
     if flatten:
         command = env.command_manager.get_command(command_name)
@@ -608,14 +928,19 @@ def generated_commands_reshaped_delayed(
 def last_low_level_action(
     env: ManagerBasedEnv, action_term: str, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
 ) -> torch.Tensor:
-    """The last low-level action.
+    """Return the most recent frozen low-level locomotion action.
+
+    The SRU policy is the high-level navigator. The G1 locomotion policy is
+    frozen underneath it. This observation exposes the previous low-level joint
+    action for the selected joints so the high-level policy/critic can infer how
+    the frozen controller is currently behaving.
 
     Args:
         env: The environment object.
         action_term: The name of the action term.
 
     Returns:
-        The last low-level action.
+        Low-level action tensor indexed by ``asset_cfg.joint_ids``.
     """
     action_term: PerceptiveNavigationSE2Action = env.action_manager._terms[action_term]
     return action_term.low_level_actions[:, asset_cfg.joint_ids]
@@ -623,27 +948,47 @@ def last_low_level_action(
 
 @torch.inference_mode()
 def depth_image_prefect(env, sensor_cfg):
-    """Return the perfect (non-noisy) encoded depth image from the camera.
+    """Return perfect/non-noisy encoded depth features.
+
+    The spelling ``prefect`` is kept for compatibility with existing config
+    files. Conceptually this is ``perfect`` depth.
+
+    This path is used where we want camera geometry without actor-side corruption:
+
+    1. Read IsaacLab ray-caster depth ``distance_to_image_plane``.
+    2. Replace NaN/Inf values with finite sentinels.
+    3. Reshape raw depth from flattened camera output to ``[B, 1, H, W]``.
+    4. Apply the frozen depth encoder.
+    5. Flatten encoded features before handing them to the observation manager.
+
+    No random noise and no delay are applied here. In contrast,
+    ``depth_image_noisy_delayed`` is the actor-facing observation used during
+    SRU training.
 
     Args:
         env: The environment object.
         sensor_cfg: The sensor configuration.
 
     Returns:
-        The encoded depth image features.
+        Flattened encoded depth features with shape ``[num_envs, 64 * 5 * 8]``
+        for the current G1 camera/encoder setup.
     """
-    # Ensure encoder is initialized
+    # The depth encoder is a singleton. This call is cheap after first use and
+    # protects play/eval scripts that may not initialize it in config __post_init__.
     _ensure_depth_noise_generator_initialized()
 
     depth_camera = env.scene.sensors[sensor_cfg.name]
 
-    # Get depth image tensor
+    # IsaacLab ray-caster output is ``[B, H, W, 1]`` or equivalent contiguous
+    # camera layout depending on sensor internals. The encoder expects
+    # ``[B, 1, H, W]``, so we first flatten per environment and then reshape.
     depth_tensor = depth_camera.data.output["distance_to_image_plane"].view(env.num_envs, -1)
 
-    # Handle NaN values by replacing them with 50.0
+    # Invalid misses may appear as NaN or Inf. Large positive values are outside
+    # the valid depth range and are later zeroed in JIT mode.
     depth_tensor = torch.nan_to_num(depth_tensor, nan=50.0, posinf=50.0, neginf=0.0)
 
-    # Reshape the tensor to [B, 1, H, W]
+    # Camera ``image_shape`` is ``(H, W)`` in IsaacLab sensor data.
     H, W = depth_camera.image_shape
     depth_tensor = depth_tensor.view(-1, 1, H, W)
 
@@ -652,9 +997,13 @@ def depth_image_prefect(env, sensor_cfg):
     )
     model = cast(torch.jit.ScriptModule, JIT_DEPTH_NOISE_GENERATOR)
     if use_jit:
+        # The JIT encoder path only returns encoded features, so invalid depth is
+        # filtered here before inference.
         depth_tensor[depth_tensor > max_depth] = 0.0
         encoded_depth_tensor = model(depth_tensor)
     else:
+        # Non-JIT DepthNoiseEncoder returns ``(encoded, noisy_depth)``. The
+        # perfect path ignores the noisy image and only keeps encoded features.
         encoded_depth_tensor, _ = model(depth_tensor)
 
     return encoded_depth_tensor.view(env.num_envs, -1)
@@ -664,10 +1013,21 @@ def depth_image_prefect(env, sensor_cfg):
 def depth_image_noisy_delayed(
     env, sensor_cfg, visualize: bool = False
 ):
-    """Return the noisy and delayed encoded depth image from the camera.
+    """Return actor-facing noisy and delayed encoded depth features.
 
-    Requires env.delay_manager to exist. Each environment has a random delay
-    sampled from [0, max_delay] at episode reset.
+    This is the main visual observation consumed by the SRU actor. The intended
+    data flow is:
+
+    1. Read raw depth from the ray-caster camera.
+    2. Replace invalid values and reshape to ``[B, 1, H, W]``.
+    3. Apply depth preprocessing/noise/encoding.
+    4. Cache the noisy raw depth sample for ``local_visibility_map``.
+    5. Flatten the encoded feature map.
+    6. Apply per-env observation delay to the encoded feature vector.
+
+    The depth encoder output is conceptually ``[B, 64, 5, 8]``. The observation
+    manager receives the flattened version ``[B, 2560]``. ``ActorCriticSRU`` then
+    slices this block according to the policy observation layout.
 
     Args:
         env: The environment object (must have delay_manager attribute).
@@ -675,20 +1035,21 @@ def depth_image_noisy_delayed(
         visualize: Whether to visualize the depth image.
 
     Returns:
-        The delayed encoded depth image features.
+        Delayed flattened encoded depth features with shape
+        ``[num_envs, 64 * 5 * 8]``.
     """
-    # Ensure encoder is initialized
+    # Same singleton guard as the perfect path.
     _ensure_depth_noise_generator_initialized()
 
     depth_camera = env.scene.sensors[sensor_cfg.name]
 
-    # Get depth image tensor
+    # Start from raw metric depth in image-plane distance.
     depth_tensor = depth_camera.data.output["distance_to_image_plane"].view(env.num_envs, -1)
 
-    # Handle NaN values by replacing them with 50.0
+    # Normalize invalid ray misses before any encoder/noise logic.
     depth_tensor = torch.nan_to_num(depth_tensor, nan=50.0, posinf=50.0, neginf=0.0)
 
-    # Reshape the tensor to [B, 1, H, W]
+    # Frozen encoder expects channel-first image format.
     H, W = depth_camera.image_shape
     depth_tensor = depth_tensor.view(-1, 1, H, W)
 
@@ -697,14 +1058,21 @@ def depth_image_noisy_delayed(
     )
     model = cast(torch.jit.ScriptModule, JIT_DEPTH_NOISE_GENERATOR)
     if use_jit:
+        # JIT path mirrors the senior implementation: values outside the encoder
+        # depth range are treated as invalid and set to zero.
         depth_tensor[depth_tensor > max_depth] = 0.0  # depth larger than depth max is invalid
         depth_tensor[depth_tensor < min_depth] = 0.0  # depth smaller than depth min is invalid
         encoded_depth_tensor = model(depth_tensor)
         noisy_depth_tensor = depth_tensor
     else:
+        # Non-JIT path can produce an explicitly noisy raw depth tensor. That raw
+        # tensor is what the visibility map should see, so it is cached below.
         encoded_depth_tensor, noisy_depth_tensor = model(depth_tensor)
 
     camera_name = sensor_cfg.name if hasattr(sensor_cfg, "name") else "depth"
+    # ``local_visibility_map`` is a separate observation term and may be called
+    # after this term in the same observation pass. Caching guarantees both terms
+    # use the same noisy camera sample instead of independently re-sampling noise.
     _cache_noisy_depth_sample(env, camera_name, noisy_depth_tensor, depth_camera)
 
     # Continuous visualization (single-env) with persistent windows
@@ -713,7 +1081,8 @@ def depth_image_noisy_delayed(
 
     encoded_depth_tensor_reshaped = encoded_depth_tensor.view(env.num_envs, -1)
 
-    # Apply delay using env's delay manager
+    # Apply the same delay system as proprioception/commands. Delay is applied to
+    # encoded features here, not raw pixels.
     return env.delay_manager.compute_delayed_depth(encoded_depth_tensor_reshaped, camera_name)
 
 
@@ -733,16 +1102,34 @@ def local_visibility_map(
     The delayed raw sample packs depth, camera pose, and intrinsics together so the
     back-projection uses a temporally consistent camera frame. The map contains no
     privileged terrain height or danger labels.
+
+    Why pack pose/intrinsics together with depth?
+
+    - If only depth were delayed, the map would combine an old image with the
+      current camera pose, producing spatially wrong points.
+    - Packing ``depth + camera_pos + camera_quat + intrinsics`` into one vector
+      and passing it through ``compute_delayed_depth`` makes all fields share the
+      same sampled delay for each environment.
+
+    Returned shape is ``[num_envs, grid_size * grid_size]``. With defaults this
+    is ``[num_envs, 4096]``.
     """
+    # Reuse the noisy raw depth created by ``depth_image_noisy_delayed`` when it
+    # is available. If observation ordering calls this term first, the helper
+    # falls back to constructing a compatible noisy sample.
     sample = _get_noisy_depth_sample(env, sensor_cfg)
     depth = sample["depth"]
     if depth.dim() == 4:
+        # Expected path: [B, 1, H, W] -> [B, H*W].
         depth_flat = depth[:, 0].flatten(start_dim=1)
         height, width = depth.shape[-2:]
     else:
+        # Compatibility path for already-flat depth tensors.
         height, width = env.scene.sensors[sensor_cfg.name].image_shape
         depth_flat = depth.view(env.num_envs, -1)
 
+    # Pack all camera information into one delayed vector. The final layout is:
+    # [depth_pixels, camera_pos_w(3), camera_quat_w(4), intrinsics(9)].
     packed = torch.cat(
         (
             depth_flat,
@@ -755,6 +1142,7 @@ def local_visibility_map(
     camera_name = sensor_cfg.name if hasattr(sensor_cfg, "name") else "depth"
     delayed = env.delay_manager.compute_delayed_depth(packed, f"{camera_name}_visibility_sample")
 
+    # Unpack the temporally consistent delayed sample.
     depth_size = height * width
     delayed_depth = delayed[:, :depth_size].view(env.num_envs, 1, height, width)
     camera_pos_w = delayed[:, depth_size : depth_size + 3]
@@ -762,6 +1150,7 @@ def local_visibility_map(
     intrinsics = delayed[:, depth_size + 7 : depth_size + 16].view(env.num_envs, 3, 3)
 
     robot = env.scene[asset_cfg.name]
+    # The manager owns map memory across steps and handles reset/warp/update.
     manager = _get_or_create_visibility_map_manager(
         env,
         size_m=size_m,

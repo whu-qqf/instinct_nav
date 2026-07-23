@@ -987,3 +987,30 @@ GIF 帧设置按师兄 `eval.py` 默认值显式写出：`--failure_rgb_history_
     --gif_dir /path/to/videos/play_gifs
 ```
 
+
+
+### 2026-07-23 追加：G1 低层视觉与观测入口继续本地化
+
+- 低层运控相机不再从 InstinctLab parkour task 的 `SceneCfg.camera` deep-copy；已在 `source/instinct_nav/instinct_nav/navigation/config/g1_instinct/navigation_env_cfg.py` 中显式定义 `NoisyGroupedRayCasterCameraCfg`。
+- 本地显式保留低层 checkpoint 期望的相机参数：
+  - parent link: `{ENV_REGEX_NS}/Robot/torso_link`
+  - ray alignment: `yaw`
+  - raw depth resolution: `64 x 36`
+  - FOV: `89.51 deg x 58.29 deg`
+  - update period: `0.02 s`
+  - camera offset: `pos=(0.0487988662332928, 0.01, 0.4378029937970051)`，`rot=(0.9135367613482678, 0.004363309284746571, 0.4067366430758002, 0.0)`
+  - noise pipeline: `crop_and_resize(crop_region=(18, 0, 16, 16))`、`gaussian_blur(kernel_size=3, sigma=1)`、`depth_normalization(depth_range=(0.0, 2.5), output_range=(0.0, 1.0))`
+  - history buffer: `data_histories={"distance_to_image_plane_noised": 37}`
+- 新增 `source/instinct_nav/instinct_nav/navigation/config/g1_instinct/g1_asset_cfg.py`，在 instinct_nav 内部构造 `G1_WITH_SHOE_CFG`，避免从 `instinctlab.tasks.parkour.config.g1.g1_parkour_target_amp_cfg` 导入整个 parkour task 配置。
+- G1-with-shoe URDF 路径现在指向项目内 external checkout：`/workspace/instinct_nav/external/instinctlab/instinctlab/tasks/parkour/urdf/g1_29dof_torsoBase_popsicle_with_shoe.urdf`。
+- `InstinctLowLevelPolicyCfg` 的本体观测和 command/action cfg 已切到 `nav_mdp` 入口：`base_ang_vel`、`projected_gravity`、`generated_commands`、`joint_pos_rel`、`joint_vel_rel`、`JointPositionActionCfg`。
+- 已将 InstinctLab 的低层图像历史读取器本地化为 `nav_mdp.delayed_visualizable_image`，用于从 `NoisyGroupedRayCasterCamera` 的 `distance_to_image_plane_noised_history` 中按延迟抽取 `8 x 18 x 32` depth history。
+- 静态检查结果：`g1_instinct/navigation_env_cfg.py` 和本地 `observations.py` 不再直接引用 `instinctlab.tasks.parkour.mdp`、`InstinctParkourSceneCfg` 或 `G1_with_shoe_CFG`。
+- 语法检查通过：
+
+```bash
+/workspace/instinctlab51-env/bin/python -m compileall -q \
+    /workspace/instinct_nav/source/instinct_nav/instinct_nav/navigation/config/g1_instinct/g1_asset_cfg.py \
+    /workspace/instinct_nav/source/instinct_nav/instinct_nav/navigation/config/g1_instinct/navigation_env_cfg.py \
+    /workspace/instinct_nav/source/instinct_nav/instinct_nav/navigation/mdp/observations.py
+```

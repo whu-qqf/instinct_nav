@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import math
 import os
 from pathlib import Path
 
@@ -9,16 +10,16 @@ from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import RayCasterCfg, patterns
+from isaaclab.sensors.ray_caster.patterns import PinholeCameraPatternCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 
 import instinct_nav.navigation.mdp as nav_mdp
 from instinct_nav.navigation.navigation_env_cfg import NavigationEnvCfg
 
-import instinctlab.tasks.parkour.mdp as instinct_mdp
-from instinctlab.assets.unitree_g1 import beyondmimic_action_scale
-from instinctlab.tasks.parkour.config.g1.g1_parkour_target_amp_cfg import G1_with_shoe_CFG
-from instinctlab.tasks.parkour.config.parkour_env_cfg import SceneCfg as InstinctParkourSceneCfg
+from .g1_asset_cfg import G1_WITH_SHOE_CFG, beyondmimic_action_scale
+from instinctlab.sensors import NoisyGroupedRayCasterCameraCfg
+from instinctlab.utils.noise import CropAndResizeCfg, DepthNormalizationCfg, GaussianBlurNoiseCfg
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[6]
 INSTINCT_G1_CHECKPOINT = os.environ.get(
@@ -43,7 +44,7 @@ class G1InstinctNavigationEnvCfg(NavigationEnvCfg):
         self.commands.robot_goal.debug_vis = False
         self.commands.robot_goal.sync_robot_root_to_spawn_origin = True
 
-        self.scene.robot = copy.deepcopy(G1_with_shoe_CFG).replace(prim_path="{ENV_REGEX_NS}/Robot")
+        self.scene.robot = copy.deepcopy(G1_WITH_SHOE_CFG).replace(prim_path="{ENV_REGEX_NS}/Robot")
         self.scene.robot.spawn.merge_fixed_joints = True
         self.scene.robot.init_state.pos = (0.0, 0.0, 0.9)
 
@@ -66,8 +67,44 @@ class G1InstinctNavigationEnvCfg(NavigationEnvCfg):
         self.events.randomize_low_pass_filter_alpha = None
         self.events.push_robot = None
 
-        self.scene.camera = copy.deepcopy(InstinctParkourSceneCfg(num_envs=self.scene.num_envs, env_spacing=self.scene.env_spacing).camera)
-        self.scene.camera.prim_path = "{ENV_REGEX_NS}/Robot/torso_link"
+        # Frozen InstinctLab G1 parkour low-level policy camera.
+        #
+        # Keep this config local to instinct_nav instead of deep-copying
+        # the original parkour task config. The low-level checkpoint expects this
+        # NoisyGroupedRayCasterCamera stream: raw 64x36 depth, crop/resize to
+        # 18x32, 8 delayed history frames in InstinctLowLevelPolicyCfg.
+        self.scene.camera = NoisyGroupedRayCasterCameraCfg(
+            prim_path="{ENV_REGEX_NS}/Robot/torso_link",
+            mesh_prim_paths=["/World/ground"],
+            ray_alignment="yaw",
+            pattern_cfg=PinholeCameraPatternCfg(
+                focal_length=1.0,
+                horizontal_aperture=2 * math.tan(math.radians(89.51) / 2),
+                vertical_aperture=2 * math.tan(math.radians(58.29) / 2),
+                width=64,
+                height=36,
+            ),
+            debug_vis=False,
+            data_types=["distance_to_image_plane"],
+            update_period=0.02,
+            depth_clipping_behavior="max",
+            offset=NoisyGroupedRayCasterCameraCfg.OffsetCfg(
+                pos=(0.0487988662332928, 0.01, 0.4378029937970051),
+                rot=(0.9135367613482678, 0.004363309284746571, 0.4067366430758002, 0.0),
+                convention="world",
+            ),
+            min_distance=0.1,
+            noise_pipeline={
+                "crop_and_resize": CropAndResizeCfg(crop_region=(18, 0, 16, 16)),
+                "gaussian_blur": GaussianBlurNoiseCfg(kernel_size=3, sigma=1),
+                "depth_normalization": DepthNormalizationCfg(
+                    depth_range=(0.0, 2.5),
+                    normalize=True,
+                    output_range=(0.0, 1.0),
+                ),
+            },
+            data_histories={"distance_to_image_plane_noised": 37},
+        )
 
         self.scene.raycast_camera.prim_path = "{ENV_REGEX_NS}/Robot/torso_link"
         self.scene.height_scanner_critic.prim_path = "{ENV_REGEX_NS}/Robot/torso_link"
@@ -82,7 +119,7 @@ class G1InstinctNavigationEnvCfg(NavigationEnvCfg):
 
         self.actions.velocity_command = nav_mdp.InstinctFrozenNavigationSE2ActionCfg(
             asset_name="robot",
-            low_level_position_action=instinct_mdp.JointPositionActionCfg(
+            low_level_position_action=nav_mdp.JointPositionActionCfg(
                 asset_name="robot",
                 joint_names=[".*"],
                 scale=beyondmimic_action_scale,
@@ -124,33 +161,33 @@ class G1InstinctNavigationEnvCfg(NavigationEnvCfg):
 @configclass
 class InstinctLowLevelPolicyCfg(ObsGroup):
     base_ang_vel = ObsTerm(
-        func=instinct_mdp.base_ang_vel,
+        func=nav_mdp.base_ang_vel,
         noise=Unoise(n_min=-0.2, n_max=0.2),
         history_length=8,
         flatten_history_dim=True,
         scale=0.25,
     )
     projected_gravity = ObsTerm(
-        func=instinct_mdp.projected_gravity,
+        func=nav_mdp.projected_gravity,
         noise=Unoise(n_min=-0.05, n_max=0.05),
         history_length=8,
         flatten_history_dim=True,
     )
     velocity_commands = ObsTerm(
-        func=instinct_mdp.generated_commands,
+        func=nav_mdp.generated_commands,
         history_length=8,
         flatten_history_dim=True,
         params={"command_name": "base_velocity"},
         noise=None,
     )
     joint_pos = ObsTerm(
-        func=instinct_mdp.joint_pos_rel,
+        func=nav_mdp.joint_pos_rel,
         noise=Unoise(n_min=-0.01, n_max=0.01),
         history_length=8,
         flatten_history_dim=True,
     )
     joint_vel = ObsTerm(
-        func=instinct_mdp.joint_vel_rel,
+        func=nav_mdp.joint_vel_rel,
         noise=Unoise(n_min=-0.5, n_max=0.5),
         scale=0.05,
         history_length=8,
@@ -163,7 +200,7 @@ class InstinctLowLevelPolicyCfg(ObsGroup):
         flatten_history_dim=True,
     )
     depth_image = ObsTerm(
-        func=instinct_mdp.delayed_visualizable_image,
+        func=nav_mdp.delayed_visualizable_image,
         params={
             "data_type": "distance_to_image_plane_noised_history",
             "sensor_cfg": SceneEntityCfg("camera"),
