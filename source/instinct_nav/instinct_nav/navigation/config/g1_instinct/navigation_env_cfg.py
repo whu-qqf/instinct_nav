@@ -283,3 +283,195 @@ class G1InstinctNavigationEnvCfg_VIS_PLAY(G1InstinctNavigationEnvCfg_VIS):
         self.observations.policy.enable_corruption = False
         self.events.base_external_force_torque = None
         self.events.push_robot = None
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_SCENE_TOKEN(G1InstinctNavigationEnvCfg):
+    """G1 navigation config with actor-side scene tokens derived from local visibility memory."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.observations.policy.scene_tokens = ObsTerm(
+            func=nav_mdp.scene_tokens_from_visibility_map,
+            params={
+                "sensor_cfg": SceneEntityCfg("raycast_camera"),
+                "size_m": 6.4,
+                "grid_size": 64,
+                "token_grid_size": 8,
+                "depth_min_m": 0.5,
+                "depth_max_m": 8.0,
+                "pixel_stride": 2,
+                "decay": 1.0,
+            },
+        )
+        self.events.reset_delay_buffer = EventTerm(func=nav_mdp.reset_visibility_map, mode="reset")
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_SCENE_TOKEN_DEV(G1InstinctNavigationEnvCfg_SCENE_TOKEN):
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.num_envs = 1
+        self.scene.terrain.terrain_generator.num_rows = 1
+        self.scene.terrain.terrain_generator.num_cols = 8
+        self.scene.terrain.max_init_terrain_level = 0
+        self.scene.terrain.terrain_generator.difficulty_range = [0.0, 0.0]
+        self.scene.terrain.terrain_generator.curriculum = False
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_SCENE_TOKEN_PLAY(G1InstinctNavigationEnvCfg_SCENE_TOKEN):
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.num_envs = 20
+        self.scene.env_spacing = 2.5
+        self.observations.policy.enable_corruption = False
+        self.events.base_external_force_torque = None
+        self.events.push_robot = None
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_SCENE_TOKEN_RISK(G1InstinctNavigationEnvCfg):
+    """G1 navigation config with 9D scene-risk tokens for actor and critic."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        scene_token_term = ObsTerm(
+            func=nav_mdp.scene_tokens_risk_from_visibility_map,
+            params={
+                "sensor_cfg": SceneEntityCfg("raycast_camera"),
+                "size_m": 6.4,
+                "grid_size": 64,
+                "token_grid_size": 8,
+                "depth_min_m": 0.5,
+                "depth_max_m": 8.0,
+                "pixel_stride": 2,
+                "decay": 1.0,
+            },
+        )
+        self.observations.policy.scene_tokens = scene_token_term
+        self.observations.critic.scene_tokens = scene_token_term
+        self.events.reset_delay_buffer = EventTerm(func=nav_mdp.reset_visibility_map, mode="reset")
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_SCENE_TOKEN_RISK_DEV(G1InstinctNavigationEnvCfg_SCENE_TOKEN_RISK):
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.num_envs = 1
+        self.scene.terrain.terrain_generator.num_rows = 1
+        self.scene.terrain.terrain_generator.num_cols = 8
+        self.scene.terrain.max_init_terrain_level = 0
+        self.scene.terrain.terrain_generator.difficulty_range = [0.0, 0.0]
+        self.scene.terrain.terrain_generator.curriculum = False
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_SCENE_TOKEN_RISK_PLAY(G1InstinctNavigationEnvCfg_SCENE_TOKEN_RISK):
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.num_envs = 20
+        self.scene.env_spacing = 2.5
+        self.observations.policy.enable_corruption = False
+        self.events.base_external_force_torque = None
+        self.events.push_robot = None
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_SCENE_TOKEN_RISK_NOGOAL(G1InstinctNavigationEnvCfg):
+    """G1 navigation config with 6D scene-risk tokens without goal-relative features."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        scene_token_term = ObsTerm(
+            func=nav_mdp.scene_tokens_risk_no_goal_from_visibility_map,
+            params={
+                "sensor_cfg": SceneEntityCfg("raycast_camera"),
+                "size_m": 6.4,
+                "grid_size": 64,
+                "token_grid_size": 8,
+                "depth_min_m": 0.5,
+                "depth_max_m": 8.0,
+                "pixel_stride": 2,
+                "decay": 1.0,
+            },
+        )
+        self.observations.policy.scene_tokens = scene_token_term
+        self.observations.critic.scene_tokens = scene_token_term
+        self.events.reset_delay_buffer = EventTerm(func=nav_mdp.reset_visibility_map, mode="reset")
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_SCENE_TOKEN_RISK_NOGOAL_DEV(G1InstinctNavigationEnvCfg_SCENE_TOKEN_RISK_NOGOAL):
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.num_envs = 1
+        self.scene.terrain.terrain_generator.num_rows = 1
+        self.scene.terrain.terrain_generator.num_cols = 8
+        self.scene.terrain.max_init_terrain_level = 0
+        self.scene.terrain.terrain_generator.difficulty_range = [0.0, 0.0]
+        self.scene.terrain.terrain_generator.curriculum = False
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_SCENE_TOKEN_RISK_NOGOAL_PLAY(G1InstinctNavigationEnvCfg_SCENE_TOKEN_RISK_NOGOAL):
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.num_envs = 20
+        self.scene.env_spacing = 2.5
+        self.observations.policy.enable_corruption = False
+        self.events.base_external_force_torque = None
+        self.events.push_robot = None
+
+@configclass
+class G1InstinctNavigationEnvCfg_SCENE_TOKEN_RISK_NOGOAL_SHARED_LOWCAM(
+    G1InstinctNavigationEnvCfg_SCENE_TOKEN_RISK_NOGOAL
+):
+    """Scene-token v3 using the frozen low-level policy camera as the only depth source.
+
+    The low-level Instinct policy still consumes the camera's own noised/cropped
+    history stream. The high-level SRU policy and critic read the same sensor's
+    raw distance_to_image_plane stream, encode it with the SRU depth encoder,
+    and build scene tokens from that same camera pose/intrinsics.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        shared_camera = SceneEntityCfg("camera")
+        self.observations.policy.depth_image.params["sensor_cfg"] = shared_camera
+        self.observations.critic.depth_image.params["sensor_cfg"] = shared_camera
+        self.observations.policy.scene_tokens.params["sensor_cfg"] = shared_camera
+        self.observations.critic.scene_tokens.params["sensor_cfg"] = shared_camera
+
+        # This task intentionally uses one physical depth sensor. Removing the
+        # inherited SRU raycast camera avoids creating a second camera stream.
+        self.scene.raycast_camera = None
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_SCENE_TOKEN_RISK_NOGOAL_SHARED_LOWCAM_DEV(
+    G1InstinctNavigationEnvCfg_SCENE_TOKEN_RISK_NOGOAL_SHARED_LOWCAM
+):
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.num_envs = 1
+        self.scene.terrain.terrain_generator.num_rows = 1
+        self.scene.terrain.terrain_generator.num_cols = 8
+        self.scene.terrain.max_init_terrain_level = 0
+        self.scene.terrain.terrain_generator.difficulty_range = [0.0, 0.0]
+        self.scene.terrain.terrain_generator.curriculum = False
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_SCENE_TOKEN_RISK_NOGOAL_SHARED_LOWCAM_PLAY(
+    G1InstinctNavigationEnvCfg_SCENE_TOKEN_RISK_NOGOAL_SHARED_LOWCAM
+):
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.num_envs = 20
+        self.scene.env_spacing = 2.5
+        self.observations.policy.enable_corruption = False
+        self.events.base_external_force_torque = None
+        self.events.push_robot = None
+

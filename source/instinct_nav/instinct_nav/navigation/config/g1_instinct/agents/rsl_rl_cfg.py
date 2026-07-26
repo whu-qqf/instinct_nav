@@ -89,3 +89,99 @@ class G1InstinctNavPPOVisibilityQueryRunnerDevCfg(G1InstinctNavPPOVisibilityQuer
         self.max_iterations = 300
         self.experiment_name = "g1_instinct_navigation_ppo_vismap_dev"
         self.logger = "tensorboard"
+
+
+@configclass
+class G1InstinctNavPPOSceneTokenQueryRunnerCfg(G1InstinctNavPPOVisMapRunnerCfg):
+    """PPO query fusion over fixed scene tokens derived from local visibility memory."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.run_name = "scene_token_query_fusion"
+        self.policy.use_actor_visibility_map = False
+        self.policy.use_actor_visibility_early_fusion = False
+        self.policy.use_actor_visibility_query_attention = False
+        self.policy.use_actor_scene_tokens = True
+        self.policy.scene_token_num_tokens = 64
+        self.policy.scene_token_dim = 6
+        self.policy.scene_token_feature_dim = 64
+        self.policy.scene_token_query_num_heads = 4
+
+
+@configclass
+class G1InstinctNavPPOSceneTokenQueryRunnerDevCfg(G1InstinctNavPPOSceneTokenQueryRunnerCfg):
+    def __post_init__(self):
+        super().__post_init__()
+        self.max_iterations = 300
+        self.experiment_name = "g1_instinct_navigation_ppo_scene_token_dev"
+        self.logger = "tensorboard"
+
+
+@configclass
+class G1InstinctNavPPOSceneTokenRiskQueryRunnerCfg(G1InstinctNavPPOSceneTokenQueryRunnerCfg):
+    """PPO query fusion over 9D actor/critic scene-risk tokens."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.run_name = "scene_token_risk_query_fusion"
+        self.policy.use_actor_scene_tokens = True
+        self.policy.use_critic_scene_tokens = True
+        self.policy.scene_token_num_tokens = 64
+        self.policy.scene_token_dim = 9
+        self.policy.scene_token_feature_dim = 64
+        self.policy.scene_token_query_num_heads = 4
+
+
+@configclass
+class G1InstinctNavPPOSceneTokenRiskQueryRunnerDevCfg(G1InstinctNavPPOSceneTokenRiskQueryRunnerCfg):
+    def __post_init__(self):
+        super().__post_init__()
+        self.max_iterations = 300
+        self.experiment_name = "g1_instinct_navigation_ppo_scene_token_risk_dev"
+        self.logger = "tensorboard"
+
+
+@configclass
+class G1InstinctNavPPOSceneTokenRiskNoGoalQueryRunnerCfg(G1InstinctNavPPOSceneTokenQueryRunnerCfg):
+    """PPO query fusion over 6D actor/critic scene-risk tokens without goal-relative features."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.run_name = "scene_token_risk_no_goal_query_fusion"
+        self.policy.use_actor_scene_tokens = True
+        self.policy.use_critic_scene_tokens = True
+        self.policy.scene_token_num_tokens = 64
+        self.policy.scene_token_dim = 6
+        self.policy.scene_token_feature_dim = 64
+        self.policy.scene_token_query_num_heads = 4
+
+
+@configclass
+class G1InstinctNavPPOSceneTokenRiskNoGoalQueryRunnerDevCfg(G1InstinctNavPPOSceneTokenRiskNoGoalQueryRunnerCfg):
+    def __post_init__(self):
+        super().__post_init__()
+        self.max_iterations = 300
+        self.experiment_name = "g1_instinct_navigation_ppo_scene_token_risk_no_goal_dev"
+        self.logger = "tensorboard"
+
+@configclass
+class G1InstinctNavPPOSceneTokenRiskNoGoalSharedLowCamQueryRunnerCfg(
+    G1InstinctNavPPOSceneTokenRiskNoGoalQueryRunnerCfg
+):
+    """Scene-token v3 runner for the shared low-level camera ablation."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.run_name = "scene_token_risk_no_goal_shared_lowcam_query_fusion"
+
+
+@configclass
+class G1InstinctNavPPOSceneTokenRiskNoGoalSharedLowCamQueryRunnerDevCfg(
+    G1InstinctNavPPOSceneTokenRiskNoGoalSharedLowCamQueryRunnerCfg
+):
+    def __post_init__(self):
+        super().__post_init__()
+        self.max_iterations = 300
+        self.experiment_name = "g1_instinct_navigation_ppo_scene_token_risk_no_goal_shared_lowcam_dev"
+        self.logger = "tensorboard"
+

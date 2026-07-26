@@ -140,12 +140,14 @@ parser.add_argument(
 parser.add_argument(
     "--failure_rgb_include_successes",
     action="store_true",
-    help="Also export real 3D RGB captures for successful episodes. Filenames use the 'success' label.",
+    default=True,
+    help="Export successful episodes too. Enabled by default; filenames use the 'success' label.",
 )
 parser.add_argument(
     "--failure_rgb_include_observations",
     action="store_true",
-    help="When exporting failure RGB GIFs, compose each RGB frame with the corresponding depth and height observations.",
+    default=True,
+    help="When exporting RGB GIFs, compose each RGB frame with depth, visibility, and scene-token observation panels. Enabled by default.",
 )
 parser.add_argument(
     "--depth_pit_to_obstacle",
@@ -240,7 +242,8 @@ parser.add_argument(
 parser.add_argument(
     "--failure_rgb_follow_robot",
     action="store_true",
-    help="For RGB GIF history export, recenter the BEV RGB camera on the robot root at every history frame.",
+    default=True,
+    help="For RGB GIF history export, recenter the BEV RGB camera on the robot root at every history frame. Enabled by default.",
 )
 parser.add_argument(
     "--failure_rgb_include_rear_view",
@@ -283,6 +286,16 @@ parser.add_argument(
     type=int,
     default=10,
     help="Number of pre-impact control-step frames to include in each RGB failure GIF. Values <=1 disable GIF history and use only the final pre-impact frame.",
+)
+parser.add_argument(
+    "--failure_rgb_full_episode",
+    action="store_true",
+    default=True,
+    help=(
+        "When exporting RGB/observation GIFs, keep enough history to render the full episode "
+        "from reset to termination instead of only the last --failure_rgb_history_frames frames. "
+        "Enabled by default; use modest num_envs because observation panels are cached for every env."
+    ),
 )
 parser.add_argument(
     "--failure_rgb_gif_frame_ms",
@@ -1667,6 +1680,30 @@ def _visibility_map_to_rgb(visibility_map: np.ndarray) -> np.ndarray:
     return rgb
 
 
+def _scene_tokens_to_rgb(scene_tokens: np.ndarray, token_grid_size: int = 8) -> np.ndarray:
+    """Render scene-token observations as compact BEV heatmaps.
+
+    The current SceneToken-Query policy uses 64 tokens with six fields:
+    [x, y, visible_ratio, dist_to_goal, cos_to_goal, sin_to_goal].
+    For visual debugging we render visible_ratio and dist_to_goal side by side.
+    """
+    tokens = np.asarray(scene_tokens, dtype=np.float32)
+    if tokens.ndim == 1:
+        if tokens.size % 6 != 0:
+            raise ValueError(f"Expected flattened 6D scene tokens, got {tokens.size} values")
+        tokens = tokens.reshape(-1, 6)
+    expected_tokens = token_grid_size * token_grid_size
+    if tokens.shape[0] != expected_tokens or tokens.shape[1] < 4:
+        raise ValueError(f"Expected [{expected_tokens}, >=4] scene tokens, got {tokens.shape}")
+
+    visible_ratio = tokens[:, 2].reshape(token_grid_size, token_grid_size)
+    dist_to_goal = tokens[:, 3].reshape(token_grid_size, token_grid_size)
+    visible_rgb = _scalar_frame_to_rgb(visible_ratio, value_min=0.0, value_max=1.0, cmap_name="magma")
+    dist_rgb = _scalar_frame_to_rgb(dist_to_goal, value_min=0.0, value_max=4.0, cmap_name="viridis_r")
+    separator = np.full((token_grid_size, 1, 3), 245, dtype=np.uint8)
+    return np.concatenate([visible_rgb, separator, dist_rgb], axis=1)
+
+
 def _overlay_danger_mask_on_depth_rgb(depth_rgb: np.ndarray, danger_mask: np.ndarray | None) -> np.ndarray:
     if danger_mask is None:
         return depth_rgb
@@ -1693,6 +1730,7 @@ def _capture_observation_frame_cache(
         "local_map": [None] * num_envs,
         "local_gradient": [None] * num_envs,
         "visibility_obs": [None] * num_envs,
+        "scene_tokens": [None] * num_envs,
     }
     sensors = getattr(env.unwrapped.scene, "sensors", {})
 
@@ -1788,6 +1826,24 @@ def _capture_observation_frame_cache(
                 cached_frames["visibility_obs"][env_id] = _visibility_map_to_rgb(visibility_np[env_id])
         except Exception as exc:
             print(f"[WARN] Failed to capture actor visibility-map observation: {exc}")
+        try:
+            scene_tokens = nav_observations.scene_tokens_from_visibility_map(
+                env.unwrapped,
+                sensor_cfg=SceneEntityCfg("raycast_camera"),
+                asset_cfg=SceneEntityCfg("robot"),
+                size_m=6.4,
+                grid_size=64,
+                token_grid_size=8,
+                depth_min_m=0.5,
+                depth_max_m=8.0,
+                pixel_stride=2,
+                decay=1.0,
+            )
+            scene_tokens_np = scene_tokens.detach().cpu().view(num_envs, 64, 6).numpy()
+            for env_id in range(num_envs):
+                cached_frames["scene_tokens"][env_id] = _scene_tokens_to_rgb(scene_tokens_np[env_id])
+        except Exception as exc:
+            print(f"[WARN] Failed to capture actor scene-token observation: {exc}")
 
     return cached_frames
 
@@ -1960,17 +2016,21 @@ def capture_failure_observation_gifs(
             local_map_frame = None
             local_gradient_frame = None
             visibility_obs_frame = None
+            scene_token_frame = None
             observation_cache = selected_observations[history_index] if history_index < len(selected_observations) else None
             if observation_cache is not None:
                 local_map_frames = observation_cache.get("local_map", [])
                 local_gradient_frames = observation_cache.get("local_gradient", [])
                 visibility_obs_frames = observation_cache.get("visibility_obs", [])
+                scene_token_frames = observation_cache.get("scene_tokens", [])
                 if env_id < len(local_map_frames):
                     local_map_frame = local_map_frames[env_id]
                 if env_id < len(local_gradient_frames):
                     local_gradient_frame = local_gradient_frames[env_id]
                 if env_id < len(visibility_obs_frames):
                     visibility_obs_frame = visibility_obs_frames[env_id]
+                if env_id < len(scene_token_frames):
+                    scene_token_frame = scene_token_frames[env_id]
 
             if (
                 topdown_frame is not None
@@ -1980,6 +2040,7 @@ def capture_failure_observation_gifs(
                 or local_map_frame is not None
                 or local_gradient_frame is not None
                 or visibility_obs_frame is not None
+                or scene_token_frame is not None
             ):
                 rendered_combined_frames.append(
                     _compose_observation_triptych(
@@ -1991,6 +2052,7 @@ def capture_failure_observation_gifs(
                         local_map_frame=local_map_frame,
                         local_gradient_frame=local_gradient_frame,
                         visibility_obs_frame=visibility_obs_frame,
+                        scene_token_frame=scene_token_frame,
                     )
                 )
 
@@ -2199,8 +2261,11 @@ def capture_failure_rgb_screenshots(
             "checkpoint": os.path.abspath(os.path.expanduser(args_cli.checkpoint)) if args_cli.checkpoint else None,
         }
 
-        history_frames = max(1, int(args_cli.failure_rgb_history_frames))
-        selected_snapshots = list(pre_step_snapshot_history[-history_frames:]) if pre_step_snapshot_history else [pre_step_snapshot]
+        if args_cli.failure_rgb_full_episode:
+            selected_snapshots = list(pre_step_snapshot_history) if pre_step_snapshot_history else [pre_step_snapshot]
+        else:
+            history_frames = max(1, int(args_cli.failure_rgb_history_frames))
+            selected_snapshots = list(pre_step_snapshot_history[-history_frames:]) if pre_step_snapshot_history else [pre_step_snapshot]
         observation_candidates = []
         if args_cli.failure_rgb_include_observations:
             observation_candidates = list(pre_step_observation_history[-len(selected_snapshots):]) if selected_snapshots else []
@@ -2301,6 +2366,7 @@ def capture_failure_rgb_screenshots(
                 local_map_frame = None
                 local_gradient_frame = None
                 visibility_obs_frame = None
+                scene_token_frame = None
                 if observation_cache is not None:
                     depth_frames = observation_cache.get("depth", [])
                     processed_depth_frames = observation_cache.get("processed_depth", [])
@@ -2309,6 +2375,7 @@ def capture_failure_rgb_screenshots(
                     local_map_frames = observation_cache.get("local_map", [])
                     local_gradient_frames = observation_cache.get("local_gradient", [])
                     visibility_obs_frames = observation_cache.get("visibility_obs", [])
+                    scene_token_frames = observation_cache.get("scene_tokens", [])
                     if env_id < len(depth_frames):
                         depth_frame = depth_frames[env_id]
                     processed_depth_frame = None
@@ -2324,6 +2391,8 @@ def capture_failure_rgb_screenshots(
                         local_gradient_frame = local_gradient_frames[env_id]
                     if env_id < len(visibility_obs_frames):
                         visibility_obs_frame = visibility_obs_frames[env_id]
+                    if env_id < len(scene_token_frames):
+                        scene_token_frame = scene_token_frames[env_id]
                 else:
                     processed_depth_frame = None
                 rgb_frame = _compose_observation_triptych(
@@ -2336,6 +2405,7 @@ def capture_failure_rgb_screenshots(
                     local_map_frame=local_map_frame,
                     local_gradient_frame=local_gradient_frame,
                     visibility_obs_frame=visibility_obs_frame,
+                    scene_token_frame=scene_token_frame,
                 )
             rendered_rgb_frames.append(rgb_frame)
 
@@ -2529,11 +2599,12 @@ def _compose_observation_triptych(
     local_map_frame: np.ndarray | None = None,
     local_gradient_frame: np.ndarray | None = None,
     visibility_obs_frame: np.ndarray | None = None,
+    scene_token_frame: np.ndarray | None = None,
 ) -> np.ndarray:
     ordered_frames = [topdown_frame, rear_view_frame, depth_frame]
     if processed_depth_frame is not None:
         ordered_frames.append(processed_depth_frame)
-    ordered_frames.extend([height_frame, steep_frame, local_map_frame, local_gradient_frame, visibility_obs_frame])
+    ordered_frames.extend([height_frame, steep_frame, local_map_frame, local_gradient_frame, visibility_obs_frame, scene_token_frame])
     ordered_frames = [frame for frame in ordered_frames if frame is not None]
     if not ordered_frames:
         raise ValueError("At least one frame is required to compose observation visualization.")
@@ -3036,11 +3107,18 @@ def _run_eval_pass(
         os.makedirs(failure_rgb_output_dir, exist_ok=True)
         failure_rgb_camera = create_failure_rgb_camera(env)
 
+    if args_cli.failure_rgb_full_episode:
+        episode_history_frames = int(getattr(env.unwrapped, "max_episode_length", 0) or 0) + 2
+        if episode_history_frames <= 2:
+            episode_history_frames = max(1, int(round(float(env.unwrapped.cfg.episode_length_s) / float(env.unwrapped.step_dt)))) + 2
+    else:
+        episode_history_frames = 1
     pre_step_history_frames = max(
         1,
         int(args_cli.failure_rgb_history_frames),
         int(args_cli.observation_gif_frames),
         int(args_cli.local_terrain_map_history_frames) if args_cli.local_terrain_map else 1,
+        episode_history_frames,
     )
     pre_step_snapshot_history: deque[dict[str, torch.Tensor]] = deque(maxlen=pre_step_history_frames)
     pre_step_observation_history: deque[dict[str, list[np.ndarray | None]]] = deque(maxlen=pre_step_history_frames)
@@ -3332,6 +3410,7 @@ def _run_eval_pass(
             "follow_robot": bool(args_cli.failure_rgb_follow_robot),
             "export_mode": str(args_cli.failure_rgb_export_mode),
             "history_frames": int(args_cli.failure_rgb_history_frames),
+            "full_episode": bool(args_cli.failure_rgb_full_episode),
             "gif_frame_ms": int(args_cli.failure_rgb_gif_frame_ms),
             "include_rear_view": bool(args_cli.failure_rgb_include_rear_view),
             "rear_view_height_m": float(args_cli.failure_rgb_rear_height_m),
@@ -3513,11 +3592,18 @@ def main():
         )
     pre_step_snapshot = capture_base_contact_snapshot(env, base_contact_context)
     pre_step_delay_snapshot = _capture_observation_delay_snapshot(env)
+    if args_cli.failure_rgb_full_episode:
+        episode_history_frames = int(getattr(env.unwrapped, "max_episode_length", 0) or 0) + 2
+        if episode_history_frames <= 2:
+            episode_history_frames = max(1, int(round(float(env.unwrapped.cfg.episode_length_s) / float(env.unwrapped.step_dt)))) + 2
+    else:
+        episode_history_frames = 1
     pre_step_history_frames = max(
         1,
         int(args_cli.failure_rgb_history_frames),
         int(args_cli.observation_gif_frames),
         int(args_cli.local_terrain_map_history_frames) if args_cli.local_terrain_map else 1,
+        episode_history_frames,
     )
     pre_step_snapshot_history: deque[dict[str, torch.Tensor]] = deque(maxlen=pre_step_history_frames)
     pre_step_observation_history: deque[dict[str, list[np.ndarray | None]]] = deque(maxlen=pre_step_history_frames)
@@ -3865,6 +3951,7 @@ def main():
             "follow_robot": bool(args_cli.failure_rgb_follow_robot),
             "export_mode": str(args_cli.failure_rgb_export_mode),
             "history_frames": int(args_cli.failure_rgb_history_frames),
+            "full_episode": bool(args_cli.failure_rgb_full_episode),
             "gif_frame_ms": int(args_cli.failure_rgb_gif_frame_ms),
             "include_rear_view": bool(args_cli.failure_rgb_include_rear_view),
             "rear_view_height_m": float(args_cli.failure_rgb_rear_height_m),
@@ -3880,8 +3967,9 @@ def main():
             "output_dir": observation_gif_output_dir,
             "render_limit": int(args_cli.observation_gif_limit),
             "history_frames": int(args_cli.observation_gif_frames),
+            "full_episode": bool(args_cli.failure_rgb_full_episode),
             "gif_frame_ms": int(args_cli.observation_gif_frame_ms),
-            "content": "combined topdown + depth + height",
+            "content": "combined topdown + depth + height + visibility + scene token",
             "rendered_count": int(observation_gif_rendered_count),
             "sample_paths": observation_gif_rendered_paths[:10],
         },

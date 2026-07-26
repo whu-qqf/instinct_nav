@@ -80,3 +80,75 @@ _register_navigation_task(
     navigation_env_cfg.G1InstinctNavigationEnvCfg_VIS_PLAY,
     agents.rsl_rl_cfg.G1InstinctNavPPOVisibilityQueryRunnerCfg,
 )
+
+# Scene-token fusion ablation. This uses the same local visibility memory as the
+# visibility-map runs, but exposes it as fixed 3D scene tokens for query attention.
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-SceneToken-Query-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_SCENE_TOKEN,
+    agents.rsl_rl_cfg.G1InstinctNavPPOSceneTokenQueryRunnerCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-SceneToken-Query-Dev-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_SCENE_TOKEN_DEV,
+    agents.rsl_rl_cfg.G1InstinctNavPPOSceneTokenQueryRunnerDevCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-SceneToken-Query-Play-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_SCENE_TOKEN_PLAY,
+    agents.rsl_rl_cfg.G1InstinctNavPPOSceneTokenQueryRunnerCfg,
+)
+
+# Scene-token v2: 9D terrain-risk tokens are provided to both actor and critic.
+
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-SceneTokenRisk-Query-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_SCENE_TOKEN_RISK,
+    agents.rsl_rl_cfg.G1InstinctNavPPOSceneTokenRiskQueryRunnerCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-SceneTokenRisk-Query-Dev-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_SCENE_TOKEN_RISK_DEV,
+    agents.rsl_rl_cfg.G1InstinctNavPPOSceneTokenRiskQueryRunnerDevCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-SceneTokenRisk-Query-Play-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_SCENE_TOKEN_RISK_PLAY,
+    agents.rsl_rl_cfg.G1InstinctNavPPOSceneTokenRiskQueryRunnerCfg,
+)
+
+
+# Scene-token v3: 6D terrain-risk tokens without per-token goal-relative features.
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-SceneTokenRiskNoGoal-Query-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_SCENE_TOKEN_RISK_NOGOAL,
+    agents.rsl_rl_cfg.G1InstinctNavPPOSceneTokenRiskNoGoalQueryRunnerCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-SceneTokenRiskNoGoal-Query-Dev-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_SCENE_TOKEN_RISK_NOGOAL_DEV,
+    agents.rsl_rl_cfg.G1InstinctNavPPOSceneTokenRiskNoGoalQueryRunnerDevCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-SceneTokenRiskNoGoal-Query-Play-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_SCENE_TOKEN_RISK_NOGOAL_PLAY,
+    agents.rsl_rl_cfg.G1InstinctNavPPOSceneTokenRiskNoGoalQueryRunnerCfg,
+)
+
+# Scene-token v4: reuse the frozen low-level policy camera as the high-level SRU depth/token source.
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-SceneTokenRiskNoGoal-SharedLowCam-Query-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_SCENE_TOKEN_RISK_NOGOAL_SHARED_LOWCAM,
+    agents.rsl_rl_cfg.G1InstinctNavPPOSceneTokenRiskNoGoalSharedLowCamQueryRunnerCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-SceneTokenRiskNoGoal-SharedLowCam-Query-Dev-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_SCENE_TOKEN_RISK_NOGOAL_SHARED_LOWCAM_DEV,
+    agents.rsl_rl_cfg.G1InstinctNavPPOSceneTokenRiskNoGoalSharedLowCamQueryRunnerDevCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-SceneTokenRiskNoGoal-SharedLowCam-Query-Play-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_SCENE_TOKEN_RISK_NOGOAL_SHARED_LOWCAM_PLAY,
+    agents.rsl_rl_cfg.G1InstinctNavPPOSceneTokenRiskNoGoalSharedLowCamQueryRunnerCfg,
+)
+

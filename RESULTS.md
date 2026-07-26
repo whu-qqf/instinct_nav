@@ -141,3 +141,31 @@ Do not change the main training path before saving a clean comparison baseline. 
 - Export a compact table and several representative GIFs for reports.
 - Add a method document explaining the high-level SRU policy, frozen low-level Instinct policy, observations, depth encoder, height encoder, action bridge, reward, and termination design.
 - Run new experiments only as named ablations, not as silent edits to the golden baseline.
+
+
+## Scene Token Ablations
+
+These results compare the current G1 SRU navigation baseline against the scene-token ablations. The token ablations use 1000-episode normal evaluation with `seed=72`; the original golden baseline is the earlier 500-episode senior/fullcopy evaluation.
+
+| Run | Episodes | Success Rate | Maze | Non Maze | Pits | Stairs | Base Contact | Large Pitch | Time Out |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `senior_fullcopy_g1_instinct_v5_scratch` | 500 | 0.902 | 0.8874 | 0.8750 | 0.8679 | 0.9592 | 0.064 | 0.048 | 0.010 |
+| `g1_sru_scene_token_query_v1` | 1000 | 0.875 | 0.8620 | 0.8621 | 0.9028 | 0.8768 | 0.085 | 0.086 | 0.014 |
+| `g1_sru_scene_token_risk_query_v1` | 1000 | 0.892 | 0.9009 | 0.8911 | 0.8995 | 0.8776 | 0.065 | 0.078 | 0.023 |
+| `g1_sru_scene_token_risk_no_goal_query_v1` | 1000 | 0.916 | 0.9183 | 0.9167 | 0.8900 | 0.9310 | 0.048 | 0.057 | 0.023 |
+
+Current best token checkpoint:
+
+```text
+logs/rsl_rl/g1_instinct_navigation_ppo_vismap/2026-07-25_17-29-52_g1_sru_scene_token_risk_no_goal_query_v1/model_2999.pt
+```
+
+Current best token evaluation summary:
+
+```text
+logs/rsl_rl/g1_instinct_navigation_ppo_vismap/2026-07-25_17-29-52_g1_sru_scene_token_risk_no_goal_query_v1/eval_summary_model_2999_1000ep.json
+```
+
+Main conclusion: scene tokens should describe local scene/risk rather than duplicate goal-relative information in every token. The v3 no-goal risk token improves overall success rate and reduces torso contact relative to v1/v2.
+
+Important caveat: fixed-case manifest evaluation is currently not trusted for scene-token policies. A v1 fixed-case run showed an abnormal early success rate, while normal v1 re-evaluation returned to the expected range. Use normal evaluation for the current comparison until `case_manifest_in` reset/cache handling is audited.

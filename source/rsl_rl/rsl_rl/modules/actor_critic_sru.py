@@ -69,6 +69,12 @@ class ActorCriticSRU(nn.Module):
         visibility_map_feature_dim: int = 64,
         use_actor_visibility_query_attention: bool = False,
         visibility_map_query_num_heads: int = 4,
+        use_actor_scene_tokens: bool = False,
+        use_critic_scene_tokens: bool = False,
+        scene_token_num_tokens: int = 64,
+        scene_token_dim: int = 6,
+        scene_token_feature_dim: int = 64,
+        scene_token_query_num_heads: int = 4,
         **kwargs,
     ):
         if kwargs:
@@ -103,8 +109,16 @@ class ActorCriticSRU(nn.Module):
         self.visibility_map_input_dims = visibility_map_input_dims
         self.visibility_map_feature_dim = int(visibility_map_feature_dim) if self.use_actor_visibility_map else 0
         self.visibility_map_query_num_heads = int(visibility_map_query_num_heads)
+        self.use_actor_scene_tokens = bool(use_actor_scene_tokens)
+        self.use_critic_scene_tokens = use_critic_scene_tokens
+        if self.use_actor_scene_tokens and self.use_actor_visibility_map:
+            raise ValueError("Actor scene tokens and actor visibility map are mutually exclusive in this implementation")
+        self.scene_token_num_tokens = int(scene_token_num_tokens)
+        self.scene_token_dim = int(scene_token_dim)
+        self.scene_token_feature_dim = int(scene_token_feature_dim) if (self.use_actor_scene_tokens or self.use_critic_scene_tokens) else 0
+        self.scene_token_query_num_heads = int(scene_token_query_num_heads)
 
-        # Compute the total number of features from image, height, and visibility inputs.
+        # Compute the total number of features from image, height, visibility, and scene-token inputs.
         self.num_image_features = image_input_dims[0] * image_input_dims[1] * image_input_dims[2]
         self.num_height_features = height_input_dims[0] * height_input_dims[1] * height_input_dims[2]
         self.num_visibility_map_features = (
@@ -112,6 +126,11 @@ class ActorCriticSRU(nn.Module):
             if self.use_actor_visibility_map
             else 0
         )
+        self.num_scene_token_features = (
+            self.scene_token_num_tokens * self.scene_token_dim if (self.use_actor_scene_tokens or self.use_critic_scene_tokens) else 0
+        )
+        self.num_actor_scene_token_features = self.num_scene_token_features if self.use_actor_scene_tokens else 0
+        self.num_critic_scene_token_features = self.num_scene_token_features if self.use_critic_scene_tokens else 0
 
         self.num_actor_obs = num_actor_obs
         self.num_critic_obs = num_critic_obs
@@ -119,10 +138,17 @@ class ActorCriticSRU(nn.Module):
         # For actor: proprioceptive data + image data + optional visibility map data
         # For critic: proprioceptive data + height data + image data + time data
         self.actor_proprioceptive_input_dim = (
-            num_actor_obs - self.num_image_features * self.num_cameras - self.num_visibility_map_features
+            num_actor_obs
+            - self.num_image_features * self.num_cameras
+            - self.num_visibility_map_features
+            - self.num_actor_scene_token_features
         )
         self.critic_proprioceptive_input_dim = (
-            num_critic_obs - self.num_height_features - self.num_image_features * self.num_cameras - 1
+            num_critic_obs
+            - self.num_height_features
+            - self.num_image_features * self.num_cameras
+            - self.num_critic_scene_token_features
+            - 1
         )
 
         assert self.actor_proprioceptive_input_dim == self.critic_proprioceptive_input_dim, (
@@ -138,9 +164,14 @@ class ActorCriticSRU(nn.Module):
             self.actor_post_recurrent_input_dim = rnn_hidden_size
         else:
             self.actor_post_recurrent_input_dim = rnn_hidden_size + self.visibility_map_feature_dim
+        if self.use_actor_scene_tokens:
+            self.actor_post_recurrent_input_dim += self.scene_token_feature_dim
         self.mlp_input_dim_critic = (
             self.critic_proprioceptive_input_dim + height_input_dims[0] + image_input_dims[0]
         )
+        self.critic_post_recurrent_input_dim = rnn_hidden_size + time_embed_dim
+        if self.use_critic_scene_tokens:
+            self.critic_post_recurrent_input_dim += self.scene_token_feature_dim
 
         # Attention modules (applied in batch, outside RNN loop)
         # spatial_dims = (D, H, W) where D=num_cameras for image, D=1 for height
@@ -229,6 +260,71 @@ class ActorCriticSRU(nn.Module):
             self.visibility_attention_ffn = None
             self.visibility_map_position_embedding = None
 
+        if self.use_actor_scene_tokens or self.use_critic_scene_tokens:
+            if self.scene_token_feature_dim % self.scene_token_query_num_heads != 0:
+                raise ValueError("scene_token_feature_dim must be divisible by scene_token_query_num_heads")
+            self.scene_token_projector = nn.Sequential(
+                nn.Linear(self.scene_token_dim, self.scene_token_feature_dim),
+                get_activation(activation),
+                nn.Linear(self.scene_token_feature_dim, self.scene_token_feature_dim),
+            )
+            self.scene_token_position_embedding = nn.Parameter(
+                torch.zeros(1, self.scene_token_num_tokens, self.scene_token_feature_dim)
+            )
+            self.scene_token_norm = nn.LayerNorm(self.scene_token_feature_dim)
+        else:
+            self.scene_token_projector = None
+            self.scene_token_position_embedding = None
+            self.scene_token_norm = None
+
+        if self.use_actor_scene_tokens:
+            self.scene_query_proj = nn.Sequential(
+                nn.Linear(rnn_hidden_size + self.actor_proprioceptive_input_dim, self.scene_token_feature_dim),
+                get_activation(activation),
+                nn.Linear(self.scene_token_feature_dim, self.scene_token_feature_dim),
+            )
+            self.scene_query_norm = nn.LayerNorm(self.scene_token_feature_dim)
+            self.scene_cross_attention = nn.MultiheadAttention(
+                embed_dim=self.scene_token_feature_dim,
+                num_heads=self.scene_token_query_num_heads,
+                batch_first=True,
+            )
+            self.scene_attention_ffn = nn.Sequential(
+                nn.LayerNorm(self.scene_token_feature_dim),
+                nn.Linear(self.scene_token_feature_dim, self.scene_token_feature_dim * 2),
+                get_activation(activation),
+                nn.Linear(self.scene_token_feature_dim * 2, self.scene_token_feature_dim),
+            )
+        else:
+            self.scene_query_proj = None
+            self.scene_query_norm = None
+            self.scene_cross_attention = None
+            self.scene_attention_ffn = None
+
+        if self.use_critic_scene_tokens:
+            self.critic_scene_query_proj = nn.Sequential(
+                nn.Linear(rnn_hidden_size + self.critic_proprioceptive_input_dim, self.scene_token_feature_dim),
+                get_activation(activation),
+                nn.Linear(self.scene_token_feature_dim, self.scene_token_feature_dim),
+            )
+            self.critic_scene_query_norm = nn.LayerNorm(self.scene_token_feature_dim)
+            self.critic_scene_cross_attention = nn.MultiheadAttention(
+                embed_dim=self.scene_token_feature_dim,
+                num_heads=self.scene_token_query_num_heads,
+                batch_first=True,
+            )
+            self.critic_scene_attention_ffn = nn.Sequential(
+                nn.LayerNorm(self.scene_token_feature_dim),
+                nn.Linear(self.scene_token_feature_dim, self.scene_token_feature_dim * 2),
+                get_activation(activation),
+                nn.Linear(self.scene_token_feature_dim * 2, self.scene_token_feature_dim),
+            )
+        else:
+            self.critic_scene_query_proj = None
+            self.critic_scene_query_norm = None
+            self.critic_scene_cross_attention = None
+            self.critic_scene_attention_ffn = None
+
         # RNN memory modules (plain LSTM_SRU without attention)
         self.memory_a = MemorySRU(
             input_size=self.mlp_input_dim_actor,
@@ -259,7 +355,7 @@ class ActorCriticSRU(nn.Module):
 
         # Value network (Critic)
         self.linear_dropout_critic = LinearConstDropout(
-            rnn_hidden_size + time_embed_dim, critic_hidden_dims[0], dropout_p=dropout, activation_name=activation
+            self.critic_post_recurrent_input_dim, critic_hidden_dims[0], dropout_p=dropout, activation_name=activation
         )
         critic_layers = []
         for layer_index in range(len(critic_hidden_dims)):
@@ -286,6 +382,12 @@ class ActorCriticSRU(nn.Module):
                 f"[ActorCriticSRU] Actor visibility map branch: {branch_name}, "
                 f"input={self.visibility_map_input_dims}, feature_dim={self.visibility_map_feature_dim}"
             )
+        if self.use_actor_scene_tokens:
+            print(
+                f"[ActorCriticSRU] Actor scene-token branch: query-attention late fusion, "
+                f"tokens={self.scene_token_num_tokens}, token_dim={self.scene_token_dim}, "
+                f"feature_dim={self.scene_token_feature_dim}"
+            )
         # Action noise: using log_std parameter
         self.log_std = nn.Parameter(torch.log(init_noise_std * torch.ones(num_actions)))
         self.distribution = None
@@ -302,9 +404,25 @@ class ActorCriticSRU(nn.Module):
             visibility_parameters += list(self.visibility_query_norm.parameters())
             visibility_parameters += list(self.visibility_cross_attention.parameters())
             visibility_parameters += list(self.visibility_attention_ffn.parameters())
+        scene_parameters = []
+        if self.use_actor_scene_tokens or self.use_critic_scene_tokens:
+            scene_parameters += list(self.scene_token_projector.parameters())
+            scene_parameters += [self.scene_token_position_embedding]
+            scene_parameters += list(self.scene_token_norm.parameters())
+            if self.use_actor_scene_tokens:
+                scene_parameters += list(self.scene_query_proj.parameters())
+                scene_parameters += list(self.scene_query_norm.parameters())
+                scene_parameters += list(self.scene_cross_attention.parameters())
+                scene_parameters += list(self.scene_attention_ffn.parameters())
+            if self.use_critic_scene_tokens:
+                scene_parameters += list(self.critic_scene_query_proj.parameters())
+                scene_parameters += list(self.critic_scene_query_norm.parameters())
+                scene_parameters += list(self.critic_scene_cross_attention.parameters())
+                scene_parameters += list(self.critic_scene_attention_ffn.parameters())
         return (
             list(self.attn_image_net.parameters())
             + visibility_parameters
+            + scene_parameters
             + list(self.linear_dropout_actor.parameters())
             + list(self.actor.parameters())
             + list(self.memory_a.parameters())
@@ -383,6 +501,18 @@ class ActorCriticSRU(nn.Module):
         visibility_obs = observations[..., -self.num_visibility_map_features :]
         return visibility_obs.reshape(-1, *self.visibility_map_input_dims)
 
+    def _extract_actor_scene_tokens(self, observations: torch.Tensor) -> torch.Tensor | None:
+        if not self.use_actor_scene_tokens:
+            return None
+        scene_obs = observations[..., -self.num_actor_scene_token_features :]
+        return scene_obs.reshape(-1, self.scene_token_num_tokens, self.scene_token_dim)
+
+    def _extract_critic_scene_tokens(self, observations: torch.Tensor) -> torch.Tensor | None:
+        if not self.use_critic_scene_tokens:
+            return None
+        scene_obs = observations[..., -self.num_critic_scene_token_features :]
+        return scene_obs.reshape(-1, self.scene_token_num_tokens, self.scene_token_dim)
+
     @staticmethod
     def _match_recurrent_shape(features: torch.Tensor, recurrent_features: torch.Tensor) -> torch.Tensor:
         while features.dim() > recurrent_features.dim() and features.shape[0] == 1:
@@ -409,6 +539,44 @@ class ActorCriticSRU(nn.Module):
         visibility_features = visibility_features + self.visibility_attention_ffn(visibility_features)
         return visibility_features.reshape(*leading_shape, self.visibility_map_feature_dim)
 
+    def _query_actor_scene_tokens(
+        self, scene_tokens: torch.Tensor, recurrent_features: torch.Tensor, proprio_features: torch.Tensor
+    ) -> torch.Tensor:
+        leading_shape = recurrent_features.shape[:-1]
+        flat_tokens = scene_tokens.reshape(-1, self.scene_token_num_tokens, self.scene_token_dim)
+        flat_context = torch.cat([recurrent_features, proprio_features], dim=-1).reshape(
+            -1, recurrent_features.shape[-1] + proprio_features.shape[-1]
+        )
+
+        tokens = self.scene_token_projector(flat_tokens)
+        tokens = tokens + self.scene_token_position_embedding.to(device=tokens.device, dtype=tokens.dtype)
+        query = self.scene_query_proj(flat_context).unsqueeze(1)
+        query = self.scene_query_norm(query)
+        tokens = self.scene_token_norm(tokens)
+        attended, _ = self.scene_cross_attention(query, tokens, tokens, need_weights=False)
+        scene_features = attended.squeeze(1)
+        scene_features = scene_features + self.scene_attention_ffn(scene_features)
+        return scene_features.reshape(*leading_shape, self.scene_token_feature_dim)
+
+    def _query_critic_scene_tokens(
+        self, scene_tokens: torch.Tensor, recurrent_features: torch.Tensor, proprio_features: torch.Tensor
+    ) -> torch.Tensor:
+        leading_shape = recurrent_features.shape[:-1]
+        flat_tokens = scene_tokens.reshape(-1, self.scene_token_num_tokens, self.scene_token_dim)
+        flat_context = torch.cat([recurrent_features, proprio_features], dim=-1).reshape(
+            -1, recurrent_features.shape[-1] + proprio_features.shape[-1]
+        )
+
+        tokens = self.scene_token_projector(flat_tokens)
+        tokens = tokens + self.scene_token_position_embedding.to(device=tokens.device, dtype=tokens.dtype)
+        query = self.critic_scene_query_proj(flat_context).unsqueeze(1)
+        query = self.critic_scene_query_norm(query)
+        tokens = self.scene_token_norm(tokens)
+        attended, _ = self.critic_scene_cross_attention(query, tokens, tokens, need_weights=False)
+        scene_features = attended.squeeze(1)
+        scene_features = scene_features + self.critic_scene_attention_ffn(scene_features)
+        return scene_features.reshape(*leading_shape, self.scene_token_feature_dim)
+
     def process_actor_input(self, observations: torch.Tensor, masks, hidden_states) -> torch.Tensor:
         """Process actor observations through attention and RNN.
 
@@ -426,12 +594,17 @@ class ActorCriticSRU(nn.Module):
         batch_mode = masks is not None
 
         # Split observations into proprioceptive, image, and optional visibility-map parts.
-        visual_tail_features = self.num_image_features * self.num_cameras + self.num_visibility_map_features
+        visual_tail_features = (
+            self.num_image_features * self.num_cameras
+            + self.num_visibility_map_features
+            + self.num_actor_scene_token_features
+        )
         other_obs = observations[..., : -visual_tail_features]
         image_list = self._extract_image_observations(
-            observations, trailing_features=self.num_visibility_map_features
+            observations, trailing_features=self.num_visibility_map_features + self.num_actor_scene_token_features
         )
         visibility_obs = self._extract_actor_visibility_map(observations)
+        scene_tokens = self._extract_actor_scene_tokens(observations)
         other_obs = other_obs.reshape(-1, self.actor_proprioceptive_input_dim)
 
         # Stack images if multiple cameras, otherwise use single image
@@ -459,6 +632,8 @@ class ActorCriticSRU(nn.Module):
                 visibility_features = visibility_features.view(seq_len, batch_size, -1)
             if visibility_tokens is not None:
                 visibility_tokens = visibility_tokens.reshape(seq_len, batch_size, -1)
+            if scene_tokens is not None:
+                scene_tokens = scene_tokens.reshape(seq_len, batch_size, -1)
             other_obs = other_obs.view(seq_len, batch_size, -1)
 
         # The recurrent actor state is based on the baseline observation stream,
@@ -493,6 +668,19 @@ class ActorCriticSRU(nn.Module):
             )
             combined_features = torch.cat([combined_features, visibility_features], dim=-1)
 
+        if scene_tokens is not None:
+            proprio_features = other_obs
+            if batch_mode:
+                proprio_features = unpad_trajectories(proprio_features, masks)
+                proprio_features = self._match_recurrent_shape(proprio_features, combined_features)
+                scene_tokens = unpad_trajectories(scene_tokens, masks)
+                scene_tokens = self._match_recurrent_shape(scene_tokens, combined_features)
+            scene_tokens = scene_tokens.reshape(
+                *combined_features.shape[:-1], self.scene_token_num_tokens, self.scene_token_dim
+            )
+            scene_features = self._query_actor_scene_tokens(scene_tokens, combined_features, proprio_features)
+            combined_features = torch.cat([combined_features, scene_features], dim=-1)
+
         return combined_features
 
     def process_critic_input(self, observations: torch.Tensor, masks, hidden_states) -> torch.Tensor:
@@ -511,15 +699,17 @@ class ActorCriticSRU(nn.Module):
         """
         batch_mode = masks is not None
 
-        # Calculate offsets for observation slicing
-        time_offset = self.num_height_features + self.num_image_features * self.num_cameras + 1
-        height_start = self.num_image_features * self.num_cameras
+        # Critic observation layout is: proprio | time | height | depth | optional scene_tokens.
+        scene_tokens = self._extract_critic_scene_tokens(observations)
+        trailing_features = self.num_critic_scene_token_features
+        depth_start_from_end = self.num_image_features * self.num_cameras + trailing_features
+        height_start_from_end = self.num_height_features + depth_start_from_end
+        time_index_from_end = height_start_from_end + 1
 
-        # Split observations into proprioceptive, time, height, and image parts
-        other_obs = observations[..., :-time_offset]
-        time_obs = observations[..., -time_offset].unsqueeze(-1)
-        height_obs = observations[..., -(height_start + self.num_height_features) : -height_start]
-        image_list = self._extract_image_observations(observations)
+        other_obs = observations[..., :-time_index_from_end]
+        time_obs = observations[..., -time_index_from_end].unsqueeze(-1)
+        height_obs = observations[..., -height_start_from_end:-depth_start_from_end]
+        image_list = self._extract_image_observations(observations, trailing_features=trailing_features)
 
         # Reshape tensors
         other_obs = other_obs.reshape(-1, self.critic_proprioceptive_input_dim)
@@ -541,6 +731,8 @@ class ActorCriticSRU(nn.Module):
             height_features = height_features.view(seq_len, batch_size, -1)
             image_features = image_features.view(seq_len, batch_size, -1)
             other_obs = other_obs.view(seq_len, batch_size, -1)
+            if scene_tokens is not None:
+                scene_tokens = scene_tokens.reshape(seq_len, batch_size, -1)
 
         # Time embedding for the critic
         time_embed = self.time_layer(time_obs)
@@ -549,13 +741,26 @@ class ActorCriticSRU(nn.Module):
         combined_features = torch.cat([height_features, image_features, other_obs], dim=-1)
 
         # RNN processing
-        combined_features = self.memory_c(combined_features, masks, hidden_states)
+        combined_features = self.memory_c(combined_features, masks, hidden_states).squeeze(0)
 
         if batch_mode:
             time_embed = unpad_trajectories(time_embed, masks)
+            time_embed = self._match_recurrent_shape(time_embed, combined_features)
 
-        # Concatenate time embedding with combined features
-        return torch.cat([combined_features.squeeze(0), time_embed], dim=-1)
+        if scene_tokens is not None:
+            proprio_features = other_obs
+            if batch_mode:
+                proprio_features = unpad_trajectories(proprio_features, masks)
+                proprio_features = self._match_recurrent_shape(proprio_features, combined_features)
+                scene_tokens = unpad_trajectories(scene_tokens, masks)
+                scene_tokens = self._match_recurrent_shape(scene_tokens, combined_features)
+            scene_tokens = scene_tokens.reshape(
+                *combined_features.shape[:-1], self.scene_token_num_tokens, self.scene_token_dim
+            )
+            scene_features = self._query_critic_scene_tokens(scene_tokens, combined_features, proprio_features)
+            return torch.cat([combined_features, scene_features, time_embed], dim=-1)
+
+        return torch.cat([combined_features, time_embed], dim=-1)
 
     def update_distribution(self, combined_features):
         """Update the action distribution based on actor output."""

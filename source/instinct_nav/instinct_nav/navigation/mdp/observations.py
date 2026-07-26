@@ -1170,6 +1170,304 @@ def local_visibility_map(
     )
 
 
+def scene_tokens_from_visibility_map(
+    env,
+    sensor_cfg,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    goal_cmd_name: str = "robot_goal",
+    size_m: float = 6.4,
+    grid_size: int = 64,
+    token_grid_size: int = 8,
+    depth_min_m: float = 0.5,
+    depth_max_m: float = 8.0,
+    pixel_stride: int = 2,
+    decay: float = 1.0,
+) -> torch.Tensor:
+    """Return fixed local 3D scene tokens derived from the visibility map.
+
+    This is the first non-PQ3D token provider. It converts the actor-side binary
+    visibility memory into a compact token set so ``ActorCriticSRU`` can learn the
+    same token-attention interface that will later consume PQ3D object/frontier
+    embeddings.
+
+    Current token layout with default ``token_grid_size=8``:
+
+    - logical token shape: ``[num_envs, 64, 6]``
+    - observation-manager shape: ``[num_envs, 384]``
+    - per-token features: ``[x_center, y_center, visible_ratio, dist_to_goal, cos_to_goal, sin_to_goal]``
+
+    Coordinates are robot-local and normalized by map size. ``visible_ratio`` is
+    the average binary visibility value inside the corresponding BEV patch. The
+    tensor is flattened before returning because IsaacLab concatenated observation
+    groups require every term to be one-dimensional per environment.
+    """
+    visibility_flat = local_visibility_map(
+        env,
+        sensor_cfg=sensor_cfg,
+        asset_cfg=asset_cfg,
+        size_m=size_m,
+        grid_size=grid_size,
+        depth_min_m=depth_min_m,
+        depth_max_m=depth_max_m,
+        pixel_stride=pixel_stride,
+        decay=decay,
+    )
+    visibility = visibility_flat.view(env.num_envs, 1, grid_size, grid_size)
+    patch_size = grid_size // token_grid_size
+    if patch_size * token_grid_size != grid_size:
+        raise ValueError(f"grid_size={grid_size} must be divisible by token_grid_size={token_grid_size}")
+
+    # Average visibility over each BEV patch: [B, 1, 64, 64] -> [B, 8, 8] -> [B, 64].
+    visible_ratio = F.avg_pool2d(visibility, kernel_size=patch_size, stride=patch_size).flatten(start_dim=1)
+
+    device = visibility.device
+    dtype = visibility.dtype
+    rows = torch.arange(token_grid_size, device=device, dtype=dtype)
+    cols = torch.arange(token_grid_size, device=device, dtype=dtype)
+    row_grid, col_grid = torch.meshgrid(rows, cols, indexing="ij")
+
+    # Token centers in robot-local meters, following LocalVisibilityMapManager's
+    # convention: x is forward, y is lateral. Normalize by half map size so values
+    # stay roughly in [-1, 1].
+    patch_m = size_m / float(token_grid_size)
+    half_size = size_m / 2.0
+    x_center_m = half_size - (row_grid + 0.5) * patch_m
+    y_center_m = half_size - (col_grid + 0.5) * patch_m
+    x_center = (x_center_m / half_size).reshape(1, -1).expand(env.num_envs, -1)
+    y_center = (y_center_m / half_size).reshape(1, -1).expand(env.num_envs, -1)
+
+    goal = env.command_manager.get_command(goal_cmd_name)
+    if goal.shape[-1] < 2:
+        goal_xy = torch.zeros((env.num_envs, 2), device=device, dtype=dtype)
+    else:
+        goal_xy = goal[:, :2].to(device=device, dtype=dtype)
+    goal_x = goal_xy[:, 0:1]
+    goal_y = goal_xy[:, 1:2]
+
+    dx = goal_x - x_center_m.reshape(1, -1)
+    dy = goal_y - y_center_m.reshape(1, -1)
+    dist = torch.sqrt(dx * dx + dy * dy + 1.0e-6)
+    dist_norm = (dist / max(size_m, 1.0e-6)).clamp(0.0, 4.0)
+    cos_to_goal = dx / dist
+    sin_to_goal = dy / dist
+
+    tokens = torch.stack(
+        (x_center, y_center, visible_ratio, dist_norm, cos_to_goal, sin_to_goal),
+        dim=-1,
+    )
+    return tokens.reshape(env.num_envs, -1)
+
+
+
+def scene_tokens_risk_from_visibility_map(
+    env,
+    sensor_cfg,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    goal_cmd_name: str = "robot_goal",
+    size_m: float = 6.4,
+    grid_size: int = 64,
+    token_grid_size: int = 8,
+    depth_min_m: float = 0.5,
+    depth_max_m: float = 8.0,
+    pixel_stride: int = 2,
+    decay: float = 1.0,
+) -> torch.Tensor:
+    """Return 9D scene tokens with lightweight terrain-risk cues.
+
+    Layout: [x, y, visible_ratio, dist_to_goal, cos_to_goal, sin_to_goal,
+    depth_mean, depth_edge, frontier]. The last three features are actor-safe:
+    they come from the same raycast camera and local visibility memory, not from
+    the critic-only height scanner.
+    """
+    cache_key = (
+        "scene_tokens_risk_from_visibility_map",
+        getattr(sensor_cfg, "name", "raycast_camera"),
+        int(getattr(env, "common_step_counter", -1)),
+        int(grid_size),
+        int(token_grid_size),
+        float(size_m),
+        float(depth_min_m),
+        float(depth_max_m),
+        int(pixel_stride),
+        float(decay),
+    )
+    cache = getattr(env, "_instinct_nav_scene_token_cache", None)
+    if cache is not None and cache.get("key") == cache_key:
+        return cache["tokens"]
+
+    visibility_flat = local_visibility_map(
+        env,
+        sensor_cfg=sensor_cfg,
+        asset_cfg=asset_cfg,
+        size_m=size_m,
+        grid_size=grid_size,
+        depth_min_m=depth_min_m,
+        depth_max_m=depth_max_m,
+        pixel_stride=pixel_stride,
+        decay=decay,
+    )
+    visibility = visibility_flat.view(env.num_envs, 1, grid_size, grid_size)
+    patch_size = grid_size // token_grid_size
+    if patch_size * token_grid_size != grid_size:
+        raise ValueError(f"grid_size={grid_size} must be divisible by token_grid_size={token_grid_size}")
+
+    visible_ratio = F.avg_pool2d(visibility, kernel_size=patch_size, stride=patch_size).flatten(start_dim=1)
+
+    device = visibility.device
+    dtype = visibility.dtype
+    rows = torch.arange(token_grid_size, device=device, dtype=dtype)
+    cols = torch.arange(token_grid_size, device=device, dtype=dtype)
+    row_grid, col_grid = torch.meshgrid(rows, cols, indexing="ij")
+    patch_m = size_m / float(token_grid_size)
+    half_size = size_m / 2.0
+    x_center_m = half_size - (row_grid + 0.5) * patch_m
+    y_center_m = half_size - (col_grid + 0.5) * patch_m
+    x_center = (x_center_m / half_size).reshape(1, -1).expand(env.num_envs, -1)
+    y_center = (y_center_m / half_size).reshape(1, -1).expand(env.num_envs, -1)
+
+    goal = env.command_manager.get_command(goal_cmd_name)
+    if goal.shape[-1] < 2:
+        goal_xy = torch.zeros((env.num_envs, 2), device=device, dtype=dtype)
+    else:
+        goal_xy = goal[:, :2].to(device=device, dtype=dtype)
+    dx = goal_xy[:, 0:1] - x_center_m.reshape(1, -1)
+    dy = goal_xy[:, 1:2] - y_center_m.reshape(1, -1)
+    dist = torch.sqrt(dx * dx + dy * dy + 1.0e-6)
+    dist_norm = (dist / max(size_m, 1.0e-6)).clamp(0.0, 4.0)
+    cos_to_goal = dx / dist
+    sin_to_goal = dy / dist
+
+    sample = _get_noisy_depth_sample(env, sensor_cfg)
+    depth = sample["depth"]
+    if depth.dim() == 4:
+        depth_image = depth[:, 0]
+    else:
+        height, width = env.scene.sensors[sensor_cfg.name].image_shape
+        depth_image = depth.view(env.num_envs, height, width)
+    valid_depth = torch.isfinite(depth_image) & (depth_image > depth_min_m) & (depth_image < depth_max_m)
+    depth_norm = torch.where(
+        valid_depth,
+        ((depth_image - depth_min_m) / max(depth_max_m - depth_min_m, 1.0e-6)).clamp(0.0, 1.0),
+        torch.ones_like(depth_image),
+    )
+    depth_mean = F.adaptive_avg_pool2d(depth_norm.unsqueeze(1), (token_grid_size, token_grid_size)).flatten(start_dim=1)
+    grad_x = F.pad((depth_norm[..., 1:] - depth_norm[..., :-1]).abs(), (0, 1, 0, 0))
+    grad_y = F.pad((depth_norm[..., 1:, :] - depth_norm[..., :-1, :]).abs(), (0, 0, 0, 1))
+    depth_edge = F.adaptive_avg_pool2d((grad_x + grad_y).unsqueeze(1), (token_grid_size, token_grid_size)).flatten(start_dim=1)
+    depth_edge = depth_edge.clamp(0.0, 1.0)
+
+    visibility_binary = (visibility > 0.5).to(dtype=dtype)
+    unknown = 1.0 - visibility_binary
+    frontier_x = F.pad((unknown[..., 1:] - unknown[..., :-1]).abs(), (0, 1, 0, 0))
+    frontier_y = F.pad((unknown[..., 1:, :] - unknown[..., :-1, :]).abs(), (0, 0, 0, 1))
+    frontier = F.avg_pool2d((frontier_x + frontier_y).clamp(0.0, 1.0), kernel_size=patch_size, stride=patch_size)
+    frontier = frontier.flatten(start_dim=1)
+
+    tokens = torch.stack(
+        (x_center, y_center, visible_ratio, dist_norm, cos_to_goal, sin_to_goal, depth_mean, depth_edge, frontier),
+        dim=-1,
+    ).reshape(env.num_envs, -1)
+    env._instinct_nav_scene_token_cache = {"key": cache_key, "tokens": tokens}
+    return tokens
+
+
+def scene_tokens_risk_no_goal_from_visibility_map(
+    env,
+    sensor_cfg,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    size_m: float = 6.4,
+    grid_size: int = 64,
+    token_grid_size: int = 8,
+    depth_min_m: float = 0.5,
+    depth_max_m: float = 8.0,
+    pixel_stride: int = 2,
+    decay: float = 1.0,
+) -> torch.Tensor:
+    """Return 6D scene-risk tokens without goal-relative features.
+
+    Layout: [x, y, visible_ratio, depth_mean, depth_edge, frontier].
+    Goal information stays in the normal proprio/command observation and enters
+    attention through the recurrent query rather than being duplicated inside
+    every scene token.
+    """
+    cache_key = (
+        "scene_tokens_risk_no_goal_from_visibility_map",
+        getattr(sensor_cfg, "name", "raycast_camera"),
+        int(getattr(env, "common_step_counter", -1)),
+        int(grid_size),
+        int(token_grid_size),
+        float(size_m),
+        float(depth_min_m),
+        float(depth_max_m),
+        int(pixel_stride),
+        float(decay),
+    )
+    cache = getattr(env, "_instinct_nav_scene_token_cache", None)
+    if cache is not None and cache.get("key") == cache_key:
+        return cache["tokens"]
+
+    visibility_flat = local_visibility_map(
+        env,
+        sensor_cfg=sensor_cfg,
+        asset_cfg=asset_cfg,
+        size_m=size_m,
+        grid_size=grid_size,
+        depth_min_m=depth_min_m,
+        depth_max_m=depth_max_m,
+        pixel_stride=pixel_stride,
+        decay=decay,
+    )
+    visibility = visibility_flat.view(env.num_envs, 1, grid_size, grid_size)
+    patch_size = grid_size // token_grid_size
+    if patch_size * token_grid_size != grid_size:
+        raise ValueError(f"grid_size={grid_size} must be divisible by token_grid_size={token_grid_size}")
+
+    visible_ratio = F.avg_pool2d(visibility, kernel_size=patch_size, stride=patch_size).flatten(start_dim=1)
+
+    device = visibility.device
+    dtype = visibility.dtype
+    rows = torch.arange(token_grid_size, device=device, dtype=dtype)
+    cols = torch.arange(token_grid_size, device=device, dtype=dtype)
+    row_grid, col_grid = torch.meshgrid(rows, cols, indexing="ij")
+    patch_m = size_m / float(token_grid_size)
+    half_size = size_m / 2.0
+    x_center_m = half_size - (row_grid + 0.5) * patch_m
+    y_center_m = half_size - (col_grid + 0.5) * patch_m
+    x_center = (x_center_m / half_size).reshape(1, -1).expand(env.num_envs, -1)
+    y_center = (y_center_m / half_size).reshape(1, -1).expand(env.num_envs, -1)
+
+    sample = _get_noisy_depth_sample(env, sensor_cfg)
+    depth = sample["depth"]
+    if depth.dim() == 4:
+        depth_image = depth[:, 0]
+    else:
+        height, width = env.scene.sensors[sensor_cfg.name].image_shape
+        depth_image = depth.view(env.num_envs, height, width)
+    valid_depth = torch.isfinite(depth_image) & (depth_image > depth_min_m) & (depth_image < depth_max_m)
+    depth_norm = torch.where(
+        valid_depth,
+        ((depth_image - depth_min_m) / max(depth_max_m - depth_min_m, 1.0e-6)).clamp(0.0, 1.0),
+        torch.ones_like(depth_image),
+    )
+    depth_mean = F.adaptive_avg_pool2d(depth_norm.unsqueeze(1), (token_grid_size, token_grid_size)).flatten(start_dim=1)
+    grad_x = F.pad((depth_norm[..., 1:] - depth_norm[..., :-1]).abs(), (0, 1, 0, 0))
+    grad_y = F.pad((depth_norm[..., 1:, :] - depth_norm[..., :-1, :]).abs(), (0, 0, 0, 1))
+    depth_edge = F.adaptive_avg_pool2d((grad_x + grad_y).unsqueeze(1), (token_grid_size, token_grid_size)).flatten(start_dim=1)
+    depth_edge = depth_edge.clamp(0.0, 1.0)
+
+    visibility_binary = (visibility > 0.5).to(dtype=dtype)
+    unknown = 1.0 - visibility_binary
+    frontier_x = F.pad((unknown[..., 1:] - unknown[..., :-1]).abs(), (0, 1, 0, 0))
+    frontier_y = F.pad((unknown[..., 1:, :] - unknown[..., :-1, :]).abs(), (0, 0, 0, 1))
+    frontier = F.avg_pool2d((frontier_x + frontier_y).clamp(0.0, 1.0), kernel_size=patch_size, stride=patch_size)
+    frontier = frontier.flatten(start_dim=1)
+
+    tokens = torch.stack((x_center, y_center, visible_ratio, depth_mean, depth_edge, frontier), dim=-1)
+    tokens = tokens.reshape(env.num_envs, -1)
+    env._instinct_nav_scene_token_cache = {"key": cache_key, "tokens": tokens}
+    return tokens
+
+
 def in_goal(
     env: ManagerBasedRLEnv,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),

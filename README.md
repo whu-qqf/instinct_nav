@@ -1014,3 +1014,132 @@ GIF 帧设置按师兄 `eval.py` 默认值显式写出：`--failure_rgb_history_
     /workspace/instinct_nav/source/instinct_nav/instinct_nav/navigation/config/g1_instinct/navigation_env_cfg.py \
     /workspace/instinct_nav/source/instinct_nav/instinct_nav/navigation/mdp/observations.py
 ```
+
+
+### 2026-07-23 追加：Scene-token query fusion 原型
+
+- 新增第一版 `scene_tokens` observation，用现有 local visibility memory 生成固定场景 token，作为后续接入 PQ3D token 的接口原型。
+- 当前 token 不是 PQ3D 输出，而是从 `64 x 64` visibility map patchify 得到：
+  - 逻辑 shape：`[num_envs, 64, 6]`
+  - observation manager 中 flatten 后 shape：`[num_envs, 384]`
+  - 每个 token 特征：`[x_center, y_center, visible_ratio, dist_to_goal, cos_to_goal, sin_to_goal]`
+- 新增 `nav_mdp.scene_tokens_from_visibility_map`，内部复用 `local_visibility_map` 的 noisy/delayed depth 更新逻辑，然后把 BEV map 聚合成 `8 x 8 = 64` 个 patch tokens。
+- `ActorCriticSRU` 新增 actor scene-token query attention 分支：
+  - baseline `proprio + depth` 仍先进入 SRU memory。
+  - SRU recurrent feature + proprio feature 作为 query。
+  - `scene_tokens` 经 projector 后作为 key/value。
+  - attention 输出 concat 到 actor MLP 前。
+- 新增 runner/task：
+  - `Instinct-Nav-G1-SRU-SceneToken-Query-v0`
+  - `Instinct-Nav-G1-SRU-SceneToken-Query-Dev-v0`
+  - `Instinct-Nav-G1-SRU-SceneToken-Query-Play-v0`
+- smoke test 通过：
+
+```bash
+/workspace/instinctlab51-env/bin/python /workspace/instinct_nav/_launcher.py train \
+    --task Instinct-Nav-G1-SRU-SceneToken-Query-Dev-v0 \
+    --num_envs 32 \
+    --max_iterations 1 \
+    --run_name scene_token_query_smoke_test_v2 \
+    --headless
+```
+
+- smoke test 观察到 policy obs shape 为 `(2960,)`：原 `(2576,)` + `scene_tokens (384,)`。低层运控 observation 仍为 `depth_image (8, 18, 32)`，未改低层输入。
+- 保存产物：`logs/rsl_rl/g1_instinct_navigation_ppo_scene_token_dev/2026-07-23_20-39-46_scene_token_query_smoke_test_v2/model_0.pt`。
+
+
+### 2026-07-24 追加：Scene-token v2 actor/critic risk-token ablation
+
+- 新增 `nav_mdp.scene_tokens_risk_from_visibility_map`，保留 v1 的 6D token，不覆盖旧任务。
+- v2 token 从 `64 x 64` local visibility memory 和同一路 actor raycast depth 派生：
+  - 逻辑 shape：`[num_envs, 64, 9]`
+  - observation manager flatten 后 shape：`[num_envs, 576]`
+  - 每个 token 特征：`[x_center, y_center, visible_ratio, dist_to_goal, cos_to_goal, sin_to_goal, depth_mean, depth_edge, frontier]`
+- `depth_mean/depth_edge/frontier` 都来自 actor 可用的 raycast camera / visibility memory，没有使用 critic-only `height_scanner_critic`，避免把 privileged height scan 泄漏给 actor。
+- v2 环境同时把同一份 scene token 加入 policy 和 critic observation：
+  - actor: `proprio + depth + scene_tokens`
+  - critic: `proprio + time + height + depth + scene_tokens`
+- token 函数内部加入 step-level cache，避免同一个仿真步里 policy/critic 分别读取 observation 时重复 update visibility map。
+- `ActorCriticSRU` 新增 critic scene-token query attention 分支：critic SRU recurrent feature + critic proprio 作为 query，scene tokens 作为 key/value，attention 输出 concat 到 critic MLP 前。
+- 新增 runner/task：
+  - `Instinct-Nav-G1-SRU-SceneTokenRisk-Query-v0`
+  - `Instinct-Nav-G1-SRU-SceneTokenRisk-Query-Dev-v0`
+  - `Instinct-Nav-G1-SRU-SceneTokenRisk-Query-Play-v0`
+- 本机当前没有可见 CUDA，Isaac dev 初始化被 `No CUDA GPUs are available` 阻止；已完成 Python 语法检查和 CPU tensor forward 检查。
+- CPU forward 检查结果：actor feature shape `[..., 576]`，critic feature shape `[..., 584]`，`act_inference` 输出 `[..., 3]`，`evaluate` 输出 `[..., 1]`。
+
+推荐训练命令：
+
+```bash
+/workspace/instinctlab51-env/bin/python /workspace/instinct_nav/_launcher.py train \
+    --task Instinct-Nav-G1-SRU-SceneTokenRisk-Query-v0 \
+    --num_envs 4096 \
+    --max_iterations 3000 \
+    --run_name g1_sru_scene_token_risk_query_v1 \
+    --headless \
+    --wandb \
+    --wandb_entity qqfqqf0612-wuhan-university \
+    --wandb_project instinct_nav \
+    --seed 72
+```
+
+
+### 2026-07-26 追加：Scene-token v3 no-goal 评估结果
+
+- 新增并完成 `SceneTokenRiskNoGoal` ablation，token 去掉 per-token goal-relative 特征，只保留局部场景/风险：
+  - token shape：`[num_envs, 64, 6]`
+  - token features：`[x_center, y_center, visible_ratio, depth_mean, depth_edge, frontier]`
+  - actor/critic 都接收同一份 scene token。
+- 训练 run：`logs/rsl_rl/g1_instinct_navigation_ppo_vismap/2026-07-25_17-29-52_g1_sru_scene_token_risk_no_goal_query_v1/`
+- checkpoint：`model_2999.pt`
+- 1000 episode 普通评估：`eval_summary_model_2999_1000ep.json`
+- 评估结果：
+  - overall success：`0.916` (`916 / 1000`)
+  - maze：`0.9183`
+  - non_maze：`0.9167`
+  - pits：`0.8900`
+  - stairs：`0.9310`
+  - base_contact：`0.048`
+  - large_pitch_angle：`0.057`
+- 对比结论：
+  - v1 scene-token：`0.875`
+  - v2 risk-token：`0.892`
+  - v3 risk-no-goal：`0.916`
+  - 去掉 `dist_to_goal/cos_to_goal/sin_to_goal` 后，楼梯和整体成功率明显提升，说明 scene token 更适合作为局部场景/风险描述，目标信息应由原始 goal observation 和 query 分支使用。
+- fixed-case manifest 评估暂不作为结论依据：v1 fixed-case 评估出现异常早期成功率，但普通 v1 重评估正常，后续需要单独修复 `case_manifest_in` 后的 visibility/depth cache reset 与 sensor sync。
+
+### 2026-07-26 追加：Scene-token v4 shared-lowcam 单相机任务
+
+- 新增 shared-lowcam ablation：高层 SRU 复用 frozen Instinct 低层的同一个 `camera`，不再创建额外 `raycast_camera`。
+- 新任务：
+  - `Instinct-Nav-G1-SRU-SceneTokenRiskNoGoal-SharedLowCam-Query-v0`
+  - `Instinct-Nav-G1-SRU-SceneTokenRiskNoGoal-SharedLowCam-Query-Dev-v0`
+  - `Instinct-Nav-G1-SRU-SceneTokenRiskNoGoal-SharedLowCam-Query-Play-v0`
+- 高层 observation 改动：
+  - actor `depth_image`：从 `SceneEntityCfg("raycast_camera")` 改为 `SceneEntityCfg("camera")`。
+  - critic `depth_image`：从 `SceneEntityCfg("raycast_camera")` 改为 `SceneEntityCfg("camera")`。
+  - actor/critic `scene_tokens`：从同一个 `camera` 的 raw `distance_to_image_plane`、pose、intrinsics 构建。
+- 低层 observation 不变：`instinct_low_level_policy.depth_image` 仍使用 `camera` 的 `distance_to_image_plane_noised_history`，即 8 帧、crop/resize 后的 `(8, 18, 32)` 历史输入。
+- 关键验证：当前 SRU depth encoder 可直接接受底层相机 raw `64x36`，输出仍是 `64x5x8=2560`，所以 `ActorCriticSRU.image_input_dims=(64,5,8)` 和网络结构不需要改。
+- smoke test 已通过：
+  - command：`/workspace/instinctlab51-env/bin/python /workspace/instinct_nav/_launcher.py train --task Instinct-Nav-G1-SRU-SceneTokenRiskNoGoal-SharedLowCam-Query-Dev-v0 --num_envs 32 --max_iterations 1 --run_name shared_lowcam_smoke_test_32env --headless`
+  - policy obs：`2960 = proprio/goal/action 16 + depth 2560 + scene_tokens 384`
+  - critic obs：`6097 = proprio/goal/action 16 + time 1 + height 3136 + depth 2560 + scene_tokens 384`
+  - low-level policy depth：`(8, 18, 32)`
+  - output：`logs/rsl_rl/g1_instinct_navigation_ppo_scene_token_risk_no_goal_shared_lowcam_dev/2026-07-26_17-28-53_shared_lowcam_smoke_test_32env/model_0.pt`
+
+正式训练命令：
+
+```bash
+/workspace/instinctlab51-env/bin/python /workspace/instinct_nav/_launcher.py train \
+    --task Instinct-Nav-G1-SRU-SceneTokenRiskNoGoal-SharedLowCam-Query-v0 \
+    --num_envs 4096 \
+    --max_iterations 3000 \
+    --run_name g1_sru_scene_token_risk_no_goal_shared_lowcam_query_v1 \
+    --headless \
+    --wandb \
+    --wandb_entity qqfqqf0612-wuhan-university \
+    --wandb_project instinct_nav \
+    --seed 72
+```
+

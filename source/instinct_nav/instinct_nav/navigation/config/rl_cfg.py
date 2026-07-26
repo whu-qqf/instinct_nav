@@ -74,6 +74,24 @@ class RslRlPpoActorCriticCfg:
     visibility_map_query_num_heads: int = 4
     """Number of attention heads for actor visibility-map query fusion."""
 
+    use_actor_scene_tokens: bool = False
+    """Whether the actor observation contains scene tokens after the depth features."""
+
+    use_critic_scene_tokens: bool = False
+    """Whether the critic observation contains scene tokens after the depth features."""
+
+    scene_token_num_tokens: int = 64
+    """Number of fixed scene tokens in the actor observation."""
+
+    scene_token_dim: int = 6
+    """Raw feature dimension of each scene token."""
+
+    scene_token_feature_dim: int = 64
+    """Projected feature dimension used by scene-token query attention."""
+
+    scene_token_query_num_heads: int = 4
+    """Number of attention heads for actor scene-token query fusion."""
+
 
 @configclass
 class RslRlPpoAlgorithmCfg:
