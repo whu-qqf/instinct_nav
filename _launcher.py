@@ -177,10 +177,16 @@ def eval_senior_main(argv: list[str]) -> int:
     parser.add_argument("--print_every", type=int, default=50)
     parser.add_argument("--save_failure_gifs", action="store_true", default=False)
     parser.add_argument("--failure_gif_folder", type=str, default=None)
+    parser.add_argument("--max_success_gifs", type=int, default=10)
     parser.add_argument("--max_failure_gifs", type=int, default=10)
+    parser.add_argument("--success_gif_min_initial_distance", type=float, default=0.0)
+    parser.add_argument("--success_gif_min_goal_height_delta", type=float, default=0.0)
+    parser.add_argument("--gif_terrain_name", type=str, default=None)
     parser.add_argument("--failure_rgb_base_contact_only", action="store_true", default=False)
-    parser.add_argument("--failure_rgb_include_successes", action="store_true", default=False)
-    parser.add_argument("--failure_rgb_include_observations", action="store_true", default=False)
+    parser.add_argument("--failure_rgb_include_successes", action="store_true", default=True)
+    parser.add_argument("--no_failure_rgb_include_successes", dest="failure_rgb_include_successes", action="store_false")
+    parser.add_argument("--failure_rgb_include_observations", action="store_true", default=True)
+    parser.add_argument("--no_failure_rgb_include_observations", dest="failure_rgb_include_observations", action="store_false")
     parser.add_argument("--failure_rgb_history_frames", type=int, default=10)
     parser.add_argument("--failure_rgb_gif_frame_ms", type=int, default=250)
     parser.add_argument("--observation_gif_folder", type=str, default=None)
@@ -212,10 +218,16 @@ def eval_senior_main(argv: list[str]) -> int:
         forwarded.extend([
             "--failure_rgb_dir", str(failure_dir),
             "--failure_rgb_limit", str(args.max_failure_gifs),
+            "--failure_rgb_success_limit", str(args.max_success_gifs),
+            "--failure_rgb_failure_limit", str(args.max_failure_gifs),
+            "--failure_rgb_success_min_initial_distance", str(args.success_gif_min_initial_distance),
+            "--failure_rgb_success_min_goal_height_delta", str(args.success_gif_min_goal_height_delta),
             "--failure_rgb_export_mode", "gif",
             "--failure_rgb_history_frames", str(args.failure_rgb_history_frames),
             "--failure_rgb_gif_frame_ms", str(args.failure_rgb_gif_frame_ms),
         ])
+    if args.gif_terrain_name:
+        forwarded.extend(["--failure_rgb_terrain_name", args.gif_terrain_name])
     if args.failure_rgb_base_contact_only:
         forwarded.append("--failure_rgb_base_contact_only")
     if args.failure_rgb_include_successes:

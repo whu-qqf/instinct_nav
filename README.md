@@ -1143,3 +1143,74 @@ GIF 帧设置按师兄 `eval.py` 默认值显式写出：`--failure_rgb_history_
     --seed 72
 ```
 
+## Onboard Deployment Skeleton
+
+2026-07-28 新增轻量真机部署骨架：[`deploy/`](/workspace/instinct_nav/deploy)。
+
+当前部署路线不是把 IsaacLab 训练容器直接连机器人，而是在本机/机器人随身工控机运行轻量推理包：
+
+```text
+real sensors -> SRU high-level nav policy @ 5 Hz -> velocity command -> instinct_onboard low-level policy @ 50 Hz -> G1 joints
+```
+
+关键文件：
+
+- [`deploy/README.md`](/workspace/instinct_nav/deploy/README.md)：部署架构、instinct_onboard 复用方式和 checklist。
+- [`deploy/instinct_nav_onboard/config.py`](/workspace/instinct_nav/deploy/instinct_nav_onboard/config.py)：shared-lowcam 相机参数、obs layout、频率和默认 artifact 路径。
+- [`deploy/instinct_nav_onboard/packets.py`](/workspace/instinct_nav/deploy/instinct_nav_onboard/packets.py)：真机 sensor packet 与 velocity command 数据结构。
+- [`deploy/instinct_nav_onboard/obs_builder.py`](/workspace/instinct_nav/deploy/instinct_nav_onboard/obs_builder.py)：高层 actor obs 拼接接口和低层 depth history 预处理参考。
+- [`deploy/instinct_nav_onboard/runtime.py`](/workspace/instinct_nav/deploy/instinct_nav_onboard/runtime.py)：5 Hz SRU runtime loop，输出速度命令，不直接发关节。
+- [`deploy/instinct_nav_onboard/bridges.py`](/workspace/instinct_nav/deploy/instinct_nav_onboard/bridges.py)：`SensorSource` / `VelocityCommandSink` 抽象接口，用于后续对接 robot SDK 或 instinct_onboard。
+- [`deploy/scripts/run_onboard_stub.py`](/workspace/instinct_nav/deploy/scripts/run_onboard_stub.py)：无 IsaacLab dry-run，验证部署包能独立启动。
+
+已验证：
+
+```bash
+PYTHONPATH=/workspace/instinct_nav/deploy /workspace/instinctlab51-env/bin/python -m py_compile \
+  /workspace/instinct_nav/deploy/instinct_nav_onboard/*.py \
+  /workspace/instinct_nav/deploy/scripts/run_onboard_stub.py
+
+PYTHONPATH=/workspace/instinct_nav/deploy /workspace/instinctlab51-env/bin/python \
+  /workspace/instinct_nav/deploy/scripts/run_onboard_stub.py --steps 3
+```
+
+重要限制：当前 scene-token policy 的 `ActorCriticSRU.export_jit()` 仍是旧的 depth-tail 导出器，不包含 scene-token query branch；部署当前最佳 checkpoint 时优先走 Python checkpoint runtime。后续若要 JIT/ONNX 上机器人，需要先补 scene-token exporter。
+
+### IsaacLab 对照 observation dump
+
+2026-07-28 追加：`source/instinct_nav/scripts/eval.py` 已支持和 onboard deploy 相同格式的 observation/action dump，用于部署前分布对齐。
+
+推荐先用当前最佳 shared-lowcam checkpoint 生成一小批仿真对照样本：
+
+```bash
+/workspace/instinctlab51-env/bin/python /workspace/instinct_nav/_launcher.py eval \
+  --task Instinct-Nav-G1-SRU-SceneTokenRiskNoGoal-SharedLowCam-Query-Play-v0 \
+  --checkpoint /workspace/instinct_nav/logs/rsl_rl/g1_instinct_navigation_ppo_vismap/2026-07-26_21-39-31_g1_sru_scene_token_risk_no_goal_shared_lowcam_query_v1/model_2999.pt \
+  --num_envs 64 \
+  --num_episodes 50 \
+  --seed 72 \
+  --headless \
+  --json_out /workspace/instinct_nav/logs/rsl_rl/g1_instinct_navigation_ppo_vismap/2026-07-26_21-39-31_g1_sru_scene_token_risk_no_goal_shared_lowcam_query_v1/eval_debug_dump_summary.json \
+  --debug_dump_dir /workspace/instinct_nav/logs/rsl_rl/g1_instinct_navigation_ppo_vismap/2026-07-26_21-39-31_g1_sru_scene_token_risk_no_goal_shared_lowcam_query_v1/eval_debug_dump \
+  --debug_dump_env_id 0 \
+  --debug_dump_every_steps 1 \
+  --debug_dump_max_steps 200
+```
+
+输出内容和 deploy dump 对齐：
+
+```text
+index.jsonl
+step_00000001.npz
+  depth_m, encoded_depth, scene_tokens, actor_obs, raw_action, command
+  base_lin_vel_b, base_ang_vel_b, projected_gravity_b, goal_b, joint_pos, joint_vel
+```
+
+如果只想看统计量，减少磁盘占用，可追加：
+
+```bash
+--debug_dump_stats_only
+```
+
+部署前比较顺序：先对比 `index.jsonl` 里的 min/max/mean/std，再打开 `.npz` 看具体数组。重点检查 `projected_gravity_b` 符号、`base_ang_vel_b` 量纲、`depth_m` 无效值约定、`encoded_depth` 分布、`scene_tokens` 范围和 `raw_action/command` 是否异常。
+

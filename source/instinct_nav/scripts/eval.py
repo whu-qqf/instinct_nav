@@ -85,6 +85,36 @@ parser.add_argument(
     help="Optional path to write the summary JSON.",
 )
 parser.add_argument(
+    "--debug_dump_dir",
+    type=str,
+    default=None,
+    help="Optional directory for IsaacLab eval observation/action dumps matching deploy debug format.",
+)
+parser.add_argument(
+    "--debug_dump_env_id",
+    type=int,
+    default=0,
+    help="Environment id to dump when --debug_dump_dir is enabled.",
+)
+parser.add_argument(
+    "--debug_dump_every_steps",
+    type=int,
+    default=1,
+    help="Dump every N eval policy steps when --debug_dump_dir is enabled.",
+)
+parser.add_argument(
+    "--debug_dump_max_steps",
+    type=int,
+    default=1000,
+    help="Maximum number of eval policy steps to dump.",
+)
+parser.add_argument(
+    "--debug_dump_stats_only",
+    action="store_true",
+    default=False,
+    help="Only write index.jsonl statistics; skip per-step npz arrays.",
+)
+parser.add_argument(
     "--print_every",
     type=int,
     default=50,
@@ -131,6 +161,39 @@ parser.add_argument(
     type=int,
     default=0,
     help="Maximum number of failed episodes to export as real 3D RGB screenshots. 0 disables RGB capture.",
+)
+parser.add_argument(
+    "--failure_rgb_success_limit",
+    type=int,
+    default=None,
+    help="Maximum number of successful episodes to export as RGB GIF/PNG. None falls back to --failure_rgb_limit when successes are included.",
+)
+parser.add_argument(
+    "--failure_rgb_failure_limit",
+    type=int,
+    default=None,
+    help="Maximum number of failed episodes to export as RGB GIF/PNG. None falls back to --failure_rgb_limit.",
+)
+parser.add_argument(
+    "--failure_rgb_success_min_initial_distance",
+    type=float,
+    default=0.0,
+    help="Only export successful RGB GIF/PNG cases whose initial spawn-goal XY distance is at least this value in meters. 0 disables filtering.",
+)
+parser.add_argument(
+    "--failure_rgb_success_min_goal_height_delta",
+    type=float,
+    default=0.0,
+    help=(
+        "Only export successful RGB GIF/PNG cases whose sampled goal terrain height is at least this many meters "
+        "above the sampled spawn terrain height. 0 disables filtering."
+    ),
+)
+parser.add_argument(
+    "--failure_rgb_terrain_name",
+    type=str,
+    default=None,
+    help="Only export RGB GIF/PNG cases from this terrain name, for example 'stairs'. None disables terrain filtering.",
 )
 parser.add_argument(
     "--failure_rgb_base_contact_only",
@@ -418,6 +481,8 @@ if (
     args_cli.failure_rgb_dir is not None
     or args_cli.compare_failure_rgb_dir is not None
     or args_cli.failure_rgb_limit > 0
+    or (args_cli.failure_rgb_success_limit is not None and args_cli.failure_rgb_success_limit > 0)
+    or (args_cli.failure_rgb_failure_limit is not None and args_cli.failure_rgb_failure_limit > 0)
 ):
     args_cli.enable_cameras = True
 
@@ -1000,6 +1065,60 @@ def _snapshot_vector(snapshot: dict[str, torch.Tensor], key: str, env_id: int) -
     if value is None or env_id < 0 or env_id >= int(value.shape[0]):
         return None
     return [float(x) for x in value[env_id].detach().cpu().tolist()]
+
+
+def _snapshot_scalar(snapshot: dict[str, torch.Tensor], key: str, env_id: int) -> float | None:
+    value = snapshot.get(key)
+    if value is None or env_id < 0 or env_id >= int(value.shape[0]):
+        return None
+    return float(value[env_id].detach().cpu().item())
+
+
+def _sample_height_field_z_for_positions(
+    env,
+    snapshot: dict[str, torch.Tensor],
+    env_ids: torch.Tensor,
+    positions_world: torch.Tensor,
+) -> torch.Tensor | None:
+    terrain = getattr(env.unwrapped.scene, "terrain", None)
+    heights_raw = getattr(terrain, "_height_field_visual", None) if terrain is not None else None
+    terrain_origins_raw = getattr(terrain, "terrain_origins", None) if terrain is not None else None
+    terrain_levels = snapshot.get("terrain_levels")
+    terrain_types = snapshot.get("terrain_types")
+    if heights_raw is None or terrain_origins_raw is None or terrain_levels is None or terrain_types is None:
+        return None
+
+    terrain_cfg = getattr(getattr(terrain, "cfg", None), "terrain_generator", None)
+    if terrain_cfg is None or not hasattr(terrain_cfg, "horizontal_scale") or not hasattr(terrain_cfg, "size"):
+        return None
+
+    device = positions_world.device
+    heights = heights_raw.to(device=device) if isinstance(heights_raw, torch.Tensor) else torch.as_tensor(heights_raw, device=device)
+    terrain_origins = (
+        terrain_origins_raw.to(device=device)
+        if isinstance(terrain_origins_raw, torch.Tensor)
+        else torch.as_tensor(terrain_origins_raw, device=device)
+    )
+    levels = terrain_levels[env_ids].to(device=device, dtype=torch.long)
+    types = terrain_types[env_ids].to(device=device, dtype=torch.long)
+    terrain_indices = levels * int(terrain_origins.shape[1]) + types
+
+    horizontal_scale = float(terrain_cfg.horizontal_scale)
+    terrain_size = terrain_cfg.size
+    mesh_center_x = float(terrain_size[0]) * 0.5
+    mesh_center_y = float(terrain_size[1]) * 0.5
+    # PositionSampler uses the same one-cell mesh border offset for local xy <-> height-field index conversion.
+    border_pixels = 1
+
+    origins = terrain_origins[levels, types]
+    local_xy = positions_world[env_ids, :2] - origins[:, :2]
+    x_idx = torch.round((local_xy[:, 0] + mesh_center_x) / horizontal_scale - border_pixels).to(dtype=torch.long)
+    y_idx = torch.round((local_xy[:, 1] + mesh_center_y) / horizontal_scale - border_pixels).to(dtype=torch.long)
+    x_idx = torch.clamp(x_idx, 0, int(heights.shape[1]) - 1)
+    y_idx = torch.clamp(y_idx, 0, int(heights.shape[2]) - 1)
+
+    vertical_scale = float(getattr(terrain_cfg, "vertical_scale", 0.005))
+    return heights[terrain_indices, x_idx, y_idx].float() * vertical_scale
 
 
 def _write_case_metadata(output_path: str, metadata: dict[str, object]):
@@ -1717,6 +1836,25 @@ def _overlay_danger_mask_on_depth_rgb(depth_rgb: np.ndarray, danger_mask: np.nda
     return overlaid
 
 
+def _resolve_depth_visualization_sensor_cfg(env) -> SceneEntityCfg | None:
+    """Resolve the depth sensor used by the active high-level navigation observation."""
+    sensors = getattr(env.unwrapped.scene, "sensors", {})
+    policy_group = getattr(getattr(env.unwrapped.cfg, "observations", None), "policy", None)
+    depth_term = getattr(policy_group, "depth_image", None) if policy_group is not None else None
+    sensor_cfg = None
+    if depth_term is not None:
+        params = getattr(depth_term, "params", {}) or {}
+        sensor_cfg = params.get("sensor_cfg")
+        sensor_name = getattr(sensor_cfg, "name", None)
+        if sensor_name is not None and hasattr(sensors, "get") and sensors.get(sensor_name) is not None:
+            return sensor_cfg
+
+    for sensor_name in ("raycast_camera", "camera"):
+        if hasattr(sensors, "get") and sensors.get(sensor_name) is not None:
+            return SceneEntityCfg(sensor_name)
+    return None
+
+
 def _capture_observation_frame_cache(
     env, local_terrain_map: DepthPoseLocalTerrainMap | None = None
 ) -> dict[str, list[np.ndarray | None]]:
@@ -1734,13 +1872,15 @@ def _capture_observation_frame_cache(
     }
     sensors = getattr(env.unwrapped.scene, "sensors", {})
 
-    depth_sensor = sensors.get("raycast_camera") if hasattr(sensors, "get") else None
+    depth_sensor_cfg = _resolve_depth_visualization_sensor_cfg(env)
+    depth_sensor_name = getattr(depth_sensor_cfg, "name", None)
+    depth_sensor = sensors.get(depth_sensor_name) if depth_sensor_name is not None and hasattr(sensors, "get") else None
     if depth_sensor is not None and "distance_to_image_plane" in depth_sensor.data.output:
         height, width = depth_sensor.image_shape
         depth_tensor_device = depth_sensor.data.output["distance_to_image_plane"].view(num_envs, 1, height, width)
         display_depth_tensor = depth_tensor_device
         try:
-            noisy_sample = nav_observations._get_noisy_depth_sample(env.unwrapped, SceneEntityCfg("raycast_camera"))
+            noisy_sample = nav_observations._get_noisy_depth_sample(env.unwrapped, depth_sensor_cfg)
             noisy_depth = noisy_sample["depth"]
             if noisy_depth.dim() in (2, 3):
                 noisy_depth = noisy_depth.view(num_envs, 1, height, width)
@@ -1757,7 +1897,7 @@ def _capture_observation_frame_cache(
             delay_manager = getattr(env.unwrapped, "delay_manager", None)
             if delay_manager is not None and getattr(delay_manager, "enabled", False):
                 depth_buffers = getattr(delay_manager, "_delay_depth_buffers", {})
-                depth_state = depth_buffers.get("raycast_camera") if hasattr(depth_buffers, "get") else None
+                depth_state = depth_buffers.get(depth_sensor_name) if depth_sensor_name is not None and hasattr(depth_buffers, "get") else None
                 if depth_state is None and hasattr(depth_buffers, "__len__") and len(depth_buffers) == 1:
                     depth_state = next(iter(depth_buffers.values()))
                 if depth_state is not None and hasattr(depth_state, "time_lags"):
@@ -1808,11 +1948,11 @@ def _capture_observation_frame_cache(
             cached_frames["local_map"][env_id] = local_terrain_map.render(env, env_id)
             cached_frames["local_gradient"][env_id] = local_terrain_map.gradient_frame(env_id)
 
-    if depth_sensor is not None:
+    if depth_sensor is not None and depth_sensor_cfg is not None:
         try:
             visibility_obs = nav_observations.local_visibility_map(
                 env.unwrapped,
-                sensor_cfg=SceneEntityCfg("raycast_camera"),
+                sensor_cfg=depth_sensor_cfg,
                 asset_cfg=SceneEntityCfg("robot"),
                 size_m=6.4,
                 grid_size=64,
@@ -1829,7 +1969,7 @@ def _capture_observation_frame_cache(
         try:
             scene_tokens = nav_observations.scene_tokens_from_visibility_map(
                 env.unwrapped,
-                sensor_cfg=SceneEntityCfg("raycast_camera"),
+                sensor_cfg=depth_sensor_cfg,
                 asset_cfg=SceneEntityCfg("robot"),
                 size_m=6.4,
                 grid_size=64,
@@ -2119,6 +2259,20 @@ def _terrain_name_from_metadata(terrain_lookup: dict[int, str], terrain_type_ind
     return terrain_lookup.get(terrain_type_index, f"terrain_type_{terrain_type_index}")
 
 
+def _resolved_failure_rgb_success_limit() -> int:
+    if args_cli.failure_rgb_success_limit is not None:
+        return max(0, int(args_cli.failure_rgb_success_limit))
+    if not args_cli.failure_rgb_include_successes:
+        return 0
+    return max(0, int(args_cli.failure_rgb_limit))
+
+
+def _resolved_failure_rgb_failure_limit() -> int:
+    if args_cli.failure_rgb_failure_limit is not None:
+        return max(0, int(args_cli.failure_rgb_failure_limit))
+    return max(0, int(args_cli.failure_rgb_limit))
+
+
 def capture_failure_rgb_screenshots(
     env,
     failure_camera: Camera | None,
@@ -2133,30 +2287,82 @@ def capture_failure_rgb_screenshots(
     base_contact_records: list[dict[str, object]],
     episode_start_index: int,
     output_dir: str | None,
-    remaining_budget: int,
-) -> tuple[int, list[str]]:
+    success_remaining_budget: int,
+    failure_remaining_budget: int,
+) -> tuple[int, int, int, int, list[str]]:
     if (
         failure_camera is None
         or output_dir is None
-        or remaining_budget <= 0
+        or (success_remaining_budget <= 0 and failure_remaining_budget <= 0)
         or pre_step_snapshot is None
         or done_ids.numel() == 0
     ):
-        return 0, []
+        return 0, 0, 0, 0, []
 
-    if args_cli.failure_rgb_include_successes:
-        capture_mask = torch.ones_like(successes, dtype=torch.bool)
-    else:
-        capture_mask = torch.logical_not(successes)
+    terrain_filter_mask = None
+    requested_terrain_name = args_cli.failure_rgb_terrain_name
+    if requested_terrain_name:
+        terrain_type_indices_all, _ = _terrain_metadata_for_env_ids(pre_step_snapshot, done_ids)
+        terrain_matches = [
+            _terrain_name_from_metadata(terrain_lookup, int(terrain_type_index)) == requested_terrain_name
+            for terrain_type_index in terrain_type_indices_all
+        ]
+        terrain_filter_mask = torch.tensor(terrain_matches, device=done_ids.device, dtype=torch.bool)
+
+    skipped_success_distance_count = 0
+    skipped_success_height_delta_count = 0
+    capture_indices: list[torch.Tensor] = []
+    if args_cli.failure_rgb_include_successes and success_remaining_budget > 0:
+        success_capture_mask = successes.clone()
+        if terrain_filter_mask is not None:
+            success_capture_mask = torch.logical_and(success_capture_mask, terrain_filter_mask)
+        min_success_distance = float(args_cli.failure_rgb_success_min_initial_distance)
+        if min_success_distance > 0.0:
+            initial_distance = None
+            if "initial_distance_to_goal" in pre_step_snapshot:
+                initial_distance = pre_step_snapshot["initial_distance_to_goal"][done_ids]
+            elif "spawn_position_world" in pre_step_snapshot and "goal_position_world" in pre_step_snapshot:
+                spawn_xy = pre_step_snapshot["spawn_position_world"][done_ids, :2]
+                goal_xy = pre_step_snapshot["goal_position_world"][done_ids, :2]
+                initial_distance = torch.norm(spawn_xy - goal_xy, dim=1)
+            if initial_distance is not None:
+                distance_mask = initial_distance >= min_success_distance
+                skipped_success_distance_count = int(torch.logical_and(success_capture_mask, torch.logical_not(distance_mask)).sum().item())
+                success_capture_mask = torch.logical_and(success_capture_mask, distance_mask)
+        min_goal_height_delta = float(args_cli.failure_rgb_success_min_goal_height_delta)
+        if min_goal_height_delta > 0.0 and "spawn_position_world" in pre_step_snapshot and "goal_position_world" in pre_step_snapshot:
+            spawn_positions = pre_step_snapshot["spawn_position_world"]
+            goal_positions = pre_step_snapshot["goal_position_world"]
+            spawn_z = _sample_height_field_z_for_positions(env, pre_step_snapshot, done_ids, spawn_positions)
+            goal_z = _sample_height_field_z_for_positions(env, pre_step_snapshot, done_ids, goal_positions)
+            if spawn_z is None or goal_z is None:
+                spawn_z = spawn_positions[done_ids, 2]
+                goal_z = goal_positions[done_ids, 2]
+            height_delta_mask = (goal_z - spawn_z) >= min_goal_height_delta
+            skipped_success_height_delta_count = int(
+                torch.logical_and(success_capture_mask, torch.logical_not(height_delta_mask)).sum().item()
+            )
+            success_capture_mask = torch.logical_and(success_capture_mask, height_delta_mask)
+        success_local_indices = torch.nonzero(success_capture_mask, as_tuple=False).squeeze(-1)
+        if success_local_indices.numel() > 0:
+            capture_indices.append(success_local_indices[:success_remaining_budget])
+
+    failure_capture_mask = torch.logical_not(successes)
+    if terrain_filter_mask is not None:
+        failure_capture_mask = torch.logical_and(failure_capture_mask, terrain_filter_mask)
     if args_cli.failure_rgb_base_contact_only:
         if "base_contact" not in done_term_values:
-            return 0, []
+            return 0, 0, skipped_success_distance_count, skipped_success_height_delta_count, []
         base_contact_mask = torch.tensor(done_term_values["base_contact"], device=done_ids.device, dtype=torch.bool)
-        capture_mask = torch.logical_and(capture_mask, base_contact_mask)
-    capture_local_indices = torch.nonzero(capture_mask, as_tuple=False).squeeze(-1)
-    if capture_local_indices.numel() == 0:
-        return 0, []
-    capture_local_indices = capture_local_indices[:remaining_budget]
+        failure_capture_mask = torch.logical_and(failure_capture_mask, base_contact_mask)
+    if failure_remaining_budget > 0:
+        failure_local_indices = torch.nonzero(failure_capture_mask, as_tuple=False).squeeze(-1)
+        if failure_local_indices.numel() > 0:
+            capture_indices.append(failure_local_indices[:failure_remaining_budget])
+
+    if not capture_indices:
+        return 0, 0, skipped_success_distance_count, skipped_success_height_delta_count, []
+    capture_local_indices = torch.cat(capture_indices).sort().values
     capture_env_ids = done_ids[capture_local_indices]
     collision_lookup = {int(record["finished_episode_index"]): record for record in base_contact_records}
     robot = env.unwrapped.scene["robot"]
@@ -2166,7 +2372,8 @@ def capture_failure_rgb_screenshots(
     terrain_type_indices, terrain_levels = _terrain_metadata_for_env_ids(pre_step_snapshot, capture_env_ids)
 
     saved_paths: list[str] = []
-    rendered_cases = 0
+    rendered_success_cases = 0
+    rendered_failure_cases = 0
     for batch_index, local_index in enumerate(capture_local_indices.detach().cpu().tolist()):
         finished_episode_index = _finished_case_index(done_ids, local_index, episode_start_index)
         env_id = int(capture_env_ids[batch_index].item())
@@ -2242,6 +2449,19 @@ def capture_failure_rgb_screenshots(
             terrain_level,
             terrain_type_index,
         )
+        spawn_position_world = _snapshot_vector(pre_step_snapshot, "spawn_position_world", env_id)
+        goal_position_world = _snapshot_vector(pre_step_snapshot, "goal_position_world", env_id)
+        goal_height_delta_m = None
+        spawn_positions_tensor = pre_step_snapshot.get("spawn_position_world")
+        goal_positions_tensor = pre_step_snapshot.get("goal_position_world")
+        if spawn_positions_tensor is not None and goal_positions_tensor is not None:
+            sampled_spawn_z = _sample_height_field_z_for_positions(env, pre_step_snapshot, env_id_tensor, spawn_positions_tensor)
+            sampled_goal_z = _sample_height_field_z_for_positions(env, pre_step_snapshot, env_id_tensor, goal_positions_tensor)
+            if sampled_spawn_z is not None and sampled_goal_z is not None:
+                goal_height_delta_m = float((sampled_goal_z[0] - sampled_spawn_z[0]).detach().cpu().item())
+            elif spawn_position_world is not None and goal_position_world is not None:
+                goal_height_delta_m = float(goal_position_world[2] - spawn_position_world[2])
+
         case_metadata = {
             "seed": None if args_cli.seed is None else int(args_cli.seed),
             "case_index": int(finished_episode_index),
@@ -2253,8 +2473,10 @@ def capture_failure_rgb_screenshots(
             "terrain_level": int(terrain_level),
             "terrain_type_index": int(terrain_type_index),
             "observation_delay": _delay_snapshot_for_env(pre_step_delay_snapshot, env_id),
-            "spawn_position_world": _snapshot_vector(pre_step_snapshot, "spawn_position_world", env_id),
-            "goal_position_world": _snapshot_vector(pre_step_snapshot, "goal_position_world", env_id),
+            "spawn_position_world": spawn_position_world,
+            "goal_position_world": goal_position_world,
+            "initial_distance_to_goal_m": _snapshot_scalar(pre_step_snapshot, "initial_distance_to_goal", env_id),
+            "goal_height_delta_m": goal_height_delta_m,
             "final_root_position_world": _snapshot_vector(pre_step_snapshot, "root_pos_w", env_id),
             "final_root_quat_world": _snapshot_vector(pre_step_snapshot, "root_quat_w", env_id),
             "terrain_geometry": terrain_geometry_signature(env),
@@ -2421,7 +2643,10 @@ def capture_failure_rgb_screenshots(
             _write_case_metadata(gif_output_path, case_metadata)
             saved_paths.append(gif_output_path)
         if rendered_rgb_frames:
-            rendered_cases += 1
+            if bool(successes[local_index].item()):
+                rendered_success_cases += 1
+            else:
+                rendered_failure_cases += 1
 
         robot.write_root_pose_to_sim(current_root_pose, env_ids=env_id_tensor)
         robot.write_root_velocity_to_sim(current_root_velocity, env_ids=env_id_tensor)
@@ -2430,7 +2655,7 @@ def capture_failure_rgb_screenshots(
         robot.set_joint_velocity_target(current_joint_vel, env_ids=env_id_tensor)
         robot.write_data_to_sim()
 
-    return rendered_cases, saved_paths
+    return rendered_success_cases, rendered_failure_cases, skipped_success_distance_count, skipped_success_height_delta_count, saved_paths
 
 
 def _terrain_instance_index(level: int, terrain_type_index: int, render_context: dict[str, object]) -> int:
@@ -2589,6 +2814,21 @@ def _resize_rgb_frame(frame: np.ndarray, target_height: int) -> np.ndarray:
     return np.asarray(resized, dtype=np.uint8)
 
 
+def _label_rgb_frame(frame: np.ndarray, label: str) -> np.ndarray:
+    from PIL import Image, ImageDraw
+
+    image = Image.fromarray(np.asarray(frame, dtype=np.uint8)).convert("RGB")
+    draw = ImageDraw.Draw(image)
+    pad_x = 6
+    pad_y = 4
+    text_bbox = draw.textbbox((0, 0), label)
+    text_w = text_bbox[2] - text_bbox[0]
+    text_h = text_bbox[3] - text_bbox[1]
+    draw.rectangle((0, 0, text_w + 2 * pad_x, text_h + 2 * pad_y), fill=(0, 0, 0))
+    draw.text((pad_x, pad_y), label, fill=(255, 255, 255))
+    return np.asarray(image, dtype=np.uint8)
+
+
 def _compose_observation_triptych(
     topdown_frame: np.ndarray,
     rear_view_frame: np.ndarray | None,
@@ -2601,15 +2841,23 @@ def _compose_observation_triptych(
     visibility_obs_frame: np.ndarray | None = None,
     scene_token_frame: np.ndarray | None = None,
 ) -> np.ndarray:
-    ordered_frames = [topdown_frame, rear_view_frame, depth_frame]
-    if processed_depth_frame is not None:
-        ordered_frames.append(processed_depth_frame)
-    ordered_frames.extend([height_frame, steep_frame, local_map_frame, local_gradient_frame, visibility_obs_frame, scene_token_frame])
-    ordered_frames = [frame for frame in ordered_frames if frame is not None]
-    if not ordered_frames:
+    labeled_frames = [
+        ("rgb", topdown_frame),
+        ("rear", rear_view_frame),
+        ("depth", depth_frame),
+        ("processed_depth", processed_depth_frame),
+        ("height", height_frame),
+        ("steep", steep_frame),
+        ("local_map", local_map_frame),
+        ("local_gradient", local_gradient_frame),
+        ("visibility", visibility_obs_frame),
+        ("scene_tokens", scene_token_frame),
+    ]
+    labeled_frames = [(label, frame) for label, frame in labeled_frames if frame is not None]
+    if not labeled_frames:
         raise ValueError("At least one frame is required to compose observation visualization.")
-    target_height = max(frame.shape[0] for frame in ordered_frames)
-    panels = [_resize_rgb_frame(frame, target_height) for frame in ordered_frames]
+    target_height = max(frame.shape[0] for _, frame in labeled_frames)
+    panels = [_label_rgb_frame(_resize_rgb_frame(frame, target_height), label) for label, frame in labeled_frames]
     return np.concatenate(panels, axis=1)
 
 
@@ -2852,6 +3100,8 @@ def capture_base_contact_snapshot(env, base_contact_context: dict | None) -> dic
         snapshot["goal_position_world"] = goal_term.goal_position_world.detach().clone()
     if goal_term is not None and hasattr(goal_term, "spawn_position_world"):
         snapshot["spawn_position_world"] = goal_term.spawn_position_world.detach().clone()
+    if goal_term is not None and hasattr(goal_term, "initial_distance_to_goal"):
+        snapshot["initial_distance_to_goal"] = goal_term.initial_distance_to_goal.detach().clone()
 
     return snapshot
 
@@ -2959,6 +3209,152 @@ def collect_base_contact_failure_records(
 
     return records
 
+
+
+def _np_stats(value: np.ndarray) -> dict[str, float | int]:
+    arr = np.asarray(value, dtype=np.float32).reshape(-1)
+    finite = np.isfinite(arr)
+    if not finite.any():
+        return {
+            "numel": int(arr.size),
+            "finite_ratio": 0.0,
+            "min": float("nan"),
+            "max": float("nan"),
+            "mean": float("nan"),
+            "std": float("nan"),
+        }
+    finite_arr = arr[finite]
+    return {
+        "numel": int(arr.size),
+        "finite_ratio": float(finite.mean()),
+        "min": float(finite_arr.min()),
+        "max": float(finite_arr.max()),
+        "mean": float(finite_arr.mean()),
+        "std": float(finite_arr.std()),
+    }
+
+
+def _tensor_env_np(value: torch.Tensor, env_id: int) -> np.ndarray:
+    if value.dim() == 0:
+        return value.detach().cpu().numpy()
+    env_id = max(0, min(int(env_id), int(value.shape[0]) - 1))
+    return value[env_id].detach().cpu().numpy().astype(np.float32, copy=False)
+
+
+def _capture_eval_depth_m(env, env_id: int) -> np.ndarray:
+    sensors = getattr(env.unwrapped.scene, "sensors", None)
+    depth_sensor = None
+    if sensors is not None and hasattr(sensors, "get"):
+        depth_sensor = sensors.get("raycast_camera") or sensors.get("camera")
+    if depth_sensor is None or "distance_to_image_plane" not in depth_sensor.data.output:
+        return np.zeros((0,), dtype=np.float32)
+    height, width = depth_sensor.image_shape
+    depth = depth_sensor.data.output["distance_to_image_plane"].view(env.unwrapped.num_envs, height, width)
+    depth = torch.nan_to_num(depth, nan=50.0, posinf=50.0, neginf=0.0)
+    return _tensor_env_np(depth, env_id).astype(np.float32, copy=True)
+
+
+def _capture_eval_robot_state(env, env_id: int) -> dict[str, np.ndarray]:
+    robot = env.unwrapped.scene["robot"]
+    data = robot.data
+    zeros3 = np.zeros(3, dtype=np.float32)
+    return {
+        "base_lin_vel_b": _tensor_env_np(getattr(data, "root_lin_vel_b", torch.zeros(env.unwrapped.num_envs, 3, device=env.unwrapped.device)), env_id).reshape(-1)[:3].astype(np.float32, copy=True),
+        "base_ang_vel_b": _tensor_env_np(getattr(data, "root_ang_vel_b", torch.zeros(env.unwrapped.num_envs, 3, device=env.unwrapped.device)), env_id).reshape(-1)[:3].astype(np.float32, copy=True),
+        "projected_gravity_b": _tensor_env_np(getattr(data, "projected_gravity_b", torch.zeros(env.unwrapped.num_envs, 3, device=env.unwrapped.device)), env_id).reshape(-1)[:3].astype(np.float32, copy=True),
+        "joint_pos": _tensor_env_np(getattr(data, "joint_pos", torch.zeros(env.unwrapped.num_envs, 0, device=env.unwrapped.device)), env_id).astype(np.float32, copy=True),
+        "joint_vel": _tensor_env_np(getattr(data, "joint_vel", torch.zeros(env.unwrapped.num_envs, 0, device=env.unwrapped.device)), env_id).astype(np.float32, copy=True),
+    }
+
+
+def _capture_eval_goal_b(env, obs_env: np.ndarray) -> np.ndarray:
+    # The current SRU actor layout is proprio(16) = base_lin_vel(3), base_ang_vel(3),
+    # projected_gravity(3), last_action(3), goal_b(4). Prefer the exact actor obs
+    # slice so this dump matches the network input even if command internals change.
+    if obs_env.shape[0] >= 16:
+        return obs_env[12:16].astype(np.float32, copy=True)
+    return np.zeros(4, dtype=np.float32)
+
+
+class EvalDebugDumper:
+    """Dump IsaacLab eval observations/actions in deploy-compatible format."""
+
+    def __init__(self, dump_dir: str | None, env_id: int, every_steps: int, max_steps: int, save_arrays: bool, label: str):
+        self.enabled = dump_dir is not None
+        self.env_id = int(env_id)
+        self.every_steps = int(every_steps)
+        self.max_steps = int(max_steps)
+        self.save_arrays = bool(save_arrays)
+        self.step_count = 0
+        self.saved_count = 0
+        self.label = str(label)
+        self.dump_dir = None
+        self.index_path = None
+        if self.enabled:
+            base_dir = Path(os.path.abspath(os.path.expanduser(str(dump_dir))))
+            self.dump_dir = base_dir if label == "primary" else base_dir / label
+            self.dump_dir.mkdir(parents=True, exist_ok=True)
+            self.index_path = self.dump_dir / "index.jsonl"
+            print(
+                f"[INFO] Eval debug dump enabled: dir={self.dump_dir}, env_id={self.env_id}, "
+                f"every_steps={self.every_steps}, max_steps={self.max_steps}, save_arrays={self.save_arrays}"
+            )
+
+    def maybe_dump(self, env, obs: torch.Tensor, actions: torch.Tensor) -> None:
+        if not self.enabled or self.every_steps <= 0:
+            return
+        self.step_count += 1
+        if self.step_count % self.every_steps != 0 or self.saved_count >= self.max_steps:
+            return
+        env_id = max(0, min(self.env_id, int(obs.shape[0]) - 1))
+        self.saved_count += 1
+        tag = f"step_{self.step_count:08d}"
+
+        obs_env = _tensor_env_np(obs, env_id).reshape(-1).astype(np.float32, copy=True)
+        action_env = _tensor_env_np(actions, env_id).reshape(-1)[:3].astype(np.float32, copy=True)
+        encoded_depth = obs_env[16:2576].astype(np.float32, copy=True) if obs_env.shape[0] >= 2576 else np.zeros(0, dtype=np.float32)
+        scene_tokens = obs_env[2576:2960].astype(np.float32, copy=True) if obs_env.shape[0] >= 2960 else np.zeros(0, dtype=np.float32)
+        depth_m = _capture_eval_depth_m(env, env_id)
+        robot_state = _capture_eval_robot_state(env, env_id)
+        goal_b = _capture_eval_goal_b(env, obs_env)
+
+        record = {
+            "step": self.step_count,
+            "saved_index": self.saved_count,
+            "env_id": int(env_id),
+            "label": self.label,
+            "file": f"{tag}.npz" if self.save_arrays else None,
+            "base_lin_vel_b": robot_state["base_lin_vel_b"].astype(float).tolist(),
+            "base_ang_vel_b": robot_state["base_ang_vel_b"].astype(float).tolist(),
+            "projected_gravity_b": robot_state["projected_gravity_b"].astype(float).tolist(),
+            "goal_b": goal_b.astype(float).tolist(),
+            "raw_action": action_env.astype(float).tolist(),
+            "command": action_env.astype(float).tolist(),
+            "depth_stats": _np_stats(depth_m),
+            "encoded_depth_stats": _np_stats(encoded_depth),
+            "scene_token_stats": _np_stats(scene_tokens),
+            "actor_obs_stats": _np_stats(obs_env),
+        }
+
+        if self.save_arrays:
+            np.savez_compressed(
+                self.dump_dir / f"{tag}.npz",
+                base_lin_vel_b=robot_state["base_lin_vel_b"],
+                base_ang_vel_b=robot_state["base_ang_vel_b"],
+                projected_gravity_b=robot_state["projected_gravity_b"],
+                joint_pos=robot_state["joint_pos"],
+                joint_vel=robot_state["joint_vel"],
+                depth_m=depth_m,
+                goal_b=goal_b,
+                encoded_depth=encoded_depth,
+                scene_tokens=scene_tokens,
+                actor_obs=obs_env,
+                raw_action=action_env,
+                command=action_env,
+            )
+
+        with self.index_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 def _load_inference_policy_for_env(env, agent_cfg: RslRlOnPolicyRunnerCfg, checkpoint_path: str):
     checkpoint_path = os.path.abspath(os.path.expanduser(checkpoint_path))
@@ -3090,6 +3486,14 @@ def _run_eval_pass(
 ) -> dict[str, object]:
     obs, _ = env.get_observations()
     reset_policy_state = True
+    debug_dumper = EvalDebugDumper(
+        dump_dir=args_cli.debug_dump_dir,
+        env_id=args_cli.debug_dump_env_id,
+        every_steps=args_cli.debug_dump_every_steps,
+        max_steps=args_cli.debug_dump_max_steps,
+        save_arrays=not args_cli.debug_dump_stats_only,
+        label=label,
+    )
 
     goal_term = env.unwrapped.command_manager._terms["robot_goal"]
     success_tracker = goal_term.success_tracker
@@ -3100,9 +3504,14 @@ def _run_eval_pass(
     topdown_render_context = resolve_topdown_render_context(env)
 
     failure_rgb_camera = None
-    failure_rgb_rendered_count = 0
+    failure_rgb_success_limit = _resolved_failure_rgb_success_limit()
+    failure_rgb_failure_limit = _resolved_failure_rgb_failure_limit()
+    failure_rgb_success_rendered_count = 0
+    failure_rgb_failure_rendered_count = 0
+    failure_rgb_success_distance_skipped_count = 0
+    failure_rgb_success_height_delta_skipped_count = 0
     failure_rgb_rendered_paths: list[str] = []
-    if failure_rgb_output_dir is not None and args_cli.failure_rgb_limit != 0:
+    if failure_rgb_output_dir is not None and (failure_rgb_success_limit != 0 or failure_rgb_failure_limit != 0):
         failure_rgb_output_dir = os.path.abspath(os.path.expanduser(failure_rgb_output_dir))
         os.makedirs(failure_rgb_output_dir, exist_ok=True)
         failure_rgb_camera = create_failure_rgb_camera(env)
@@ -3193,6 +3602,7 @@ def _run_eval_pass(
                 reset_policy_state = False
             else:
                 actions = policy(obs)
+            debug_dumper.maybe_dump(env, obs, actions)
             obs, _, dones, _ = env.step(actions)
 
         raw_done_ids = torch.nonzero(dones > 0, as_tuple=False).squeeze(-1)
@@ -3261,8 +3671,9 @@ def _run_eval_pass(
             base_contact_records = []
 
         if failure_rgb_output_dir is not None:
-            remaining_rgb_budget = max(0, args_cli.failure_rgb_limit - failure_rgb_rendered_count)
-            rendered_count, rendered_paths = capture_failure_rgb_screenshots(
+            remaining_success_budget = max(0, failure_rgb_success_limit - failure_rgb_success_rendered_count)
+            remaining_failure_budget = max(0, failure_rgb_failure_limit - failure_rgb_failure_rendered_count)
+            rendered_success_count, rendered_failure_count, skipped_success_distance_count, skipped_success_height_delta_count, rendered_paths = capture_failure_rgb_screenshots(
                 env=env,
                 failure_camera=failure_rgb_camera,
                 done_ids=done_ids,
@@ -3276,9 +3687,13 @@ def _run_eval_pass(
                 base_contact_records=base_contact_records,
                 episode_start_index=episode_start_index,
                 output_dir=failure_rgb_output_dir,
-                remaining_budget=remaining_rgb_budget,
+                success_remaining_budget=remaining_success_budget,
+                failure_remaining_budget=remaining_failure_budget,
             )
-            failure_rgb_rendered_count += rendered_count
+            failure_rgb_success_rendered_count += rendered_success_count
+            failure_rgb_failure_rendered_count += rendered_failure_count
+            failure_rgb_success_distance_skipped_count += skipped_success_distance_count
+            failure_rgb_success_height_delta_skipped_count += skipped_success_height_delta_count
             failure_rgb_rendered_paths.extend(rendered_paths)
 
         if local_terrain_map is not None:
@@ -3321,6 +3736,13 @@ def _run_eval_pass(
     summary = {
         "task": args_cli.task,
         "checkpoint": checkpoint_path,
+        "debug_dump": {
+            "enabled": bool(debug_dumper.enabled),
+            "dir": str(debug_dumper.dump_dir) if debug_dumper.dump_dir is not None else None,
+            "env_id": int(debug_dumper.env_id),
+            "saved_steps": int(debug_dumper.saved_count),
+            "stats_only": bool(not debug_dumper.save_arrays),
+        },
         "num_envs": int(env.unwrapped.num_envs),
         "episodes": total_episodes,
         "successes": total_successes,
@@ -3399,6 +3821,13 @@ def _run_eval_pass(
             "enabled": failure_rgb_output_dir is not None,
             "output_dir": failure_rgb_output_dir,
             "render_limit": int(args_cli.failure_rgb_limit),
+            "success_render_limit": int(failure_rgb_success_limit),
+            "failure_render_limit": int(failure_rgb_failure_limit),
+            "success_min_initial_distance_m": float(args_cli.failure_rgb_success_min_initial_distance),
+            "success_min_goal_height_delta_m": float(args_cli.failure_rgb_success_min_goal_height_delta),
+            "terrain_name_filter": args_cli.failure_rgb_terrain_name,
+            "success_distance_skipped_count": int(failure_rgb_success_distance_skipped_count),
+            "success_height_delta_skipped_count": int(failure_rgb_success_height_delta_skipped_count),
             "base_contact_only": bool(args_cli.failure_rgb_base_contact_only),
             "include_successes": bool(args_cli.failure_rgb_include_successes),
             "include_observations": bool(args_cli.failure_rgb_include_observations),
@@ -3418,7 +3847,9 @@ def _run_eval_pass(
             "rear_view_lateral_m": float(args_cli.failure_rgb_rear_lateral_m),
             "rear_view_target_height_m": float(args_cli.failure_rgb_rear_lookahead_m),
             "rear_view_orientation": "gravity_aligned_look_at",
-            "rendered_count": int(failure_rgb_rendered_count),
+            "success_rendered_count": int(failure_rgb_success_rendered_count),
+            "failure_rendered_count": int(failure_rgb_failure_rendered_count),
+            "rendered_count": int(failure_rgb_success_rendered_count + failure_rgb_failure_rendered_count),
             "sample_paths": failure_rgb_rendered_paths[:10],
         },
         "eval_overrides_enabled": not args_cli.disable_eval_overrides,
@@ -3559,9 +3990,14 @@ def main():
     topdown_render_context = resolve_topdown_render_context(env)
     failure_rgb_camera = None
     failure_rgb_output_dir = None
-    failure_rgb_rendered_count = 0
+    failure_rgb_success_limit = _resolved_failure_rgb_success_limit()
+    failure_rgb_failure_limit = _resolved_failure_rgb_failure_limit()
+    failure_rgb_success_rendered_count = 0
+    failure_rgb_failure_rendered_count = 0
+    failure_rgb_success_distance_skipped_count = 0
+    failure_rgb_success_height_delta_skipped_count = 0
     failure_rgb_rendered_paths: list[str] = []
-    if args_cli.failure_rgb_dir and args_cli.failure_rgb_limit != 0:
+    if args_cli.failure_rgb_dir and (failure_rgb_success_limit != 0 or failure_rgb_failure_limit != 0):
         failure_rgb_output_dir = os.path.abspath(os.path.expanduser(args_cli.failure_rgb_dir))
         os.makedirs(failure_rgb_output_dir, exist_ok=True)
         failure_rgb_camera = create_failure_rgb_camera(env)
@@ -3650,6 +4086,15 @@ def main():
             )
         initial_case_done_mask = torch.zeros(env.unwrapped.num_envs, dtype=torch.bool, device=env.unwrapped.device)
 
+    debug_dumper = EvalDebugDumper(
+        dump_dir=args_cli.debug_dump_dir,
+        env_id=args_cli.debug_dump_env_id,
+        every_steps=args_cli.debug_dump_every_steps,
+        max_steps=args_cli.debug_dump_max_steps,
+        save_arrays=not args_cli.debug_dump_stats_only,
+        label="primary",
+    )
+
     print(
         f"[INFO] Starting evaluation: task={args_cli.task}, num_envs={env.unwrapped.num_envs}, "
         f"target_episodes={args_cli.num_episodes}"
@@ -3672,6 +4117,7 @@ def main():
             else:
                 actions = policy(obs)
 
+            debug_dumper.maybe_dump(env, obs, actions)
             obs, _, dones, _ = env.step(actions)
 
         raw_done_ids = torch.nonzero(dones > 0, as_tuple=False).squeeze(-1)
@@ -3759,8 +4205,9 @@ def main():
             topdown_rendered_paths.extend(rendered_paths)
 
         if failure_rgb_output_dir is not None:
-            remaining_rgb_budget = max(0, args_cli.failure_rgb_limit - failure_rgb_rendered_count)
-            rendered_count, rendered_paths = capture_failure_rgb_screenshots(
+            remaining_success_budget = max(0, failure_rgb_success_limit - failure_rgb_success_rendered_count)
+            remaining_failure_budget = max(0, failure_rgb_failure_limit - failure_rgb_failure_rendered_count)
+            rendered_success_count, rendered_failure_count, skipped_success_distance_count, skipped_success_height_delta_count, rendered_paths = capture_failure_rgb_screenshots(
                 env=env,
                 failure_camera=failure_rgb_camera,
                 done_ids=done_ids,
@@ -3774,9 +4221,13 @@ def main():
                 base_contact_records=base_contact_records,
                 episode_start_index=episode_start_index,
                 output_dir=failure_rgb_output_dir,
-                remaining_budget=remaining_rgb_budget,
+                success_remaining_budget=remaining_success_budget,
+                failure_remaining_budget=remaining_failure_budget,
             )
-            failure_rgb_rendered_count += rendered_count
+            failure_rgb_success_rendered_count += rendered_success_count
+            failure_rgb_failure_rendered_count += rendered_failure_count
+            failure_rgb_success_distance_skipped_count += skipped_success_distance_count
+            failure_rgb_success_height_delta_skipped_count += skipped_success_height_delta_count
             failure_rgb_rendered_paths.extend(rendered_paths)
 
         if observation_gif_output_dir is not None:
@@ -3840,6 +4291,13 @@ def main():
     summary = {
         "task": args_cli.task,
         "checkpoint": resume_path,
+        "debug_dump": {
+            "enabled": bool(debug_dumper.enabled),
+            "dir": str(debug_dumper.dump_dir) if debug_dumper.dump_dir is not None else None,
+            "env_id": int(debug_dumper.env_id),
+            "saved_steps": int(debug_dumper.saved_count),
+            "stats_only": bool(not debug_dumper.save_arrays),
+        },
         "num_envs": int(env.unwrapped.num_envs),
         "episodes": total_episodes,
         "successes": total_successes,
@@ -3940,6 +4398,13 @@ def main():
             "enabled": failure_rgb_output_dir is not None,
             "output_dir": failure_rgb_output_dir,
             "render_limit": int(args_cli.failure_rgb_limit),
+            "success_render_limit": int(failure_rgb_success_limit),
+            "failure_render_limit": int(failure_rgb_failure_limit),
+            "success_min_initial_distance_m": float(args_cli.failure_rgb_success_min_initial_distance),
+            "success_min_goal_height_delta_m": float(args_cli.failure_rgb_success_min_goal_height_delta),
+            "terrain_name_filter": args_cli.failure_rgb_terrain_name,
+            "success_distance_skipped_count": int(failure_rgb_success_distance_skipped_count),
+            "success_height_delta_skipped_count": int(failure_rgb_success_height_delta_skipped_count),
             "base_contact_only": bool(args_cli.failure_rgb_base_contact_only),
             "include_successes": bool(args_cli.failure_rgb_include_successes),
             "include_observations": bool(args_cli.failure_rgb_include_observations),
@@ -3959,7 +4424,9 @@ def main():
             "rear_view_lateral_m": float(args_cli.failure_rgb_rear_lateral_m),
             "rear_view_target_height_m": float(args_cli.failure_rgb_rear_lookahead_m),
             "rear_view_orientation": "gravity_aligned_look_at",
-            "rendered_count": int(failure_rgb_rendered_count),
+            "success_rendered_count": int(failure_rgb_success_rendered_count),
+            "failure_rendered_count": int(failure_rgb_failure_rendered_count),
+            "rendered_count": int(failure_rgb_success_rendered_count + failure_rgb_failure_rendered_count),
             "sample_paths": failure_rgb_rendered_paths[:10],
         },
         "base_contact_observation_gifs": {
