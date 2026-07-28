@@ -158,9 +158,10 @@ Dry-run wiring command on the robot PC:
 ```bash
 PYTHONPATH=/path/to/instinct_nav/deploy:/path/to/instinct_onboard:$PYTHONPATH \
 python /path/to/instinct_nav/deploy/scripts/g1_nav_onboard.py \
-  --standdir /path/to/stand_agent_logdir \
+  --standdir /path/to/parkour_agent_logdir \
   --logdir /path/to/parkour_agent_logdir \
-  --auto_start_parkour
+  --auto_start_parkour \
+  --goal_pose_topic /instinct_nav/goal_pose
 ```
 
 This command defaults to dry-run. It publishes to instinct_onboard's dry-run
@@ -183,7 +184,7 @@ Current real SRU policy path:
 ```bash
 PYTHONPATH=/path/to/instinct_nav/deploy:/path/to/instinct_nav/source/rsl_rl:/path/to/instinct_onboard:$PYTHONPATH \
 python /path/to/instinct_nav/deploy/scripts/g1_nav_onboard.py \
-  --standdir /path/to/stand_agent_logdir \
+  --standdir /path/to/parkour_agent_logdir \
   --logdir /path/to/parkour_agent_logdir \
   --sru_checkpoint_path /path/to/model_2999.pt \
   --depth_encoder_path /path/to/instinct_nav/artifacts/sru/depth_encoder/vae_pretrain_new.pth \
@@ -191,7 +192,8 @@ python /path/to/instinct_nav/deploy/scripts/g1_nav_onboard.py \
   --debug_dump_every_steps 1 \
   --debug_dump_max_steps 1000 \
   --sru_device cpu \
-  --auto_start_parkour
+  --auto_start_parkour \
+  --goal_pose_topic /instinct_nav/goal_pose
 ```
 
 `--sru_checkpoint_path` directly loads the trained Python `ActorCriticSRU`

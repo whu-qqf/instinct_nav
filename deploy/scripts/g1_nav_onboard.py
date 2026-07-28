@@ -100,6 +100,8 @@ class G1NavOnboardNode(RealsenseMPCamera, UnitreeNode):
         sru_high_level_hz: float = 5.0,
         autonomous_command_timeout_s: float = 0.5,
         auto_start_parkour: bool = False,
+        goal_pose_topic: str = "/instinct_nav/goal_pose",
+        goal_reached_threshold: float = 0.5,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -113,6 +115,9 @@ class G1NavOnboardNode(RealsenseMPCamera, UnitreeNode):
         self._last_sru_command_time_s = 0.0
         self._autonomous_command_timeout_s = autonomous_command_timeout_s
         self._auto_start_parkour = bool(auto_start_parkour)
+        self._goal_pose_topic = str(goal_pose_topic)
+        self._goal_reached_threshold = float(goal_reached_threshold)
+        self._goal_pose_subscription = None
 
         cfg = OnboardConfig(high_level_hz=float(sru_high_level_hz))
         sensor_source = G1NodeSensorSource(self)
@@ -191,11 +196,22 @@ class G1NavOnboardNode(RealsenseMPCamera, UnitreeNode):
 
     def start_ros_handlers(self):
         super().start_ros_handlers()
+        from geometry_msgs.msg import PoseStamped
         from sensor_msgs.msg import JointState
         from tf2_ros import TransformBroadcaster
 
         self.joint_state_publisher = self.create_publisher(JointState, "joint_states", 10)
         self.tf_broadcaster = TransformBroadcaster(self)
+        self._goal_pose_subscription = self.create_subscription(
+            PoseStamped,
+            self._goal_pose_topic,
+            self._on_goal_pose,
+            10,
+        )
+        self.get_logger().info(
+            f"Listening for SRU navigation goals on {self._goal_pose_topic}. "
+            "For offline dry-run, publish PoseStamped in frame_id='base_link'."
+        )
         main_loop_duration = 0.02
         self.get_logger().info(f"Starting nav onboard main loop with duration: {main_loop_duration} seconds.")
         self.main_loop_timer = self.create_timer(main_loop_duration, self.main_loop_callback)
@@ -269,6 +285,36 @@ class G1NavOnboardNode(RealsenseMPCamera, UnitreeNode):
     def clear_nav_reset(self) -> None:
         self.nav_reset_requested = False
 
+    def _on_goal_pose(self, msg) -> None:
+        frame_id = msg.header.frame_id.strip("/") if msg.header.frame_id else "base_link"
+        if frame_id not in {"base_link", "base", "body", "torso_link"}:
+            self.get_logger().warn(
+                f"Received goal in frame '{msg.header.frame_id}', but only base_link/body-relative goals "
+                "are supported before odom/map transform wiring is added. Ignoring this goal.",
+                throttle_duration_sec=2.0,
+            )
+            return
+
+        goal_xyz = np.asarray(
+            [msg.pose.position.x, msg.pose.position.y, msg.pose.position.z],
+            dtype=np.float32,
+        )
+        distance = float(np.linalg.norm(goal_xyz))
+        if distance < self._goal_reached_threshold:
+            goal_b = np.asarray([0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        else:
+            direction = goal_xyz / max(distance, 1.0e-6)
+            goal_b = np.asarray(
+                [direction[0], direction[1], direction[2], np.log1p(distance)],
+                dtype=np.float32,
+            )
+        self.set_nav_goal_body(goal_b)
+        self.get_logger().info(
+            f"Updated SRU goal from {self._goal_pose_topic}: "
+            f"xyz_b=({goal_xyz[0]:+.2f}, {goal_xyz[1]:+.2f}, {goal_xyz[2]:+.2f}) m, "
+            f"goal_b=({goal_b[0]:+.3f}, {goal_b[1]:+.3f}, {goal_b[2]:+.3f}, {goal_b[3]:+.3f})."
+        )
+
 
 def main(args: argparse.Namespace) -> None:
     rclpy.init()
@@ -289,6 +335,8 @@ def main(args: argparse.Namespace) -> None:
         sru_device=args.sru_device,
         sru_high_level_hz=args.sru_high_level_hz,
         auto_start_parkour=args.auto_start_parkour,
+        goal_pose_topic=args.goal_pose_topic,
+        goal_reached_threshold=args.goal_reached_threshold,
     )
 
     stand_agent = ParkourStandAgent(logdir=args.standdir, ros_node=node)
@@ -347,6 +395,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pointcloud_vis", action="store_true", default=False)
     parser.add_argument("--nodryrun", action="store_true", default=False, help="Actually publish to /lowcmd instead of dry-run topic")
     parser.add_argument("--auto_start_parkour", action="store_true", default=False, help="Automatically switch from stand to parkour for dry-run wiring tests")
+    parser.add_argument("--goal_pose_topic", type=str, default="/instinct_nav/goal_pose", help="PoseStamped topic for body-frame SRU navigation goals")
+    parser.add_argument("--goal_reached_threshold", type=float, default=0.5, help="Body-frame goal distance below which the deployed goal command is zeroed")
     return parser.parse_args()
 
 
