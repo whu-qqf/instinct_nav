@@ -2,7 +2,6 @@
 
 from .config import OnboardConfig
 from .packets import SensorPacket, VelocityCommand, JointCommand
-from .runtime import InstinctNavOnboardRuntime
 from .instinct_onboard_bridge import InstinctOnboardVelocityCommandSink
 
 __all__ = [
@@ -10,6 +9,5 @@ __all__ = [
     "SensorPacket",
     "VelocityCommand",
     "JointCommand",
-    "InstinctNavOnboardRuntime",
     "InstinctOnboardVelocityCommandSink",
 ]

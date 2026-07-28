@@ -87,6 +87,7 @@ class G1NavOnboardOnnxNode(RealsenseMPCamera, UnitreeNode):
         self._goal_pose_topic = str(goal_pose_topic)
         self._goal_reached_threshold = float(goal_reached_threshold)
         self._goal_pose_subscription = None
+        self._goal_start_requested = False
 
         debug_cfg = None
         if debug_dump_dir is not None:
@@ -153,8 +154,9 @@ class G1NavOnboardOnnxNode(RealsenseMPCamera, UnitreeNode):
             tjs, _ = self.available_agents[self.current_agent_name].step()
             self.refresh_camera_data()
             self.send_target_joint_state(tjs)
-            if self._auto_start_parkour:
-                self.get_logger().info("auto_start_parkour enabled; switching to parkour agent.", once=True)
+            if self._auto_start_parkour or self._goal_start_requested:
+                reason = "auto_start_parkour enabled" if self._auto_start_parkour else "navigation goal received"
+                self.get_logger().info(f"{reason}; switching to parkour agent.", once=True)
                 self.current_agent_name = "parkour"
                 self.available_agents[self.current_agent_name].reset()
         elif self.current_agent_name == "parkour":
@@ -202,9 +204,17 @@ class G1NavOnboardOnnxNode(RealsenseMPCamera, UnitreeNode):
         distance = float(np.linalg.norm(goal_xyz))
         if distance < self._goal_reached_threshold:
             goal_b = np.asarray([0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+            self._goal_start_requested = False
+            self.base_velocity_cmd = np.zeros(3, dtype=np.float32)
+            self.sru_runtime.reset()
+            if self.current_agent_name == "parkour" and "stand" in self.available_agents:
+                self.get_logger().info("Navigation goal reached; switching back to stand agent.")
+                self.current_agent_name = "stand"
+                self.available_agents[self.current_agent_name].reset()
         else:
             direction = goal_xyz / max(distance, 1.0e-6)
             goal_b = np.asarray([direction[0], direction[1], direction[2], np.log1p(distance)], dtype=np.float32)
+            self._goal_start_requested = True
         self.set_nav_goal_body(goal_b)
         self.get_logger().info(
             f"Updated SRU goal from {self._goal_pose_topic}: xyz_b=({goal_xyz[0]:+.2f}, {goal_xyz[1]:+.2f}, {goal_xyz[2]:+.2f}) m, "
