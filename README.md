@@ -1214,3 +1214,132 @@ step_00000001.npz
 
 部署前比较顺序：先对比 `index.jsonl` 里的 min/max/mean/std，再打开 `.npz` 看具体数组。重点检查 `projected_gravity_b` 符号、`base_ang_vel_b` 量纲、`depth_m` 无效值约定、`encoded_depth` 分布、`scene_tokens` 范围和 `raw_action/command` 是否异常。
 
+
+## 2026-07-28 真机 ONNX 部署进展
+
+今天完成了 G1 机器人端的轻量部署链路整理，目标是让机器人随身 NX 容器不依赖 IsaacLab、不依赖 torch，只用 `onnxruntime + instinct_onboard + RealSense` 运行导航。
+
+已完成内容：
+
+- 高层 SRU actor 已导出为 ONNX：`artifacts/high_level/sru_scene_token/sru_high_level_scene_token.onnx`。
+- 高层 SRU depth encoder 已导出为 ONNX：`artifacts/high_level/sru_scene_token/sru_high_level_depth_encoder.onnx`。
+- 低层 parkour ONNX 已整理到：`artifacts/low_level/g1_parkour/exported/`。
+- 新增 torch-free 高层推理 runtime：`deploy/instinct_nav_onboard/onnx_high_level_runtime.py`。
+- 新增机器人端 ONNX onboard 入口：`deploy/scripts/g1_nav_onboard_onnx.py`。
+- 新增目标管理器：`deploy/scripts/goal_manager.py`，输入世界/odom 坐标点，持续发布机器人 base 坐标系下的目标，到点后发布零目标让机器人回到 stand。
+- 修复 `deploy/instinct_nav_onboard/__init__.py`，避免 ONNX 部署路径因为包初始化提前导入 torch。
+
+机器人端已验证：
+
+```text
+RealSense D435i 可枚举，深度流 480x270@60Hz 可读。
+ROS2 lowstate / secondary_imu / lowcmd 话题可见。
+高层 SRU ONNX 可被 onnxruntime 加载。
+低层 parkour ONNX 可被 instinct_onboard 加载。
+dry-run 下相机约 60Hz，主循环约 50Hz。
+```
+
+注意：dry-run 不会真实下发关节命令，所以 `ColdStartAgent` 可能一直卡在默认姿态误差检查，这是正常的。真正让机器人调整到 parkour 初始站姿时需要加 `--nodryrun`，但必须先确认机器人处于安全调试/运动控制状态。
+
+### 机器人端环境
+
+进入已有容器，不需要新建容器：
+
+```bash
+sudo docker exec -it unitree.unitree-jetson-container bash
+source /workspace/unitree-jetson-container/instinct_onboard/instinct_venv/bin/activate
+cd /workspace/unitree-jetson-container/instinct_nav
+export PYTHONPATH=/workspace/unitree-jetson-container/instinct_nav/deploy:/workspace/unitree-jetson-container/instinct_nav/external/instinct_onboard:$PYTHONPATH
+```
+
+检查 ONNX 是否能加载：
+
+```bash
+python -c "import onnxruntime as ort; d='artifacts/high_level/sru_scene_token'; print(ort.InferenceSession(d+'/sru_high_level_scene_token.onnx').get_inputs()); print(ort.InferenceSession(d+'/sru_high_level_depth_encoder.onnx').get_inputs())"
+```
+
+### 启动 Onboard
+
+安全 dry-run，不真实下发：
+
+```bash
+python deploy/scripts/g1_nav_onboard_onnx.py \
+  --standdir artifacts/low_level/g1_parkour \
+  --logdir artifacts/low_level/g1_parkour \
+  --sru_policy_onnx_path artifacts/high_level/sru_scene_token/sru_high_level_scene_token.onnx \
+  --sru_depth_encoder_onnx_path artifacts/high_level/sru_scene_token/sru_high_level_depth_encoder.onnx \
+  --goal_pose_topic /instinct_nav/goal_pose
+```
+
+真机下发时才加：
+
+```bash
+--nodryrun
+```
+
+当前状态机：
+
+```text
+cold_start 调整到 parkour 默认初始姿态
+-> stand 等待目标点
+-> 收到目标点后进入 parkour/SRU 导航
+-> 到点后清零速度并切回 stand
+```
+
+不要在第一次测试时加 `--auto_start_parkour`，否则站好后会自动进入 parkour。
+
+### 启动目标管理器
+
+另开一个机器人容器终端，同样激活环境和 `PYTHONPATH` 后运行：
+
+```bash
+python deploy/scripts/goal_manager.py \
+  --odom_topic /dog_odom \
+  --world_goal_topic /instinct_nav/world_goal_point \
+  --body_goal_topic /instinct_nav/goal_pose \
+  --goal_reached_threshold 0.5
+```
+
+`goal_manager.py` 订阅一次性世界/odom 坐标目标：
+
+```text
+/instinct_nav/world_goal_point: geometry_msgs/msg/PointStamped
+```
+
+并持续发布 onboard/SRU 需要的机器人坐标系目标：
+
+```text
+/instinct_nav/goal_pose: geometry_msgs/msg/PoseStamped, frame_id=base_link
+```
+
+发布一个 odom 坐标目标点：
+
+```bash
+ros2 topic pub --once /instinct_nav/world_goal_point geometry_msgs/msg/PointStamped \
+"{header: {frame_id: 'odom'}, point: {x: 1.0, y: 0.0, z: 0.0}}"
+```
+
+这里 `x/y/z` 是 `/dog_odom` 坐标系下的目标点，不是持续向机器人当前前方走 1 米。`goal_manager.py` 会根据 `/dog_odom` 持续转换成当前 `base_link` 下的相对目标。到达阈值后，它会发布零目标，`g1_nav_onboard_onnx.py` 会切回 stand。
+
+### 手动停止目标
+
+如果需要手动停止导航，可以直接向 onboard 内部目标接口发布零目标：
+
+```bash
+ros2 topic pub --once /instinct_nav/goal_pose geometry_msgs/msg/PoseStamped \
+"{header: {frame_id: 'base_link'}, pose: {position: {x: 0.0, y: 0.0, z: 0.0}, orientation: {w: 1.0}}}"
+```
+
+### 当前部署文件清单
+
+```text
+artifacts/high_level/sru_scene_token/sru_high_level_scene_token.onnx
+artifacts/high_level/sru_scene_token/sru_high_level_depth_encoder.onnx
+artifacts/low_level/g1_parkour/exported/actor.onnx
+artifacts/low_level/g1_parkour/exported/0-depth_encoder.onnx
+artifacts/low_level/g1_parkour/params/agent.yaml
+artifacts/low_level/g1_parkour/params/env.yaml
+deploy/scripts/g1_nav_onboard_onnx.py
+deploy/scripts/goal_manager.py
+deploy/instinct_nav_onboard/onnx_high_level_runtime.py
+```
