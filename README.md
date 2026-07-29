@@ -1248,9 +1248,13 @@ dry-run 下相机约 60Hz，主循环约 50Hz。
 
 注意：dry-run 不会真实下发关节命令，所以 `ColdStartAgent` 可能一直卡在默认姿态误差检查，这是正常的。真正让机器人调整到 parkour 初始站姿时需要加 `--nodryrun`，但必须先确认机器人处于安全调试/运动控制状态。
 
-### 机器人端环境
+### 完整上机运行顺序
 
-进入已有容器，不需要新建容器：
+下面顺序是当前推荐的真机测试流程。第一次上机只做 `dry-run -> stand -> 短目标`，不要一开始测试楼梯或长距离。
+
+#### 0. 进入机器人容器并准备环境
+
+在机器人 NX 上打开第一个终端：
 
 ```bash
 sudo docker exec -it unitree.unitree-jetson-container bash
@@ -1259,15 +1263,22 @@ cd /workspace/unitree-jetson-container/instinct_nav
 export PYTHONPATH=/workspace/unitree-jetson-container/instinct_nav/deploy:/workspace/unitree-jetson-container/instinct_nav/external/instinct_onboard:$PYTHONPATH
 ```
 
-检查 ONNX 是否能加载：
+确认 ROS2 和相机基础状态：
+
+```bash
+ros2 topic list | grep -Ei "lowstate|secondary_imu|lowcmd|dog_odom"
+python -c "import pyrealsense2 as rs; print(rs.context().query_devices())"
+```
+
+#### 1. 检查 ONNX bundle 能加载
 
 ```bash
 python -c "import onnxruntime as ort; d='artifacts/high_level/sru_scene_token'; print(ort.InferenceSession(d+'/sru_high_level_scene_token.onnx').get_inputs()); print(ort.InferenceSession(d+'/sru_high_level_depth_encoder.onnx').get_inputs())"
 ```
 
-### 启动 Onboard
+#### 2. 启动 onboard dry-run
 
-安全 dry-run，不真实下发：
+这个命令不会真实发布 `/lowcmd`，只会发布 dry-run topic，用于确认相机、odom、SRU、低层 ONNX 都能跑通：
 
 ```bash
 python deploy/scripts/g1_nav_onboard_onnx.py \
@@ -1281,26 +1292,110 @@ python deploy/scripts/g1_nav_onboard_onnx.py \
   --odom_topic /dog_odom \
   --odom_twist_frame auto \
   --odom_timeout_s 0.5 \
-  --command_min -1.0 -0.6 -1.0 \
-  --command_max 1.0 0.6 1.0 \
+  --command_min -0.3 -0.2 -0.4 \
+  --command_max 0.3 0.2 0.4 \
   --command_deadband 0.02 0.02 0.02 \
-  --command_slew_rate 0.4 0.3 0.6 \
-  --command_lowpass_alpha 0.5
+  --command_slew_rate 0.3 0.2 0.4 \
+  --command_lowpass_alpha 0.4 \
+  --debug_dump_dir /tmp/instinct_nav_onboard_onnx_debug \
+  --debug_dump_every_steps 5 \
+  --debug_dump_max_steps 100
 ```
 
-真机下发时才加。第一次非 dryrun 建议使用更保守的速度变化限制：
+预期现象：
+
+```text
+Loaded high-level SRU ONNX policy
+Loaded high-level SRU depth encoder ONNX
+Low state data received
+Torso IMU data received
+All necessary buffers received
+Camera process running at about 60 Hz
+Actual main loop frequency about 50 Hz
+```
+
+如果这里出现 `Autonomy fault latched`，先不要进入非 dry-run。需要根据日志原因检查相机、odom 或 ONNX bundle。
+
+#### 3. 启动目标管理器
+
+另开第二个机器人容器终端，重复第 0 步的环境准备，然后启动：
 
 ```bash
---nodryrun \
---command_min -0.3 -0.2 -0.4 \
---command_max 0.3 0.2 0.4 \
---command_slew_rate 0.3 0.2 0.4 \
---command_lowpass_alpha 0.4
+python deploy/scripts/goal_manager.py \
+  --odom_topic /dog_odom \
+  --world_goal_topic /instinct_nav/world_goal_point \
+  --body_goal_topic /instinct_nav/goal_pose \
+  --goal_frame odom \
+  --goal_reached_threshold 0.5 \
+  --stop_publish_count 10
 ```
+
+#### 4. dry-run 下发布短目标
+
+在第三个终端发布一个很短的 odom 目标。第一次建议 `0.5m`，不是 `1m` 或更远：
+
+```bash
+ros2 topic pub --once /instinct_nav/world_goal_point geometry_msgs/msg/PointStamped \
+"{header: {frame_id: 'odom'}, point: {x: 0.5, y: 0.0, z: 0.0}}"
+```
+
+此时仍然是 dry-run，所以机器人不会真实运动。主要看 onboard 终端是否进入 `parkour`、SRU 是否产生有限 command、是否没有 fault。
+
+#### 5. 非 dry-run 站姿测试
+
+确认机器人处于安全调试/运动控制状态、场地空旷、操作员准备好急停后，停止第 2 步 dry-run 进程，重新启动 onboard 并加 `--nodryrun`。先不要启动目标管理器，也不要发目标：
+
+```bash
+python deploy/scripts/g1_nav_onboard_onnx.py \
+  --standdir artifacts/low_level/g1_parkour \
+  --logdir artifacts/low_level/g1_parkour \
+  --sru_policy_onnx_path artifacts/high_level/sru_scene_token/sru_high_level_scene_token.onnx \
+  --sru_depth_encoder_onnx_path artifacts/high_level/sru_scene_token/sru_high_level_depth_encoder.onnx \
+  --deploy_manifest_path artifacts/high_level/sru_scene_token/deploy_manifest.json \
+  --camera_frame_timeout_s 0.25 \
+  --goal_pose_topic /instinct_nav/goal_pose \
+  --odom_topic /dog_odom \
+  --odom_twist_frame auto \
+  --odom_timeout_s 0.5 \
+  --command_min -0.3 -0.2 -0.4 \
+  --command_max 0.3 0.2 0.4 \
+  --command_deadband 0.02 0.02 0.02 \
+  --command_slew_rate 0.3 0.2 0.4 \
+  --command_lowpass_alpha 0.4 \
+  --nodryrun
+```
+
+预期是机器人从当前状态调整到 parkour 默认站姿，然后停在 `stand` 等目标。不要加 `--auto_start_parkour`。
+
+#### 6. 非 dry-run 短目标测试
+
+站姿稳定后，再启动第 3 步目标管理器，并发布 0.5m 短目标：
+
+```bash
+ros2 topic pub --once /instinct_nav/world_goal_point geometry_msgs/msg/PointStamped \
+"{header: {frame_id: 'odom'}, point: {x: 0.5, y: 0.0, z: 0.0}}"
+```
+
+测试顺序建议：
+
+```text
+0.5m 前进 -> 0.5m 左/右偏移 -> 轻微转向目标 -> 1.0m 前进
+```
+
+任意阶段如果出现 `Autonomy fault latched`，节点会保持 `stand` 并拒绝新目标。处理方式是先查明 fault 原因，然后重启 onboard 节点重新 re-arm。
+
+### 补充说明
+
+`--odom_twist_frame auto` 的规则是：如果 `/dog_odom.child_frame_id` 是 `base_link/base/body/torso_link`，直接把 twist 当 body-frame 速度；否则把 twist 当 world-frame 速度，并用 odom pose quaternion 旋转到 body frame。现场正式测试建议显式指定 `--odom_twist_frame body` 或 `--odom_twist_frame world`，不要长期依赖 auto heuristic。
 
 如果现场确认 `/dog_odom.twist` 不可靠，可以临时加 `--disable_odom_velocity` 回退到旧的零线速度观测，但这会重新引入训练/部署观测不一致。
 
-`--odom_twist_frame auto` 的规则是：如果 `/dog_odom.child_frame_id` 是 `base_link/base/body/torso_link`，直接把 twist 当 body-frame 速度；否则把 twist 当 world-frame 速度，并用 odom pose quaternion 旋转到 body frame。现场正式测试建议显式指定 `--odom_twist_frame body` 或 `--odom_twist_frame world`，不要长期依赖 auto heuristic。
+手动停止导航可以直接向 onboard 内部目标接口发布零目标：
+
+```bash
+ros2 topic pub --once /instinct_nav/goal_pose geometry_msgs/msg/PoseStamped \
+"{header: {frame_id: 'base_link'}, pose: {position: {x: 0.0, y: 0.0, z: 0.0}, orientation: {w: 1.0}}}"
+```
 
 ### 对比仿真和真机 Debug Dump
 
@@ -1328,50 +1423,6 @@ cold_start 调整到 parkour 默认初始姿态
 ```
 
 不要在第一次测试时加 `--auto_start_parkour`，否则站好后会自动进入 parkour。
-
-### 启动目标管理器
-
-另开一个机器人容器终端，同样激活环境和 `PYTHONPATH` 后运行：
-
-```bash
-python deploy/scripts/goal_manager.py \
-  --odom_topic /dog_odom \
-  --world_goal_topic /instinct_nav/world_goal_point \
-  --body_goal_topic /instinct_nav/goal_pose \
-  --goal_frame odom \
-  --goal_reached_threshold 0.5 \
-  --stop_publish_count 10
-```
-
-`goal_manager.py` 订阅一次性世界/odom 坐标目标：
-
-```text
-/instinct_nav/world_goal_point: geometry_msgs/msg/PointStamped
-```
-
-并持续发布 onboard/SRU 需要的机器人坐标系目标：
-
-```text
-/instinct_nav/goal_pose: geometry_msgs/msg/PoseStamped, frame_id=base_link
-```
-
-发布一个 odom 坐标目标点：
-
-```bash
-ros2 topic pub --once /instinct_nav/world_goal_point geometry_msgs/msg/PointStamped \
-"{header: {frame_id: 'odom'}, point: {x: 1.0, y: 0.0, z: 0.0}}"
-```
-
-这里 `x/y/z` 是 `/dog_odom` 坐标系下的目标点，不是持续向机器人当前前方走 1 米。`goal_manager.py` 会根据 `/dog_odom` 持续转换成当前 `base_link` 下的相对目标。到达阈值后，它会按 `--stop_publish_count` 连续发布零目标，`g1_nav_onboard_onnx.py` 会清零 SRU 命令并切回 stand。
-
-### 手动停止目标
-
-如果需要手动停止导航，可以直接向 onboard 内部目标接口发布零目标：
-
-```bash
-ros2 topic pub --once /instinct_nav/goal_pose geometry_msgs/msg/PoseStamped \
-"{header: {frame_id: 'base_link'}, pose: {position: {x: 0.0, y: 0.0, z: 0.0}, orientation: {w: 1.0}}}"
-```
 
 ### 当前部署文件清单
 
