@@ -8,7 +8,9 @@
   "num_actions": 3,
   "rnn_num_layers": 1,
   "rnn_hidden_size": 512,
-  "scene_token_dim": 384,
+  "scene_token_num_tokens": 64,
+  "scene_token_dim": 6,
+  "scene_token_features_total": 384,
   "encoded_depth_dim": 2560,
   "proprio_dim": 16,
   "image_input_dims": [

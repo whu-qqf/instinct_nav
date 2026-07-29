@@ -20,7 +20,11 @@ class OnnxPolicyContract:
     num_actions: int
     rnn_num_layers: int
     rnn_hidden_size: int
+    scene_token_num_tokens: int | None = None
     scene_token_dim: int | None = None
+    scene_token_features_total: int | None = None
+    encoded_depth_dim: int | None = None
+    proprio_dim: int | None = None
 
 @dataclass(frozen=True)
 class OnnxDebugDumpConfig:
@@ -104,12 +108,27 @@ class OnnxHighLevelRuntime:
                 num_actions=int(manifest["num_actions"]),
                 rnn_num_layers=int(manifest["rnn_num_layers"]),
                 rnn_hidden_size=int(manifest["rnn_hidden_size"]),
+                scene_token_num_tokens=int(manifest["scene_token_num_tokens"]) if manifest.get("scene_token_num_tokens") is not None else None,
                 scene_token_dim=int(manifest["scene_token_dim"]) if manifest.get("scene_token_dim") is not None else None,
+                scene_token_features_total=int(manifest["scene_token_features_total"]) if manifest.get("scene_token_features_total") is not None else None,
+                encoded_depth_dim=int(manifest["encoded_depth_dim"]) if manifest.get("encoded_depth_dim") is not None else None,
+                proprio_dim=int(manifest["proprio_dim"]) if manifest.get("proprio_dim") is not None else None,
             )
             mismatches = []
             for field in ("obs_dim", "num_actions", "rnn_num_layers", "rnn_hidden_size"):
                 if getattr(contract, field) != getattr(inferred, field):
                     mismatches.append(f"{field}: manifest={getattr(contract, field)} onnx={getattr(inferred, field)}")
+            expected_metadata = {
+                "scene_token_num_tokens": self.cfg.layout.scene_token_num_tokens,
+                "scene_token_dim": self.cfg.layout.scene_token_feature_dim,
+                "scene_token_features_total": self.cfg.layout.scene_token_dim,
+                "encoded_depth_dim": self.cfg.layout.encoded_depth_dim,
+                "proprio_dim": self.cfg.layout.proprio_dim,
+            }
+            for field, expected in expected_metadata.items():
+                actual = getattr(contract, field)
+                if actual is not None and int(actual) != int(expected):
+                    mismatches.append(f"{field}: manifest={actual} runtime={expected}")
             if mismatches:
                 raise ValueError("ONNX contract mismatch: " + "; ".join(mismatches))
         if contract.obs_dim != self.cfg.layout.actor_obs_dim:
@@ -135,7 +154,11 @@ class OnnxHighLevelRuntime:
             num_actions=num_actions,
             rnn_num_layers=rnn_num_layers,
             rnn_hidden_size=rnn_hidden_size,
-            scene_token_dim=self.cfg.layout.scene_token_dim,
+            scene_token_num_tokens=self.cfg.layout.scene_token_num_tokens,
+            scene_token_dim=self.cfg.layout.scene_token_feature_dim,
+            scene_token_features_total=self.cfg.layout.scene_token_dim,
+            encoded_depth_dim=self.cfg.layout.encoded_depth_dim,
+            proprio_dim=self.cfg.layout.proprio_dim,
         )
 
     def build_actor_obs(self, packet: SensorPacket, encoded_depth: np.ndarray, scene_tokens: np.ndarray) -> np.ndarray:

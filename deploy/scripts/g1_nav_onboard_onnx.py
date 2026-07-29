@@ -75,6 +75,7 @@ class G1NavOnboardOnnxNode(RealsenseMPCamera, UnitreeNode):
         goal_reached_threshold: float = 0.5,
         odom_topic: str = "/dog_odom",
         odom_twist_frame: str = "auto",
+        odom_timeout_s: float = 0.5,
         use_odom_velocity: bool = True,
         command_min: tuple[float, float, float] = (-1.0, -0.6, -1.0),
         command_max: tuple[float, float, float] = (1.0, 0.6, 1.0),
@@ -100,6 +101,8 @@ class G1NavOnboardOnnxNode(RealsenseMPCamera, UnitreeNode):
         self._goal_pose_topic = str(goal_pose_topic)
         self._goal_reached_threshold = float(goal_reached_threshold)
         self._odom_topic = str(odom_topic)
+        self._odom_timeout_s = float(odom_timeout_s)
+        self._last_odom_timestamp_s = 0.0
         self._odom_twist_frame = str(odom_twist_frame)
         if self._odom_twist_frame not in {"auto", "body", "world"}:
             raise ValueError(f"odom_twist_frame must be auto/body/world, got {self._odom_twist_frame!r}")
@@ -107,6 +110,9 @@ class G1NavOnboardOnnxNode(RealsenseMPCamera, UnitreeNode):
         self._goal_pose_subscription = None
         self._odom_subscription = None
         self._goal_start_requested = False
+        self._autonomy_fault_latched = False
+        self._last_autonomy_fault_reason: str | None = None
+        self._last_autonomy_fault_log_time_s = 0.0
         self.base_lin_vel_b = np.zeros(3, dtype=np.float32)
         self._last_shaped_command = np.zeros(3, dtype=np.float32)
         self._last_command_shape_time_s = 0.0
@@ -188,7 +194,9 @@ class G1NavOnboardOnnxNode(RealsenseMPCamera, UnitreeNode):
             tjs, _ = self.available_agents[self.current_agent_name].step()
             self.refresh_camera_data()
             self.send_target_joint_state(tjs)
-            if self._auto_start_parkour or self._goal_start_requested:
+            if self._autonomy_fault_latched:
+                self._zero_autonomous_command()
+            elif self._auto_start_parkour or self._goal_start_requested:
                 reason = "auto_start_parkour enabled" if self._auto_start_parkour else "navigation goal received"
                 self.get_logger().info(f"{reason}; switching to parkour agent.", once=True)
                 self.current_agent_name = "parkour"
@@ -215,6 +223,10 @@ class G1NavOnboardOnnxNode(RealsenseMPCamera, UnitreeNode):
             self._enter_autonomy_fault("Depth camera frame is stale or unavailable; stopping autonomous navigation.")
             self._next_sru_update_time_s = now + self._sru_high_level_period_s
             return
+        if not self._odom_velocity_is_fresh(now):
+            self._enter_autonomy_fault("Odometry velocity is stale or unavailable; stopping autonomous navigation.")
+            self._next_sru_update_time_s = now + self._sru_high_level_period_s
+            return
         if now < self._next_sru_update_time_s:
             if now - self._last_sru_command_time_s > self._autonomous_command_timeout_s:
                 self._zero_autonomous_command()
@@ -233,6 +245,7 @@ class G1NavOnboardOnnxNode(RealsenseMPCamera, UnitreeNode):
 
 
     def _on_odom(self, msg) -> None:
+        self._last_odom_timestamp_s = time.monotonic()
         linear = msg.twist.twist.linear
         vel = np.asarray([linear.x, linear.y, linear.z], dtype=np.float32)
         mode = self._odom_twist_frame
@@ -260,6 +273,13 @@ class G1NavOnboardOnnxNode(RealsenseMPCamera, UnitreeNode):
             return True
         return (now_monotonic_s - self._last_depth_frame_timestamp_s) <= self._camera_frame_timeout_s
 
+    def _odom_velocity_is_fresh(self, now_monotonic_s: float) -> bool:
+        if not self._use_odom_velocity:
+            return True
+        if self._last_odom_timestamp_s <= 0.0:
+            return False
+        return (now_monotonic_s - self._last_odom_timestamp_s) <= self._odom_timeout_s
+
     def _shape_command(self, command: np.ndarray, now: float) -> np.ndarray:
         command = np.asarray(command, dtype=np.float32).reshape(3)
         command = np.where(np.abs(command) < self._command_deadband, 0.0, command)
@@ -281,7 +301,14 @@ class G1NavOnboardOnnxNode(RealsenseMPCamera, UnitreeNode):
         self._last_command_shape_time_s = 0.0
 
     def _enter_autonomy_fault(self, reason: str) -> None:
-        self.get_logger().error(reason)
+        now = time.monotonic()
+        repeated = reason == self._last_autonomy_fault_reason
+        should_log = (not repeated) or (now - self._last_autonomy_fault_log_time_s > 2.0)
+        self._autonomy_fault_latched = True
+        self._last_autonomy_fault_reason = reason
+        if should_log:
+            self.get_logger().error(f"Autonomy fault latched: {reason}")
+            self._last_autonomy_fault_log_time_s = now
         self._zero_autonomous_command()
         self.sru_runtime.reset()
         self._goal_start_requested = False
@@ -304,6 +331,13 @@ class G1NavOnboardOnnxNode(RealsenseMPCamera, UnitreeNode):
             return
         goal_xyz = np.asarray([msg.pose.position.x, msg.pose.position.y, msg.pose.position.z], dtype=np.float32)
         distance = float(np.linalg.norm(goal_xyz))
+        if self._autonomy_fault_latched:
+            self.get_logger().warn(
+                f"Ignoring navigation goal because autonomy fault is latched: {self._last_autonomy_fault_reason}. Restart the node to re-arm.",
+                throttle_duration_sec=2.0,
+            )
+            self._zero_autonomous_command()
+            return
         if distance < self._goal_reached_threshold:
             goal_b = np.asarray([0.0, 0.0, 0.0, 0.0], dtype=np.float32)
             self._goal_start_requested = False
@@ -374,6 +408,7 @@ def main(args: argparse.Namespace) -> None:
         goal_reached_threshold=args.goal_reached_threshold,
         odom_topic=args.odom_topic,
         odom_twist_frame=args.odom_twist_frame,
+        odom_timeout_s=args.odom_timeout_s,
         use_odom_velocity=not args.disable_odom_velocity,
         command_min=tuple(args.command_min),
         command_max=tuple(args.command_max),
@@ -432,6 +467,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--goal_reached_threshold", type=float, default=0.5)
     parser.add_argument("--odom_topic", type=str, default="/dog_odom")
     parser.add_argument("--odom_twist_frame", type=str, choices=("auto", "body", "world"), default="auto")
+    parser.add_argument("--odom_timeout_s", type=float, default=0.5)
     parser.add_argument("--disable_odom_velocity", action="store_true", default=False)
     parser.add_argument("--command_min", type=float, nargs=3, default=(-1.0, -0.6, -1.0), metavar=("VX", "VY", "WZ"))
     parser.add_argument("--command_max", type=float, nargs=3, default=(1.0, 0.6, 1.0), metavar=("VX", "VY", "WZ"))

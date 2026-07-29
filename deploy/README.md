@@ -62,9 +62,15 @@ single-camera exporter that assumes the tail of the observation is only depth. I
 therefore should not be used blindly for the scene-token policy until the exporter
 is updated to include the scene-token query branch.
 
-For now, deploy the current policy by loading the PyTorch checkpoint and the local
-`source/rsl_rl` `ActorCriticSRU` module directly in Python. JIT/ONNX export should
-be treated as a follow-up task.
+The production robot path is now the ONNX entry point:
+
+```text
+deploy/scripts/g1_nav_onboard_onnx.py
+```
+
+The Python checkpoint path is retained only as a debug/reference path. It should
+not be treated as production-safe unless the same state-machine, watchdog, and
+manifest checks are ported to it.
 
 ## Files
 
@@ -76,26 +82,28 @@ instinct_nav_onboard/runtime.py                5 Hz SRU runtime loop wrapper
 instinct_nav_onboard/bridges.py                Abstract robot/instinct_onboard bridges
 instinct_nav_onboard/sru_checkpoint_policy.py  Python checkpoint loader for scene-token ActorCriticSRU
 scripts/run_onboard_stub.py                    Dry-run entry point for local integration
-scripts/g1_nav_onboard.py                      ROS2/instinct_onboard integration entry point
+scripts/g1_nav_onboard_onnx.py                 Production ROS2/instinct_onboard ONNX entry point
+scripts/g1_nav_onboard.py                      Debug-only Python checkpoint integration entry point
 ```
 
 ## Deployment checklist
 
 1. Copy this repository to the robot PC or user workstation.
-2. Install a lightweight Python env with PyTorch, NumPy and the robot SDK.
-3. Add `source/rsl_rl` to `PYTHONPATH` so `ActorCriticSRU` can be constructed.
-4. Bring the trained SRU checkpoint and low-level Instinct checkpoint:
+2. Use the robot-side `instinct_onboard/instinct_venv` with `onnxruntime`, NumPy, OpenCV, PyYAML and `pyrealsense2`. PyTorch is not required for production ONNX deployment.
+3. Bring the exported high-level ONNX bundle and low-level Instinct artifacts:
 
 ```text
-logs/rsl_rl/.../model_2999.pt
-artifacts/low_level/g1_parkour/model_30000.pt
-artifacts/sru/depth_encoder/vae_pretrain_new.pth
+artifacts/high_level/sru_scene_token/sru_high_level_scene_token.onnx
+artifacts/high_level/sru_scene_token/sru_high_level_depth_encoder.onnx
+artifacts/high_level/sru_scene_token/deploy_manifest.json
+artifacts/low_level/g1_parkour/exported/actor.onnx
+artifacts/low_level/g1_parkour/exported/0-depth_encoder.onnx
+artifacts/low_level/g1_parkour/params/agent.yaml
+artifacts/low_level/g1_parkour/params/env.yaml
 ```
 
-5. Implement a concrete `SensorSource` for the robot sensors.
-6. Implement a concrete `VelocityCommandSink` that writes to `instinct_onboard`.
-7. Run dry mode first: policy outputs commands, but robot actuators are not enabled.
-8. Then enable the low-level policy with strict command clamps and watchdogs.
+4. Run dry mode first: policy outputs commands, but robot actuators are not enabled.
+5. Then enable the low-level policy with strict command clamps and watchdogs.
 
 ## Recommended first integration target
 
@@ -147,13 +155,15 @@ Recommended integration on the robot PC:
 5. Let ParkourAgent keep running at 50 Hz and sending joint targets.
 ```
 
-## G1 navigation onboard entry script
+## Legacy Python checkpoint entry script
 
-`deploy/scripts/g1_nav_onboard.py` is the first real integration entry point.
-It reuses instinct_onboard's G1 parkour low-level stack and replaces the joystick
-velocity source with an SRU command cache when the node is in `parkour` mode.
+`deploy/scripts/g1_nav_onboard.py` is a legacy debug/reference entry point. It
+reuses instinct_onboard's G1 parkour low-level stack and loads the SRU checkpoint
+through PyTorch. It does not currently carry the full production ONNX path's
+fault latch, odom watchdog, and manifest validation semantics. Do not use it as
+the production real-robot entry point.
 
-Dry-run wiring command on the robot PC:
+Debug-only dry-run wiring command on the robot PC:
 
 ```bash
 PYTHONPATH=/path/to/instinct_nav/deploy:/path/to/instinct_onboard:$PYTHONPATH \
@@ -179,7 +189,7 @@ Do not pass `--nodryrun` until all of these are verified on the robot PC:
 - dry-run /lowcmd_* contains finite joint targets
 ```
 
-Current real SRU policy path:
+Debug-only Python SRU checkpoint path:
 
 ```bash
 PYTHONPATH=/path/to/instinct_nav/deploy:/path/to/instinct_nav/source/rsl_rl:/path/to/instinct_onboard:$PYTHONPATH \
@@ -197,13 +207,14 @@ python /path/to/instinct_nav/deploy/scripts/g1_nav_onboard.py \
 ```
 
 `--sru_checkpoint_path` directly loads the trained Python `ActorCriticSRU`
-checkpoint. This is the correct route for the current scene-token policy. The
-older `--sru_policy_path` is reserved for a future scene-token-capable
-TorchScript export.
+checkpoint. Use this only for debugging observation construction against the
+training-time Python modules. For real robot production trials, use
+`deploy/scripts/g1_nav_onboard_onnx.py`.
 
-Important: this proves the policy checkpoint, depth encoder, scene-token builder
-and command bridge can run in one Python path. Before enabling `--nodryrun`, still
-compare logged real-robot observations against IsaacLab eval samples, especially:
+Important: this debug path can help inspect the policy checkpoint, depth encoder,
+scene-token builder and command bridge in one Python path. Before trusting any
+deployment path, compare logged real-robot observations against IsaacLab eval
+samples, especially:
 
 ```text
 - projected_gravity_b sign/order
@@ -247,3 +258,19 @@ The first comparison target is not success rate; it is distribution parity with
 IsaacLab eval samples. Check sign/order and numeric range before passing
 `--nodryrun`.
 
+
+## Production ONNX entry point
+
+Use `deploy/scripts/g1_nav_onboard_onnx.py` for real robot deployment. Important
+field behavior:
+
+```text
+--camera_frame_timeout_s   depth frame watchdog; timeout latches autonomy fault
+--odom_timeout_s           odom velocity watchdog; timeout latches autonomy fault
+--odom_twist_frame auto    body if child_frame_id is base_link/base/body/torso_link, otherwise world->body rotation
+```
+
+For field tests, prefer explicit `--odom_twist_frame body` or
+`--odom_twist_frame world` after inspecting `/dog_odom`. The `auto` mode is only
+a convenience heuristic. If any autonomy fault is latched, the node stays in
+`stand` and ignores new navigation goals until the node is restarted.

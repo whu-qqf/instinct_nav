@@ -1,442 +1,244 @@
-# Real Robot Deployment Code Review
+# Real-Robot Deploy Fix Checklist
 
 Date: 2026-07-29
 
 Scope:
 - `deploy/scripts/g1_nav_onboard_onnx.py`
-- `deploy/scripts/g1_nav_onboard.py`
 - `deploy/instinct_nav_onboard/onnx_high_level_runtime.py`
 - `deploy/scripts/export_high_level_sru_onnx.py`
-- `deploy/instinct_nav_onboard/obs_builder.py`
 - `deploy/scripts/goal_manager.py`
-- related deployment notes in `deploy/README.md`
-- training-side observation definitions in `source/instinct_nav/instinct_nav/navigation/`
 
-Assumption:
-- The production deployment path must use ONNX because `instinct_onboard` only supports ONNX for the low-level stack.
-- Therefore, the ONNX high-level path is the only deployment path that should be treated as authoritative for real robot use.
+Purpose:
+- Turn the current deployment review into an executable fix list.
+- Focus on the remaining safety, contract, and observation-parity issues after the latest ONNX deployment updates.
 
-## Executive Summary
+## P0: Fix Before Any Non-Dryrun Retry
 
-The current deployment architecture is directionally correct:
-
-```text
-robot sensors
--> high-level SRU ONNX runtime
--> base_velocity_cmd
--> instinct_onboard low-level parkour ONNX stack
--> joint targets
-```
-
-This is the right control split. The main issues are not architectural. They are in:
-
-- observation parity with training
-- ONNX contract hard-coding
-- safety fallback behavior
-- state-machine robustness
-- exporter/runtime consistency validation
-
-The most important conclusion is:
-
-1. Keep only the ONNX deployment path as the real robot production path.
-2. Treat PyTorch checkpoint runtime only as a debug/reference path.
-3. Before any serious robot trial, close the observation-parity and safety gaps listed below.
-
-## Findings
-
-### 1. `base_lin_vel_b` is hard-coded to zeros in real deployment input
+### 1. Latch autonomy faults instead of allowing automatic re-entry
 
 Severity: High
 
 Files:
-- [deploy/scripts/g1_nav_onboard_onnx.py](/abs/path/D:/instinct_nav/deploy/scripts/g1_nav_onboard_onnx.py:40)
-- [deploy/instinct_nav_onboard/onnx_high_level_runtime.py](/abs/path/D:/instinct_nav/deploy/instinct_nav_onboard/onnx_high_level_runtime.py:76)
+- [deploy/scripts/g1_nav_onboard_onnx.py](/abs/path/D:/instinct_nav/deploy/scripts/g1_nav_onboard_onnx.py:191)
+- [deploy/scripts/g1_nav_onboard_onnx.py](/abs/path/D:/instinct_nav/deploy/scripts/g1_nav_onboard_onnx.py:283)
 
-Details:
-- Both deployment entry paths set `base_lin_vel_b=np.zeros(3, dtype=np.float32)`:
-  - ONNX path: `deploy/scripts/g1_nav_onboard_onnx.py`
-  - Python checkpoint path: `deploy/scripts/g1_nav_onboard.py`
-- The actor observation builder includes `base_lin_vel_b` as part of the 16D proprio block.
-- Training did not use a zero placeholder here. The high-level actor observation is defined with
-  `mdp.base_lin_vel_delayed` plus additive noise, and the underlying source is
-  `asset.data.root_lin_vel_b`.
+Problem:
+- `_enter_autonomy_fault()` clears `_goal_start_requested`, zeros the command, resets SRU, and switches back to `stand`.
+- But `stand -> parkour` still triggers whenever `--auto_start_parkour` is enabled.
+- Therefore a depth timeout or SRU exception can produce:
+ - `parkour -> fault -> stand -> parkour -> fault`
 
-Risk:
-- If the trained policy relies on base linear velocity feedback, deployment is feeding a materially different observation distribution than training.
-- This is not a cosmetic mismatch. It can change action quality, stability, and memory behavior.
+Required change:
+- Add a latched fault state such as:
+ - `_autonomy_fault_latched: bool`
+ - or an explicit mode enum: `idle / armed / active / fault`
+- In `_enter_autonomy_fault()`:
+ - set the fault latch
+ - clear goal-start intent
+ - keep the robot in `stand`
+- In the `stand` branch:
+ - refuse `stand -> parkour` if the fault latch is active
+- Add one explicit recovery path:
+ - operator reset command
+ - manual method call
+ - or node restart
 
-Recommendation:
-- Prefer wiring a real body-frame linear velocity estimate into `SensorPacket.base_lin_vel_b`.
-- The most practical first source is a robot odometry / state-estimator topic that already publishes
-  `nav_msgs/Odometry` or equivalent twist.
-- Convert to body frame only if the odometry source is world-frame. If the published twist is already
-  in `child_frame_id=base_link`, do not rotate it again.
-- If reliable linear velocity is not available, run an explicit simulation ablation with actor-side `base_lin_vel` removed or zeroed and compare performance against the deployment policy.
-- Do not proceed to serious robot trials while assuming this mismatch is harmless.
+Acceptance:
+- With `--auto_start_parkour` enabled, forcing a camera timeout must not re-enter `parkour` automatically.
+- After fault, the robot must remain in `stand` until explicit re-arm.
 
-Additional note:
-- The repository already has an odometry consumer in `deploy/scripts/goal_manager.py`, but that odom
-  stream is currently used only for world-goal to body-goal conversion, not for high-level policy
-  observation.
-
-### 2. High-level ONNX runtime hard-codes hidden-state shape `(1, 1, 512)`
+### 2. Add odom freshness watchdog for `base_lin_vel_b`
 
 Severity: High
 
 Files:
-- [deploy/instinct_nav_onboard/onnx_high_level_runtime.py](/abs/path/D:/instinct_nav/deploy/instinct_nav_onboard/onnx_high_level_runtime.py:41)
-- [deploy/instinct_nav_onboard/onnx_high_level_runtime.py](/abs/path/D:/instinct_nav/deploy/instinct_nav_onboard/onnx_high_level_runtime.py:42)
-- [deploy/scripts/export_high_level_sru_onnx.py](/abs/path/D:/instinct_nav/deploy/scripts/export_high_level_sru_onnx.py:114)
+- [deploy/scripts/g1_nav_onboard_onnx.py](/abs/path/D:/instinct_nav/deploy/scripts/g1_nav_onboard_onnx.py:235)
+- [deploy/scripts/g1_nav_onboard_onnx.py](/abs/path/D:/instinct_nav/deploy/scripts/g1_nav_onboard_onnx.py:212)
 
-Details:
-- The runtime initializes:
-  - `self.h = np.zeros((1, 1, 512), dtype=np.float32)`
-  - `self.c = np.zeros((1, 1, 512), dtype=np.float32)`
-- The exporter prints these dimensions, but the runtime does not read them from the ONNX graph or a manifest.
+Problem:
+- `base_lin_vel_b` now comes from odometry, which is the correct direction.
+- But there is no freshness check for odom updates.
+- If odom stalls, the actor continues receiving stale linear velocity.
 
-Risk:
-- Any future checkpoint change to SRU hidden size or number of layers will silently break deployment assumptions.
-- This creates a fragile coupling between exporter internals and runtime code.
+Required change:
+- Track last odom receipt time, for example:
+ - `_last_odom_timestamp_s`
+ - `_odom_timeout_s`
+- In `_on_odom()`:
+ - update freshness timestamp each message
+- Before SRU step:
+ - verify odom is still fresh when `use_odom_velocity=True`
+- On timeout choose one policy and document it clearly:
+ - preferred: enter autonomy fault
+ - acceptable fallback: force `base_lin_vel_b = 0` and log a warning
 
-Recommendation:
-- Export a manifest alongside `policy.onnx`, for example:
+Acceptance:
+- If `/dog_odom` stops updating, deployment must not silently keep using a frozen linear velocity vector.
+- Fault or explicit degrade behavior must be visible in logs.
 
-```json
-{
-  "obs_dim": 2960,
-  "num_actions": 3,
-  "rnn_num_layers": 1,
-  "rnn_hidden_size": 512,
-  "scene_token_dim": 384
-}
-```
+## P1: Fix Before Wider Robot Trials
 
-- Make `OnnxHighLevelRuntime` read that manifest and allocate hidden state from it.
-- Reject startup if manifest and ONNX IO contract disagree.
-
-### 3. No explicit PyTorch-vs-ONNX parity check is built into the export flow
-
-Severity: High
-
-Files:
-- [deploy/scripts/export_high_level_sru_onnx.py](/abs/path/D:/instinct_nav/deploy/scripts/export_high_level_sru_onnx.py:121)
-- [deploy/scripts/export_high_level_sru_onnx.py](/abs/path/D:/instinct_nav/deploy/scripts/export_high_level_sru_onnx.py:124)
-
-Details:
-- The exporter runs one PyTorch forward pass on dummy zeros and exports ONNX.
-- It does not reload the exported ONNX and compare:
-  - `actions`
-  - `h_out`
-  - `c_out`
-  against the PyTorch exporter module on the same inputs.
-
-Risk:
-- A successful export does not prove deployment correctness.
-- Numerical or graph-level divergence can survive until robot-side testing.
-
-Recommendation:
-- Extend the export script to:
-  1. export ONNX
-  2. load ONNXRuntime session
-  3. run the same dummy and several randomized inputs
-  4. compare `actions`, `h_out`, `c_out` with tolerances
-- Fail export if parity is out of bounds.
-
-Minimum tests:
-- single-step zero input
-- single-step random finite input
-- multi-step recurrent rollout with non-zero hidden state
-- reset case
-
-### 4. Safety fallback only covers timing drift, not runtime exceptions
-
-Severity: High
-
-Files:
-- [deploy/scripts/g1_nav_onboard_onnx.py](/abs/path/D:/instinct_nav/deploy/scripts/g1_nav_onboard_onnx.py:178)
-- [deploy/scripts/g1_nav_onboard_onnx.py](/abs/path/D:/instinct_nav/deploy/scripts/g1_nav_onboard_onnx.py:185)
-
-Details:
-- `_update_sru_velocity_command_if_due()` zeros `base_velocity_cmd` only when the high-level update is late.
-- If `self.sru_runtime.step(packet)` raises, there is no local exception handling and no guaranteed zero-command fallback before the node unwinds.
-
-Risk:
-- The robot can keep the last non-zero command cached in `base_velocity_cmd`.
-- In `--nodryrun` mode this is a real safety issue.
-
-Recommendation:
-- Wrap the SRU update path in `try/except`.
-- On exception:
-  - set `self.base_velocity_cmd = np.zeros(3, dtype=np.float32)`
-  - call `self.sru_runtime.reset()`
-  - optionally switch `current_agent_name` back to `stand`
-  - emit an error log with throttling
-
-Suggested behavior:
-
-```text
-SRU step error
--> zero command immediately
--> reset SRU hidden state
--> stop autonomous progression
--> require operator intervention or explicit re-arm
-```
-
-### 5. Deployment state machine is better than the Python path, but still too implicit for field use
+### 3. Correct manifest field semantics for `scene_token_dim`
 
 Severity: Medium
 
 Files:
-- [deploy/scripts/g1_nav_onboard_onnx.py](/abs/path/D:/instinct_nav/deploy/scripts/g1_nav_onboard_onnx.py:153)
-- [deploy/scripts/g1_nav_onboard_onnx.py](/abs/path/D:/instinct_nav/deploy/scripts/g1_nav_onboard_onnx.py:205)
+- [deploy/scripts/export_high_level_sru_onnx.py](/abs/path/D:/instinct_nav/deploy/scripts/export_high_level_sru_onnx.py:242)
 
-Details:
-- Goal receipt can trigger `stand -> parkour`.
-- Goal reached can trigger `parkour -> stand`.
-- This is correct as a first version.
+Problem:
+- The exporter currently writes:
+ - `"scene_token_dim": num_actor_scene_token_features`
+- For the current v3/v4 policy this is `384`, not the per-token dimension `6`.
+- The field name implies per-token dimensionality, not flattened total size.
 
-Remaining issue:
-- There is still no explicit deployment mode model such as:
-  - `idle`
-  - `armed`
-  - `autonomous_active`
-  - `fault`
-- The ONNX path supports goal-driven `stand -> parkour` and `parkour -> stand` transitions.
-- The Python checkpoint path is less complete here: it supports `auto_start_parkour`, but it does not
-  currently mirror the ONNX path's `_goal_start_requested` transition behavior.
+Required change:
+- Replace:
+ - `num_actor_scene_token_features`
+- With:
+ - `actor_critic.scene_token_dim`
+- If useful, add separate explicit fields:
+ - `scene_token_num_tokens`
+ - `scene_token_dim`
+ - `scene_token_features_total`
 
-Risk:
-- As more operator behaviors are added, implicit booleans like `_goal_start_requested` and `auto_start_parkour` will become hard to reason about.
-- Maintaining two deployment entry points with slightly different autonomy semantics increases the
-  chance of testing one behavior and deploying another.
+Acceptance:
+- The exported manifest must report:
+ - `scene_token_num_tokens = 64`
+ - `scene_token_dim = 6`
+ - `scene_token_features_total = 384`
 
-Recommendation:
-- Introduce a small explicit autonomy mode enum/state variable.
-- Only allow non-zero autonomous commands when:
-  - low-level buffers are ready
-  - robot is in the expected agent state
-  - autonomy mode is armed and active
-- Either keep the ONNX path as the only authoritative production entry point, or make the Python
-  checkpoint path match the same state transitions exactly.
-
-### 6. Scene-token construction is intentionally approximate and must be treated as a known sim-to-real gap
+### 4. Extend runtime manifest validation beyond basic ONNX IO shapes
 
 Severity: Medium
 
 Files:
-- [deploy/instinct_nav_onboard/onnx_high_level_runtime.py](/abs/path/D:/instinct_nav/deploy/instinct_nav_onboard/onnx_high_level_runtime.py:89)
-- [deploy/instinct_nav_onboard/obs_builder.py](/abs/path/D:/instinct_nav/deploy/instinct_nav_onboard/obs_builder.py:77)
-- [deploy/README.md](/abs/path/D:/instinct_nav/deploy/README.md:164)
+- [deploy/instinct_nav_onboard/onnx_high_level_runtime.py](/abs/path/D:/instinct_nav/deploy/instinct_nav_onboard/onnx_high_level_runtime.py:86)
 
-Details:
-- Deployment-side scene tokens are built from current-frame torso depth plus local visibility accumulation.
-- Training-side token construction used IsaacLab-side camera/root-pose information and delayed BEV warping.
+Problem:
+- Runtime currently validates:
+ - `obs_dim`
+ - `num_actions`
+ - `rnn_num_layers`
+ - `rnn_hidden_size`
+- But scene-token-related metadata is not checked for semantic consistency.
 
-Risk:
-- Even if ONNX export is perfect, token semantics may differ from training.
-- This is likely to show up as poor behavior around occlusion, exploration memory, or turn planning.
+Required change:
+- Validate manifest fields against runtime config where applicable:
+ - `scene_token_dim`
+ - `scene_token_num_tokens`
+ - `encoded_depth_dim`
+ - `proprio_dim`
+- Fail fast at startup if bundle metadata and runtime layout disagree.
 
-Recommendation:
-- Treat this as a declared parity gap, not a hidden assumption.
-- Before serious robot trials, compare token statistics between:
-  - IsaacLab eval dump
-  - robot dry-run dump
-- The next parity improvement should be odom/root-pose based visibility warping on the robot.
+Acceptance:
+- A mismatched manifest must stop startup before robot control begins.
 
-### 7. There is no contract file tying exporter output to runtime expectations
-
-Severity: Medium
-
-Files:
-- [deploy/scripts/export_high_level_sru_onnx.py](/abs/path/D:/instinct_nav/deploy/scripts/export_high_level_sru_onnx.py:142)
-- [deploy/instinct_nav_onboard/config.py](/abs/path/D:/instinct_nav/deploy/instinct_nav_onboard/config.py:29)
-
-Details:
-- Runtime expects a fixed actor observation layout from local Python constants.
-- Exporter expects a matching checkpoint architecture from `SceneTokenSruPolicyConfig`.
-- No artifact bundle records that these two came from the same model/export step.
-
-Risk:
-- It is easy to deploy mismatched combinations of:
-  - checkpoint
-  - depth encoder ONNX
-  - high-level policy ONNX
-  - runtime constants
-
-Recommendation:
-- Export a deployment bundle:
-
-```text
-policy.onnx
-depth_encoder.onnx
-deploy_manifest.json
-git_revision.txt
-checkpoint_info.json
-```
-
-- Make `g1_nav_onboard_onnx.py` validate the bundle before startup.
-
-### 8. Command limiting is present, but command-shaping is still too thin for first real robot trials
+### 5. Record and throttle autonomy fault reasons
 
 Severity: Medium
 
 Files:
-- [deploy/instinct_nav_onboard/onnx_high_level_runtime.py](/abs/path/D:/instinct_nav/deploy/instinct_nav_onboard/onnx_high_level_runtime.py:147)
-- [deploy/instinct_nav_onboard/config.py](/abs/path/D:/instinct_nav/deploy/instinct_nav_onboard/config.py:46)
+- [deploy/scripts/g1_nav_onboard_onnx.py](/abs/path/D:/instinct_nav/deploy/scripts/g1_nav_onboard_onnx.py:283)
 
-Details:
-- Current deployment clamps `[vx, vy, wz]` to configured min/max.
-- There is no explicit slew-rate limiter, deadband, or first-order smoothing in the ONNX runtime path.
+Problem:
+- Current fault path logs errors, but repeated conditions may spam logs.
+- There is no persistent explicit state for diagnosis.
 
-Risk:
-- Even with correct action values, step-to-step jumps can be too aggressive for early field trials.
+Required change:
+- Store:
+ - `_last_autonomy_fault_reason`
+ - `_last_autonomy_fault_time_s`
+- Throttle repeated identical fault messages.
+- Log fault entry and recovery separately.
 
-Recommendation:
-- Add deployment-side shaping before writing to `base_velocity_cmd`:
-  - per-axis deadband
-  - per-axis slew rate limit
-  - optional low-pass filter
-- Keep these settings in deployment config, not embedded in model logic.
+Acceptance:
+- Repeated stale-camera faults should not flood logs every cycle.
+- Operators should be able to identify the last fault cause quickly.
 
-### 9. The runtime writes commands twice through two layers
+## P2: Recommended Hardening
+
+### 6. Make `odom_twist_frame=auto` assumptions explicit in docs and CLI usage
 
 Severity: Low
 
 Files:
-- [deploy/instinct_nav_onboard/onnx_high_level_runtime.py](/abs/path/D:/instinct_nav/deploy/instinct_nav_onboard/onnx_high_level_runtime.py:70)
-- [deploy/scripts/g1_nav_onboard_onnx.py](/abs/path/D:/instinct_nav/deploy/scripts/g1_nav_onboard_onnx.py:189)
+- [deploy/scripts/g1_nav_onboard_onnx.py](/abs/path/D:/instinct_nav/deploy/scripts/g1_nav_onboard_onnx.py:240)
+- [deploy/README.md](/abs/path/D:/instinct_nav/deploy/README.md)
 
-Details:
-- `OnnxHighLevelRuntime.step()` already writes to the command sink.
-- `_update_sru_velocity_command_if_due()` then also writes `self.base_velocity_cmd = command.as_array()`.
+Problem:
+- `auto` infers body-vs-world twist from `child_frame_id`.
+- This is a reasonable heuristic, but it is still a heuristic.
 
-Risk:
-- Not currently wrong because both target the same buffer, but this is redundant and weakens ownership clarity.
+Required change:
+- Document the exact inference rule in `deploy/README.md`.
+- Recommend explicit operator selection in field runs:
+ - `--odom_twist_frame body`
+ - or `--odom_twist_frame world`
 
-Recommendation:
-- Pick one owner:
-  - either the runtime writes to sink and the node does not reassign
-  - or the runtime returns command and the node owns the final write
+Acceptance:
+- Operators should not need to inspect code to understand how `auto` behaves.
 
-The second option is usually clearer for robot safety state machines.
+### 7. Decide whether the Python checkpoint deploy path remains supported
 
-## Recommended Modifications
+Severity: Low
 
-### Priority 0: Required before any non-dryrun test
+Files:
+- [deploy/scripts/g1_nav_onboard.py](/abs/path/D:/instinct_nav/deploy/scripts/g1_nav_onboard.py:1)
+- [deploy/scripts/g1_nav_onboard_onnx.py](/abs/path/D:/instinct_nav/deploy/scripts/g1_nav_onboard_onnx.py:1)
 
-1. Add exception-safe zeroing in `_update_sru_velocity_command_if_due()`.
-2. Add exporter parity verification against ONNXRuntime.
-3. Stop hard-coding hidden state shape in runtime.
-4. Freeze a deployment bundle format and reject mismatched artifacts.
-5. Decide and document the single authoritative production entry point: ONNX path only, or strict
-   state-machine parity across both paths.
+Problem:
+- The latest safety and odom changes are concentrated in the ONNX path.
+- The Python checkpoint path still has weaker deployment semantics.
 
-### Priority 1: Required before serious navigation trials
+Required change:
+- Choose one:
+ - declare ONNX as the only production deployment path
+ - or port the same state-machine and safety fixes into `g1_nav_onboard.py`
 
-1. Replace zero `base_lin_vel_b` with a real estimate, or re-train / validate without it.
-   Recommended first source: existing odom / state-estimator twist.
-2. Add deployment-side command shaping:
-   - deadband
-   - slew-rate limiting
-   - optional smoothing
-3. Make autonomy mode explicit instead of relying only on booleans.
+Acceptance:
+- Documentation and code must agree on which entry point is production-safe.
 
-### Priority 2: Required for robust sim-to-real iteration
+## Validation Checklist
 
-1. Add IsaacLab vs robot dump comparison tooling.
-2. Improve scene-token parity with odom/root-pose warping.
-3. Unify PyTorch `obs_builder` logic and ONNX runtime `build_actor_obs` / `build_scene_tokens` through a shared test suite.
+### Safety
 
-## Recommended Test Sequence
+1. Start with `--auto_start_parkour`.
+2. Force camera frame timeout.
+3. Confirm:
+  - command is zeroed
+  - node returns to `stand`
+  - autonomy does not automatically re-enter `parkour`
 
-### Stage 1: Export contract verification
+### Odom
 
-Run on workstation:
+1. Run with odom enabled.
+2. Stop odom updates while depth still updates.
+3. Confirm:
+  - fault or explicit degrade behavior occurs
+  - stale `base_lin_vel_b` is not silently reused forever
 
-1. Export `policy.onnx` and `depth_encoder.onnx`.
-2. Re-load both in ONNXRuntime.
-3. Compare PyTorch vs ONNX:
-   - `actions`
-   - `h_out`
-   - `c_out`
-4. Save a deployment manifest.
+### Manifest
 
-Exit criterion:
-- deterministic parity within agreed tolerance
+1. Re-export ONNX bundle.
+2. Inspect manifest JSON.
+3. Confirm:
+  - `scene_token_dim == 6`
+  - `scene_token_num_tokens == 64`
+  - total token features are represented separately if included
 
-### Stage 2: Robot-PC dry run
+### Stability
 
-Run only with dry-run enabled.
-
-Checks:
-- `/lowstate` and IMU are valid
-- depth frames update
-- actor obs dim is exactly `2960`
-- encoded depth is finite and shaped correctly
-- scene tokens are finite and numerically sane
-- `base_velocity_cmd` updates at 5 Hz
-- low-level joint targets remain finite
-
-Exit criterion:
-- at least 30 minutes stable runtime without SRU or runtime exceptions
-
-### Stage 3: Constrained non-dryrun
-
-Use:
-- flat terrain
-- short body-frame goals
-- low command limits
-- operator ready on e-stop
-
-Suggested temporary tighter limits than current config:
-
-```text
-vx: +/- 0.3
-vy: +/- 0.2
-wz: +/- 0.4
-```
-
-Exit criterion:
-- no unstable command bursts
-- clean goal start/goal reached transitions
-- reliable zeroing on fault or timeout
-
-### Stage 4: Expanded trials
-
-Only after prior stages pass:
-- turning
-- repeated goals
-- cluttered local geometry
-- stairs or more difficult terrain
-
-## Suggested Work Split
-
-### Track A: Export and contract
-
-Owner tasks:
-- add bundle manifest
-- add ONNX parity check
-- add runtime contract validation
-
-### Track B: Runtime safety
-
-Owner tasks:
-- exception fallback
-- zero command on failure
-- explicit autonomy mode
-- command shaping
-
-### Track C: Observation parity
-
-Owner tasks:
-- replace zero `base_lin_vel_b`
-- dump comparison against IsaacLab eval
-- scene-token parity audit
+1. Dry-run for 10 to 30 minutes.
+2. Confirm:
+  - no repeated fault loops
+  - no uncontrolled command bursts
+  - goal reached still transitions cleanly to `stand`
 
 ## Bottom Line
 
-The deployment path is viable, but it is not yet reliable enough for serious real robot navigation trials without further tightening.
+The latest deployment updates fixed the most important original gap by replacing zero `base_lin_vel_b` with odometry-derived linear velocity and by adding SRU fault fallback.
 
-The most important next step is not another model change. It is to convert the ONNX deployment path from "runs end-to-end" into "has a verified export contract, verified observation parity, and verified fail-safe behavior."
-
-That is the threshold for calling the current real robot deployment path dependable.
+The next critical step is to make fault handling truly operator-safe:
+- fault must latch
+- stale odom must be detected
+- manifest semantics must be cleaned up before further tooling depends on them

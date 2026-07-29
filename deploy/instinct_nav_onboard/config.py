@@ -33,6 +33,8 @@ class ObservationLayout:
 
     proprio_dim: int = 16
     encoded_depth_dim: int = 64 * 5 * 8
+    scene_token_num_tokens: int = 64
+    scene_token_feature_dim: int = 6
     scene_token_dim: int = 64 * 6
 
     @property

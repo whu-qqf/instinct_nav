@@ -1227,11 +1227,11 @@ step_00000001.npz
 - 新增 torch-free 高层推理 runtime：`deploy/instinct_nav_onboard/onnx_high_level_runtime.py`。
 - 新增机器人端 ONNX onboard 入口：`deploy/scripts/g1_nav_onboard_onnx.py`。
 - 新增目标管理器：`deploy/scripts/goal_manager.py`，输入指定 odom/world frame 坐标点，持续发布机器人 base 坐标系下的目标，到点后连续发布停止目标让机器人回到 stand。
-- 新增部署 manifest：`artifacts/high_level/sru_scene_token/deploy_manifest.json`，记录 obs 维度、动作维度、SRU hidden size、checkpoint iteration 和 ONNX sha256。
-- ONNX runtime 启动时会读取/校验 manifest、ONNX sha256 和 ONNX IO contract，不再硬编码 hidden state shape。
+- 新增部署 manifest：`artifacts/high_level/sru_scene_token/deploy_manifest.json`，记录 obs 维度、动作维度、SRU hidden size、checkpoint iteration、ONNX sha256、scene-token 数量/单 token 维度/总维度。
+- ONNX runtime 启动时会读取/校验 manifest、ONNX sha256、ONNX IO contract 和 scene-token/encoded-depth/proprio 语义字段，不再硬编码 hidden state shape。
 - ONNX onboard 入口已接入 `/dog_odom` 线速度作为高层 actor 的 `base_lin_vel_b`，支持用 `--odom_twist_frame auto/body/world` 显式选择 twist 坐标系，避免部署观测中该项固定为 0 或坐标系误判。
 - ONNX onboard 入口已加入 SRU 异常清零、回退 stand、命令 deadband / slew-rate / low-pass shaping。
-- ONNX onboard 入口已加入深度相机帧新鲜度检查，深度帧超时会清零自主命令并回退 stand。
+- ONNX onboard 入口已加入深度相机帧新鲜度检查和 odom 新鲜度检查，深度/odom 超时会 latch autonomy fault、清零自主命令并回退 stand。fault latch 后不会因为 `--auto_start_parkour` 或新目标自动重入 parkour，需要重启节点显式 re-arm。
 - 新增 dump 对比工具：`deploy/scripts/compare_debug_dumps.py`，用于比较 IsaacLab eval dump 和机器人 dry-run dump 的观测/动作分布。
 - 修复 `deploy/instinct_nav_onboard/__init__.py`，避免 ONNX 部署路径因为包初始化提前导入 torch。
 
@@ -1280,6 +1280,7 @@ python deploy/scripts/g1_nav_onboard_onnx.py \
   --goal_pose_topic /instinct_nav/goal_pose \
   --odom_topic /dog_odom \
   --odom_twist_frame auto \
+  --odom_timeout_s 0.5 \
   --command_min -1.0 -0.6 -1.0 \
   --command_max 1.0 0.6 1.0 \
   --command_deadband 0.02 0.02 0.02 \
@@ -1298,6 +1299,8 @@ python deploy/scripts/g1_nav_onboard_onnx.py \
 ```
 
 如果现场确认 `/dog_odom.twist` 不可靠，可以临时加 `--disable_odom_velocity` 回退到旧的零线速度观测，但这会重新引入训练/部署观测不一致。
+
+`--odom_twist_frame auto` 的规则是：如果 `/dog_odom.child_frame_id` 是 `base_link/base/body/torso_link`，直接把 twist 当 body-frame 速度；否则把 twist 当 world-frame 速度，并用 odom pose quaternion 旋转到 body frame。现场正式测试建议显式指定 `--odom_twist_frame body` 或 `--odom_twist_frame world`，不要长期依赖 auto heuristic。
 
 ### 对比仿真和真机 Debug Dump
 
