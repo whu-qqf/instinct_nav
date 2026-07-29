@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import time
 from pathlib import Path
 
@@ -10,7 +11,6 @@ import rclpy
 
 from instinct_nav_onboard.bridges import SensorSource
 from instinct_nav_onboard.config import OnboardConfig
-from instinct_nav_onboard.instinct_onboard_bridge import InstinctOnboardVelocityCommandSink
 from instinct_nav_onboard.onnx_high_level_runtime import OnnxDebugDumpConfig, OnnxHighLevelRuntime
 from instinct_nav_onboard.packets import SensorPacket
 
@@ -37,7 +37,7 @@ class G1NodeSensorSource(SensorSource):
         depth = self._resize_depth_to_training_shape(depth)
         return SensorPacket(
             timestamp_s=time.monotonic(),
-            base_lin_vel_b=np.zeros(3, dtype=np.float32),
+            base_lin_vel_b=self.node.base_lin_vel_b.astype(np.float32),
             base_ang_vel_b=self.node._get_base_ang_vel_obs().astype(np.float32),
             projected_gravity_b=self.node._get_projected_gravity_obs().astype(np.float32),
             joint_pos=self.node._get_joint_pos_obs().astype(np.float32),
@@ -62,15 +62,25 @@ class G1NavOnboardOnnxNode(RealsenseMPCamera, UnitreeNode):
         *args,
         sru_policy_onnx_path: str,
         sru_depth_encoder_onnx_path: str,
+        deploy_manifest_path: str | None = None,
         debug_dump_dir: str | None = None,
         debug_dump_every_steps: int = 1,
         debug_dump_max_steps: int = 1000,
         debug_dump_stats_only: bool = False,
         sru_high_level_hz: float = 5.0,
         autonomous_command_timeout_s: float = 0.5,
+        camera_frame_timeout_s: float = 0.25,
         auto_start_parkour: bool = False,
         goal_pose_topic: str = "/instinct_nav/goal_pose",
         goal_reached_threshold: float = 0.5,
+        odom_topic: str = "/dog_odom",
+        odom_twist_frame: str = "auto",
+        use_odom_velocity: bool = True,
+        command_min: tuple[float, float, float] = (-1.0, -0.6, -1.0),
+        command_max: tuple[float, float, float] = (1.0, 0.6, 1.0),
+        command_deadband: tuple[float, float, float] = (0.02, 0.02, 0.02),
+        command_slew_rate: tuple[float, float, float] = (0.4, 0.3, 0.6),
+        command_lowpass_alpha: float = 0.5,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -83,11 +93,28 @@ class G1NavOnboardOnnxNode(RealsenseMPCamera, UnitreeNode):
         self._next_sru_update_time_s = 0.0
         self._last_sru_command_time_s = 0.0
         self._autonomous_command_timeout_s = float(autonomous_command_timeout_s)
+        self._camera_frame_timeout_s = float(camera_frame_timeout_s)
+        self._last_depth_frame_counter_seen = 0
+        self._last_depth_frame_timestamp_s = 0.0
         self._auto_start_parkour = bool(auto_start_parkour)
         self._goal_pose_topic = str(goal_pose_topic)
         self._goal_reached_threshold = float(goal_reached_threshold)
+        self._odom_topic = str(odom_topic)
+        self._odom_twist_frame = str(odom_twist_frame)
+        if self._odom_twist_frame not in {"auto", "body", "world"}:
+            raise ValueError(f"odom_twist_frame must be auto/body/world, got {self._odom_twist_frame!r}")
+        self._use_odom_velocity = bool(use_odom_velocity)
         self._goal_pose_subscription = None
+        self._odom_subscription = None
         self._goal_start_requested = False
+        self.base_lin_vel_b = np.zeros(3, dtype=np.float32)
+        self._last_shaped_command = np.zeros(3, dtype=np.float32)
+        self._last_command_shape_time_s = 0.0
+        self._command_min = tuple(float(v) for v in command_min)
+        self._command_max = tuple(float(v) for v in command_max)
+        self._command_deadband = np.asarray(command_deadband, dtype=np.float32)
+        self._command_slew_rate = np.asarray(command_slew_rate, dtype=np.float32)
+        self._command_lowpass_alpha = float(np.clip(command_lowpass_alpha, 0.0, 1.0))
 
         debug_cfg = None
         if debug_dump_dir is not None:
@@ -102,11 +129,12 @@ class G1NavOnboardOnnxNode(RealsenseMPCamera, UnitreeNode):
                 f"max_steps={debug_cfg.max_steps}, save_arrays={debug_cfg.save_arrays}."
             )
         self.sru_runtime = OnnxHighLevelRuntime(
-            cfg=OnboardConfig(high_level_hz=float(sru_high_level_hz)),
+            cfg=OnboardConfig(high_level_hz=float(sru_high_level_hz), command_min=self._command_min, command_max=self._command_max),
             policy_onnx_path=sru_policy_onnx_path,
             depth_encoder_onnx_path=sru_depth_encoder_onnx_path,
-            command_sink=InstinctOnboardVelocityCommandSink(self),
+            command_sink=None,
             debug_dump_config=debug_cfg,
+            manifest_path=deploy_manifest_path,
         )
         self.get_logger().info(f"Loaded high-level SRU ONNX policy from {sru_policy_onnx_path}")
         self.get_logger().info(f"Loaded high-level SRU depth encoder ONNX from {sru_depth_encoder_onnx_path}")
@@ -117,12 +145,18 @@ class G1NavOnboardOnnxNode(RealsenseMPCamera, UnitreeNode):
     def start_ros_handlers(self):
         super().start_ros_handlers()
         from geometry_msgs.msg import PoseStamped
+        from nav_msgs.msg import Odometry
         from sensor_msgs.msg import JointState
         from tf2_ros import TransformBroadcaster
 
         self.joint_state_publisher = self.create_publisher(JointState, "joint_states", 10)
         self.tf_broadcaster = TransformBroadcaster(self)
         self._goal_pose_subscription = self.create_subscription(PoseStamped, self._goal_pose_topic, self._on_goal_pose, 10)
+        if self._use_odom_velocity:
+            self._odom_subscription = self.create_subscription(Odometry, self._odom_topic, self._on_odom, 20)
+            self.get_logger().info(f"Using odometry linear velocity from {self._odom_topic} for high-level actor obs.")
+        else:
+            self.get_logger().warn("Odom velocity disabled; high-level actor base_lin_vel_b will stay zero.")
         self.get_logger().info(
             f"Listening for SRU navigation goals on {self._goal_pose_topic}. "
             "For offline dry-run, publish PoseStamped in frame_id='base_link'."
@@ -177,16 +211,84 @@ class G1NavOnboardOnnxNode(RealsenseMPCamera, UnitreeNode):
 
     def _update_sru_velocity_command_if_due(self) -> None:
         now = time.monotonic()
+        if not self._camera_depth_is_fresh(now):
+            self._enter_autonomy_fault("Depth camera frame is stale or unavailable; stopping autonomous navigation.")
+            self._next_sru_update_time_s = now + self._sru_high_level_period_s
+            return
         if now < self._next_sru_update_time_s:
             if now - self._last_sru_command_time_s > self._autonomous_command_timeout_s:
-                self.base_velocity_cmd = np.zeros(3, dtype=np.float32)
+                self._zero_autonomous_command()
             return
-        packet = G1NodeSensorSource(self).read()
-        command = self.sru_runtime.step(packet)
+        try:
+            packet = G1NodeSensorSource(self).read()
+            command = self.sru_runtime.step(packet)
+        except Exception as exc:
+            self._enter_autonomy_fault(f"SRU high-level update failed: {exc}")
+            self._next_sru_update_time_s = now + self._sru_high_level_period_s
+            return
         self.nav_reset_requested = False
         self._last_sru_command_time_s = now
         self._next_sru_update_time_s = now + self._sru_high_level_period_s
-        self.base_velocity_cmd = command.as_array()
+        self.base_velocity_cmd = self._shape_command(command.as_array(), now)
+
+
+    def _on_odom(self, msg) -> None:
+        linear = msg.twist.twist.linear
+        vel = np.asarray([linear.x, linear.y, linear.z], dtype=np.float32)
+        mode = self._odom_twist_frame
+        if mode == "auto":
+            child_frame = (msg.child_frame_id or "").strip("/")
+            mode = "body" if child_frame in {"base_link", "base", "body", "torso_link"} else "world"
+        if mode == "body":
+            self.base_lin_vel_b = vel
+            return
+        q = msg.pose.pose.orientation
+        self.base_lin_vel_b = _rotate_world_to_body(vel, np.asarray([q.x, q.y, q.z, q.w], dtype=np.float32))
+
+    def _camera_depth_is_fresh(self, now_monotonic_s: float) -> bool:
+        header = getattr(self, "_depth_header", None)
+        if header is None:
+            depth = self.get_depth_image()
+            return depth is not None and np.isfinite(depth).any()
+        frame_counter = int(getattr(header, "frame_counter", 0))
+        timestamp_wall_s = float(getattr(header, "timestamp", 0.0))
+        if frame_counter <= 0 or timestamp_wall_s <= 0.0:
+            return False
+        if frame_counter != self._last_depth_frame_counter_seen:
+            self._last_depth_frame_counter_seen = frame_counter
+            self._last_depth_frame_timestamp_s = now_monotonic_s
+            return True
+        return (now_monotonic_s - self._last_depth_frame_timestamp_s) <= self._camera_frame_timeout_s
+
+    def _shape_command(self, command: np.ndarray, now: float) -> np.ndarray:
+        command = np.asarray(command, dtype=np.float32).reshape(3)
+        command = np.where(np.abs(command) < self._command_deadband, 0.0, command)
+        if self._last_command_shape_time_s <= 0.0:
+            dt = self._sru_high_level_period_s
+        else:
+            dt = max(now - self._last_command_shape_time_s, 1.0e-3)
+        max_delta = self._command_slew_rate * dt
+        delta = np.clip(command - self._last_shaped_command, -max_delta, max_delta)
+        limited = self._last_shaped_command + delta
+        shaped = self._command_lowpass_alpha * limited + (1.0 - self._command_lowpass_alpha) * self._last_shaped_command
+        self._last_shaped_command = shaped.astype(np.float32)
+        self._last_command_shape_time_s = now
+        return self._last_shaped_command.copy()
+
+    def _zero_autonomous_command(self) -> None:
+        self.base_velocity_cmd = np.zeros(3, dtype=np.float32)
+        self._last_shaped_command = np.zeros(3, dtype=np.float32)
+        self._last_command_shape_time_s = 0.0
+
+    def _enter_autonomy_fault(self, reason: str) -> None:
+        self.get_logger().error(reason)
+        self._zero_autonomous_command()
+        self.sru_runtime.reset()
+        self._goal_start_requested = False
+        self.nav_reset_requested = True
+        if "stand" in self.available_agents and self.current_agent_name != "stand":
+            self.current_agent_name = "stand"
+            self.available_agents[self.current_agent_name].reset()
 
     def set_nav_goal_body(self, goal_b: np.ndarray) -> None:
         self.nav_goal_b = np.asarray(goal_b, dtype=np.float32).reshape(4)
@@ -205,7 +307,7 @@ class G1NavOnboardOnnxNode(RealsenseMPCamera, UnitreeNode):
         if distance < self._goal_reached_threshold:
             goal_b = np.asarray([0.0, 0.0, 0.0, 0.0], dtype=np.float32)
             self._goal_start_requested = False
-            self.base_velocity_cmd = np.zeros(3, dtype=np.float32)
+            self._zero_autonomous_command()
             self.sru_runtime.reset()
             if self.current_agent_name == "parkour" and "stand" in self.available_agents:
                 self.get_logger().info("Navigation goal reached; switching back to stand agent.")
@@ -222,6 +324,34 @@ class G1NavOnboardOnnxNode(RealsenseMPCamera, UnitreeNode):
         )
 
 
+def _rotate_world_to_body(vec_w: np.ndarray, quat_xyzw: np.ndarray) -> np.ndarray:
+    x, y, z, w = [float(v) for v in quat_xyzw]
+    norm = math.sqrt(x * x + y * y + z * z + w * w)
+    if norm <= 1.0e-6:
+        return np.asarray(vec_w, dtype=np.float32)
+    x, y, z, w = x / norm, y / norm, z / norm, w / norm
+    # Rotation matrix world_from_body, then transpose for body_from_world.
+    r00 = 1.0 - 2.0 * (y * y + z * z)
+    r01 = 2.0 * (x * y - z * w)
+    r02 = 2.0 * (x * z + y * w)
+    r10 = 2.0 * (x * y + z * w)
+    r11 = 1.0 - 2.0 * (x * x + z * z)
+    r12 = 2.0 * (y * z - x * w)
+    r20 = 2.0 * (x * z - y * w)
+    r21 = 2.0 * (y * z + x * w)
+    r22 = 1.0 - 2.0 * (x * x + y * y)
+    vx, vy, vz = [float(v) for v in vec_w]
+    return np.asarray(
+        [
+            r00 * vx + r10 * vy + r20 * vz,
+            r01 * vx + r11 * vy + r21 * vz,
+            r02 * vx + r12 * vy + r22 * vz,
+        ],
+        dtype=np.float32,
+    )
+
+
+
 def main(args: argparse.Namespace) -> None:
     rclpy.init()
     node = G1NavOnboardOnnxNode(
@@ -232,14 +362,24 @@ def main(args: argparse.Namespace) -> None:
         dryrun=not args.nodryrun,
         sru_policy_onnx_path=args.sru_policy_onnx_path,
         sru_depth_encoder_onnx_path=args.sru_depth_encoder_onnx_path,
+        deploy_manifest_path=args.deploy_manifest_path,
         debug_dump_dir=args.debug_dump_dir,
         debug_dump_every_steps=args.debug_dump_every_steps,
         debug_dump_max_steps=args.debug_dump_max_steps,
         debug_dump_stats_only=args.debug_dump_stats_only,
         sru_high_level_hz=args.sru_high_level_hz,
+        camera_frame_timeout_s=args.camera_frame_timeout_s,
         auto_start_parkour=args.auto_start_parkour,
         goal_pose_topic=args.goal_pose_topic,
         goal_reached_threshold=args.goal_reached_threshold,
+        odom_topic=args.odom_topic,
+        odom_twist_frame=args.odom_twist_frame,
+        use_odom_velocity=not args.disable_odom_velocity,
+        command_min=tuple(args.command_min),
+        command_max=tuple(args.command_max),
+        command_deadband=tuple(args.command_deadband),
+        command_slew_rate=tuple(args.command_slew_rate),
+        command_lowpass_alpha=args.command_lowpass_alpha,
     )
     parkour_agent = ParkourAgent(logdir=args.logdir, ros_node=node, depth_vis=args.depth_vis, pointcloud_vis=args.pointcloud_vis)
     node.register_agent("parkour", parkour_agent)
@@ -264,7 +404,8 @@ def main(args: argparse.Namespace) -> None:
         print("Keyboard interrupt received, shutting down...")
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
         print("Node shutdown complete.")
 
 
@@ -274,11 +415,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--logdir", type=str, required=True)
     parser.add_argument("--sru_policy_onnx_path", type=str, required=True)
     parser.add_argument("--sru_depth_encoder_onnx_path", type=str, required=True)
+    parser.add_argument("--deploy_manifest_path", type=str, default=None)
     parser.add_argument("--debug_dump_dir", type=str, default=None)
     parser.add_argument("--debug_dump_every_steps", type=int, default=1)
     parser.add_argument("--debug_dump_max_steps", type=int, default=1000)
     parser.add_argument("--debug_dump_stats_only", action="store_true", default=False)
     parser.add_argument("--sru_high_level_hz", type=float, default=5.0)
+    parser.add_argument("--camera_frame_timeout_s", type=float, default=0.25)
     parser.add_argument("--startup_step_size", type=float, default=0.2)
     parser.add_argument("--kpkd_factor", type=float, default=2.0)
     parser.add_argument("--depth_vis", action="store_true", default=False)
@@ -287,6 +430,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--auto_start_parkour", action="store_true", default=False)
     parser.add_argument("--goal_pose_topic", type=str, default="/instinct_nav/goal_pose")
     parser.add_argument("--goal_reached_threshold", type=float, default=0.5)
+    parser.add_argument("--odom_topic", type=str, default="/dog_odom")
+    parser.add_argument("--odom_twist_frame", type=str, choices=("auto", "body", "world"), default="auto")
+    parser.add_argument("--disable_odom_velocity", action="store_true", default=False)
+    parser.add_argument("--command_min", type=float, nargs=3, default=(-1.0, -0.6, -1.0), metavar=("VX", "VY", "WZ"))
+    parser.add_argument("--command_max", type=float, nargs=3, default=(1.0, 0.6, 1.0), metavar=("VX", "VY", "WZ"))
+    parser.add_argument("--command_deadband", type=float, nargs=3, default=(0.02, 0.02, 0.02), metavar=("VX", "VY", "WZ"))
+    parser.add_argument("--command_slew_rate", type=float, nargs=3, default=(0.4, 0.3, 0.6), metavar=("VX", "VY", "WZ"))
+    parser.add_argument("--command_lowpass_alpha", type=float, default=0.5)
     return parser.parse_args()
 
 

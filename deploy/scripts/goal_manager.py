@@ -26,8 +26,11 @@ class BodyGoalManager(Node):
         self.odom_topic = args.odom_topic
         self.world_goal_topic = args.world_goal_topic
         self.body_goal_topic = args.body_goal_topic
+        self.goal_frame = (args.goal_frame or "odom").strip("/")
         self.goal_reached_threshold = float(args.goal_reached_threshold)
         self.publish_hz = float(args.publish_hz)
+        self.stop_publish_count = max(int(args.stop_publish_count), 1)
+        self.stop_publish_remaining = 0
         self.goal: tuple[float, float, float] | None = None
         self.robot_pose: PlanarPose | None = None
         self.goal_active = False
@@ -39,7 +42,8 @@ class BodyGoalManager(Node):
         self.timer = self.create_timer(1.0 / max(self.publish_hz, 1.0), self._publish_body_goal)
         self.get_logger().info(
             f"Goal manager ready: odom={self.odom_topic}, world_goal={self.world_goal_topic}, "
-            f"body_goal={self.body_goal_topic}, threshold={self.goal_reached_threshold:.2f} m."
+            f"body_goal={self.body_goal_topic}, goal_frame={self.goal_frame}, "
+            f"threshold={self.goal_reached_threshold:.2f} m, stop_publish_count={self.stop_publish_count}."
         )
 
     def _on_odom(self, msg: Odometry) -> None:
@@ -49,16 +53,31 @@ class BodyGoalManager(Node):
         self.robot_pose = PlanarPose(float(p.x), float(p.y), yaw)
 
     def _on_world_goal(self, msg: PointStamped) -> None:
+        frame_id = (msg.header.frame_id or self.goal_frame).strip("/")
+        if frame_id != self.goal_frame:
+            self.get_logger().warn(
+                f"Ignoring world goal in frame={frame_id!r}; expected frame={self.goal_frame!r}. "
+                "TF conversion is not enabled in this lightweight goal manager.",
+                throttle_duration_sec=2.0,
+            )
+            return
         p = msg.point
         self.goal = (float(p.x), float(p.y), float(p.z))
         self.goal_active = True
         self.goal_done_latched = False
+        self.stop_publish_remaining = 0
         self.get_logger().info(
-            f"Received world goal: frame={msg.header.frame_id or 'odom'}, "
+            f"Received world goal: frame={frame_id}, "
             f"xyz=({p.x:+.2f}, {p.y:+.2f}, {p.z:+.2f}) m."
         )
 
     def _publish_body_goal(self) -> None:
+        if self.stop_publish_remaining > 0:
+            self._publish_goal_b(0.0, 0.0, 0.0)
+            self.stop_publish_remaining -= 1
+            if self.stop_publish_remaining <= 0:
+                self.goal_active = False
+            return
         if self.robot_pose is None or self.goal is None or not self.goal_active:
             return
         gx, gy, gz = self.goal
@@ -67,10 +86,15 @@ class BodyGoalManager(Node):
         distance = math.hypot(dx_w, dy_w)
         if distance < self.goal_reached_threshold:
             if not self.goal_done_latched:
-                self.get_logger().info(f"Goal reached: distance={distance:.3f} m. Publishing stop goal.")
+                self.get_logger().info(
+                    f"Goal reached: distance={distance:.3f} m. Publishing {self.stop_publish_count} stop goals."
+                )
                 self.goal_done_latched = True
+            self.stop_publish_remaining = self.stop_publish_count
             self._publish_goal_b(0.0, 0.0, 0.0)
-            self.goal_active = False
+            self.stop_publish_remaining -= 1
+            if self.stop_publish_remaining <= 0:
+                self.goal_active = False
             return
 
         cos_yaw = math.cos(self.robot_pose.yaw)
@@ -101,7 +125,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--odom_topic", type=str, default="/dog_odom")
     parser.add_argument("--world_goal_topic", type=str, default="/instinct_nav/world_goal_point")
     parser.add_argument("--body_goal_topic", type=str, default="/instinct_nav/goal_pose")
+    parser.add_argument("--goal_frame", type=str, default="odom")
     parser.add_argument("--goal_reached_threshold", type=float, default=0.5)
+    parser.add_argument("--stop_publish_count", type=int, default=10)
     parser.add_argument("--publish_hz", type=float, default=10.0)
     return parser.parse_args()
 

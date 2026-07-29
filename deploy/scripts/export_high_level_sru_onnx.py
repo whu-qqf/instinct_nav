@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
+import json
 import sys
 from pathlib import Path
 
@@ -96,8 +98,88 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint_path", type=str, required=True)
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--output_name", type=str, default="sru_high_level_scene_token.onnx")
+    parser.add_argument("--manifest_name", type=str, default="deploy_manifest.json")
     parser.add_argument("--opset", type=int, default=17)
+    parser.add_argument("--parity_atol", type=float, default=1.0e-5)
+    parser.add_argument("--parity_rtol", type=float, default=1.0e-4)
+    parser.add_argument("--require_onnx_parity", action="store_true", default=False)
     return parser.parse_args()
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _run_onnx_parity_check(
+    exporter: nn.Module,
+    onnx_path: Path,
+    obs_dim: int,
+    num_layers: int,
+    hidden_size: int,
+    atol: float,
+    rtol: float,
+    require: bool,
+) -> bool:
+    try:
+        import onnxruntime as ort
+    except Exception as exc:
+        message = f"onnxruntime is unavailable; skipping ONNX parity check: {exc}"
+        if require:
+            raise RuntimeError(message) from exc
+        print(f"[WARN] {message}")
+        return False
+
+    session = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
+    generator = torch.Generator(device="cpu").manual_seed(72)
+    test_cases = [
+        ("zero", torch.zeros(1, obs_dim), torch.zeros(num_layers, 1, hidden_size), torch.zeros(num_layers, 1, hidden_size)),
+        ("random", torch.randn(1, obs_dim, generator=generator), torch.randn(num_layers, 1, hidden_size, generator=generator) * 0.1, torch.randn(num_layers, 1, hidden_size, generator=generator) * 0.1),
+    ]
+    exporter.eval().cpu()
+    with torch.no_grad():
+        for name, obs, h, c in test_cases:
+            pt_actions, pt_h, pt_c = exporter(obs.float(), h.float(), c.float())
+            ort_actions, ort_h, ort_c = session.run(
+                None,
+                {
+                    "obs": obs.numpy().astype("float32"),
+                    "h_in": h.numpy().astype("float32"),
+                    "c_in": c.numpy().astype("float32"),
+                },
+            )
+            _assert_close(name, "actions", pt_actions.numpy(), ort_actions, atol, rtol)
+            _assert_close(name, "h_out", pt_h.numpy(), ort_h, atol, rtol)
+            _assert_close(name, "c_out", pt_c.numpy(), ort_c, atol, rtol)
+
+        h = torch.randn(num_layers, 1, hidden_size, generator=generator) * 0.1
+        c = torch.randn(num_layers, 1, hidden_size, generator=generator) * 0.1
+        ort_h = h.numpy().astype("float32")
+        ort_c = c.numpy().astype("float32")
+        for step in range(4):
+            obs = torch.randn(1, obs_dim, generator=generator).float()
+            pt_actions, h, c = exporter(obs, h.float(), c.float())
+            ort_actions, ort_h, ort_c = session.run(
+                None,
+                {"obs": obs.numpy().astype("float32"), "h_in": ort_h, "c_in": ort_c},
+            )
+            _assert_close(f"rollout_{step}", "actions", pt_actions.numpy(), ort_actions, atol, rtol)
+            _assert_close(f"rollout_{step}", "h_out", h.numpy(), ort_h, atol, rtol)
+            _assert_close(f"rollout_{step}", "c_out", c.numpy(), ort_c, atol, rtol)
+    return True
+
+
+def _assert_close(case: str, name: str, expected, actual, atol: float, rtol: float) -> None:
+    import numpy as np
+
+    expected = np.asarray(expected, dtype=np.float32)
+    actual = np.asarray(actual, dtype=np.float32)
+    if not np.allclose(expected, actual, atol=atol, rtol=rtol):
+        max_abs = float(np.max(np.abs(expected - actual)))
+        raise RuntimeError(f"ONNX parity failed for {case}/{name}: max_abs={max_abs:.6g}, atol={atol}, rtol={rtol}")
 
 
 def main() -> None:
@@ -106,6 +188,13 @@ def main() -> None:
     output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / args.output_name
+    manifest_path = output_dir / args.manifest_name
+    tmp_output_path = output_path.with_name(output_path.name + ".tmp")
+    tmp_manifest_path = manifest_path.with_name(manifest_path.name + ".tmp")
+
+    for tmp_path in (tmp_output_path, tmp_manifest_path):
+        if tmp_path.exists():
+            tmp_path.unlink()
 
     policy = SceneTokenSruCheckpointPolicy(checkpoint_path, device="cpu")
     actor_critic = policy.actor_critic.eval().cpu()
@@ -121,31 +210,70 @@ def main() -> None:
     with torch.no_grad():
         pt_actions, pt_h, pt_c = exporter(dummy_obs, dummy_h, dummy_c)
 
-    torch.onnx.export(
-        exporter,
-        (dummy_obs, dummy_h, dummy_c),
-        str(output_path),
-        input_names=["obs", "h_in", "c_in"],
-        output_names=["actions", "h_out", "c_out"],
-        dynamic_axes={
-            "obs": {0: "batch"},
-            "h_in": {1: "batch"},
-            "c_in": {1: "batch"},
-            "actions": {0: "batch"},
-            "h_out": {1: "batch"},
-            "c_out": {1: "batch"},
-        },
-        opset_version=int(args.opset),
-        do_constant_folding=True,
-    )
+    try:
+        torch.onnx.export(
+            exporter,
+            (dummy_obs, dummy_h, dummy_c),
+            str(tmp_output_path),
+            input_names=["obs", "h_in", "c_in"],
+            output_names=["actions", "h_out", "c_out"],
+            dynamic_axes={
+                "obs": {0: "batch"},
+                "h_in": {1: "batch"},
+                "c_in": {1: "batch"},
+                "actions": {0: "batch"},
+                "h_out": {1: "batch"},
+                "c_out": {1: "batch"},
+            },
+            opset_version=int(args.opset),
+            do_constant_folding=True,
+        )
+
+        manifest = {
+            "format_version": 1,
+            "policy_onnx": output_path.name,
+            "policy_onnx_sha256": _sha256(tmp_output_path),
+            "checkpoint_path": str(checkpoint_path),
+            "checkpoint_iteration": int(policy.checkpoint_iteration),
+            "obs_dim": int(obs_dim),
+            "num_actions": 3,
+            "rnn_num_layers": int(num_layers),
+            "rnn_hidden_size": int(hidden_size),
+            "scene_token_dim": int(getattr(actor_critic, "num_actor_scene_token_features", 0)),
+            "encoded_depth_dim": int(getattr(actor_critic, "num_image_features", 0)),
+            "proprio_dim": int(getattr(actor_critic, "actor_proprioceptive_input_dim", 0)),
+            "image_input_dims": [int(v) for v in getattr(actor_critic, "image_input_dims", [])],
+            "opset": int(args.opset),
+        }
+        tmp_manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+        parity_ok = _run_onnx_parity_check(
+            exporter=exporter,
+            onnx_path=tmp_output_path,
+            obs_dim=obs_dim,
+            num_layers=num_layers,
+            hidden_size=hidden_size,
+            atol=float(args.parity_atol),
+            rtol=float(args.parity_rtol),
+            require=bool(args.require_onnx_parity),
+        )
+
+        tmp_output_path.replace(output_path)
+        tmp_manifest_path.replace(manifest_path)
+    except Exception:
+        for tmp_path in (tmp_output_path, tmp_manifest_path):
+            if tmp_path.exists():
+                tmp_path.unlink()
+        raise
 
     print(f"[INFO] Exported high-level SRU ONNX: {output_path}")
+    print(f"[INFO] Exported deploy manifest: {manifest_path}")
+    print(f"[INFO] ONNX parity check: {'passed' if parity_ok else 'not run'}")
     print(f"[INFO] checkpoint iteration: {policy.checkpoint_iteration}")
     print(f"[INFO] obs shape: (1, {obs_dim})")
     print(f"[INFO] h/c shape: ({num_layers}, 1, {hidden_size})")
     print(f"[INFO] sample actions: {pt_actions.detach().cpu().numpy().reshape(-1).tolist()}")
     print(f"[INFO] sample h_norm={float(pt_h.norm()):.6f}, c_norm={float(pt_c.norm()):.6f}")
-
 
 if __name__ == "__main__":
     main()

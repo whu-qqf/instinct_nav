@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from collections import deque
 from dataclasses import dataclass
@@ -12,6 +13,14 @@ import onnxruntime as ort
 from .config import OnboardConfig
 from .packets import SensorPacket, VelocityCommand
 
+
+@dataclass(frozen=True)
+class OnnxPolicyContract:
+    obs_dim: int
+    num_actions: int
+    rnn_num_layers: int
+    rnn_hidden_size: int
+    scene_token_dim: int | None = None
 
 @dataclass(frozen=True)
 class OnnxDebugDumpConfig:
@@ -29,17 +38,21 @@ class OnnxHighLevelRuntime:
         cfg: OnboardConfig,
         policy_onnx_path: str | Path,
         depth_encoder_onnx_path: str | Path,
-        command_sink,
+        command_sink=None,
         providers: list[str] | None = None,
         debug_dump_config: OnnxDebugDumpConfig | None = None,
+        manifest_path: str | Path | None = None,
     ):
         self.cfg = cfg
         self.command_sink = command_sink
         self.providers = providers or ort.get_available_providers()
-        self.policy_session = ort.InferenceSession(str(Path(policy_onnx_path).expanduser()), providers=self.providers)
-        self.depth_session = ort.InferenceSession(str(Path(depth_encoder_onnx_path).expanduser()), providers=self.providers)
-        self.h = np.zeros((1, 1, 512), dtype=np.float32)
-        self.c = np.zeros((1, 1, 512), dtype=np.float32)
+        self.policy_onnx_path = Path(policy_onnx_path).expanduser()
+        self.depth_encoder_onnx_path = Path(depth_encoder_onnx_path).expanduser()
+        self.policy_session = ort.InferenceSession(str(self.policy_onnx_path), providers=self.providers)
+        self.depth_session = ort.InferenceSession(str(self.depth_encoder_onnx_path), providers=self.providers)
+        self.contract = self._load_and_validate_contract(manifest_path)
+        self.h = np.zeros((self.contract.rnn_num_layers, 1, self.contract.rnn_hidden_size), dtype=np.float32)
+        self.c = np.zeros((self.contract.rnn_num_layers, 1, self.contract.rnn_hidden_size), dtype=np.float32)
         self.last_action = np.zeros(3, dtype=np.float32)
         self.visibility = np.zeros((1, 1, 64, 64), dtype=np.float32)
         self.debug_cfg = debug_dump_config
@@ -67,8 +80,63 @@ class OnnxHighLevelRuntime:
         self.last_action = action.copy()
         command = self._action_to_command(action, packet.timestamp_s)
         self._maybe_dump(packet, encoded_depth, filtered_depth, scene_tokens, obs, action, command)
-        self.command_sink.write(command)
         return command
+
+
+    def _load_and_validate_contract(self, manifest_path: str | Path | None) -> OnnxPolicyContract:
+        manifest = _read_manifest(manifest_path) if manifest_path is not None else _read_manifest(self.policy_onnx_path.with_name("deploy_manifest.json"))
+        inferred = self._infer_contract_from_onnx()
+        if manifest is None:
+            contract = inferred
+        else:
+            expected_name = manifest.get("policy_onnx")
+            if expected_name is not None and Path(expected_name).name != self.policy_onnx_path.name:
+                raise ValueError(f"policy ONNX filename mismatch: manifest={expected_name}, runtime={self.policy_onnx_path.name}")
+            expected_sha256 = manifest.get("policy_onnx_sha256")
+            if expected_sha256 is not None:
+                actual_sha256 = _sha256(self.policy_onnx_path)
+                if actual_sha256 != expected_sha256:
+                    raise ValueError(
+                        f"policy ONNX sha256 mismatch: manifest={expected_sha256}, runtime={actual_sha256}"
+                    )
+            contract = OnnxPolicyContract(
+                obs_dim=int(manifest["obs_dim"]),
+                num_actions=int(manifest["num_actions"]),
+                rnn_num_layers=int(manifest["rnn_num_layers"]),
+                rnn_hidden_size=int(manifest["rnn_hidden_size"]),
+                scene_token_dim=int(manifest["scene_token_dim"]) if manifest.get("scene_token_dim") is not None else None,
+            )
+            mismatches = []
+            for field in ("obs_dim", "num_actions", "rnn_num_layers", "rnn_hidden_size"):
+                if getattr(contract, field) != getattr(inferred, field):
+                    mismatches.append(f"{field}: manifest={getattr(contract, field)} onnx={getattr(inferred, field)}")
+            if mismatches:
+                raise ValueError("ONNX contract mismatch: " + "; ".join(mismatches))
+        if contract.obs_dim != self.cfg.layout.actor_obs_dim:
+            raise ValueError(f"runtime obs layout mismatch: contract={contract.obs_dim}, cfg={self.cfg.layout.actor_obs_dim}")
+        if contract.num_actions != 3:
+            raise ValueError(f"expected 3 high-level actions, got {contract.num_actions}")
+        return contract
+
+    def _infer_contract_from_onnx(self) -> OnnxPolicyContract:
+        inputs = {item.name: item.shape for item in self.policy_session.get_inputs()}
+        outputs = {item.name: item.shape for item in self.policy_session.get_outputs()}
+        obs_shape = inputs.get("obs")
+        h_shape = inputs.get("h_in")
+        actions_shape = outputs.get("actions")
+        if obs_shape is None or h_shape is None or actions_shape is None:
+            raise ValueError("policy ONNX must expose inputs obs/h_in and output actions")
+        obs_dim = _static_dim(obs_shape, 1, "obs_dim")
+        rnn_num_layers = _static_dim(h_shape, 0, "rnn_num_layers")
+        rnn_hidden_size = _static_dim(h_shape, 2, "rnn_hidden_size")
+        num_actions = _static_dim(actions_shape, 1, "num_actions")
+        return OnnxPolicyContract(
+            obs_dim=obs_dim,
+            num_actions=num_actions,
+            rnn_num_layers=rnn_num_layers,
+            rnn_hidden_size=rnn_hidden_size,
+            scene_token_dim=self.cfg.layout.scene_token_dim,
+        )
 
     def build_actor_obs(self, packet: SensorPacket, encoded_depth: np.ndarray, scene_tokens: np.ndarray) -> np.ndarray:
         proprio = np.concatenate(
@@ -82,8 +150,8 @@ class OnnxHighLevelRuntime:
             axis=0,
         ).reshape(1, -1)
         obs = np.concatenate([proprio, encoded_depth.reshape(1, -1), scene_tokens.reshape(1, -1)], axis=1).astype(np.float32)
-        if obs.shape[1] != self.cfg.layout.actor_obs_dim:
-            raise ValueError(f"actor obs dim mismatch: got {obs.shape[1]}, expected {self.cfg.layout.actor_obs_dim}")
+        if obs.shape[1] != self.contract.obs_dim:
+            raise ValueError(f"actor obs dim mismatch: got {obs.shape[1]}, expected {self.contract.obs_dim}")
         return obs
 
     def build_scene_tokens(self, depth_m: np.ndarray) -> np.ndarray:
@@ -194,6 +262,34 @@ class OnnxHighLevelRuntime:
             )
         with self.index_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _read_manifest(path: str | Path | None) -> dict | None:
+    if path is None:
+        return None
+    manifest_path = Path(path).expanduser()
+    if not manifest_path.exists():
+        return None
+    with manifest_path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _static_dim(shape: list, index: int, name: str) -> int:
+    try:
+        value = shape[index]
+    except IndexError as exc:
+        raise ValueError(f"missing ONNX dimension {name} at index {index}: shape={shape}") from exc
+    if not isinstance(value, int) or value <= 0:
+        raise ValueError(f"ONNX dimension {name} must be static positive int, got {value!r} from shape={shape}")
+    return int(value)
 
 
 def _stats(value: np.ndarray) -> dict[str, float | int]:

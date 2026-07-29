@@ -1,0 +1,20 @@
+{
+  "format_version": 1,
+  "policy_onnx": "sru_high_level_scene_token.onnx",
+  "policy_onnx_sha256": "dd482d907a014a45abeea0f221c0dfe1bb9bd2776e2a9c7191ccac4b681cf60b",
+  "checkpoint_path": "/workspace/instinct_nav/logs/rsl_rl/g1_instinct_navigation_ppo_vismap/2026-07-26_21-39-31_g1_sru_scene_token_risk_no_goal_shared_lowcam_query_v1/model_2999.pt",
+  "checkpoint_iteration": 2999,
+  "obs_dim": 2960,
+  "num_actions": 3,
+  "rnn_num_layers": 1,
+  "rnn_hidden_size": 512,
+  "scene_token_dim": 384,
+  "encoded_depth_dim": 2560,
+  "proprio_dim": 16,
+  "image_input_dims": [
+    64,
+    5,
+    8
+  ],
+  "opset": 17
+}
