@@ -1645,4 +1645,5 @@ ros2 topic pub --once /instinct_nav/world_goal_point geometry_msgs/msg/PointStam
 "{header: {frame_id: 'odom'}, point: {x: 0.3, y: 0.0, z: 0.0}}"
 ```
 
-`R1` 返回 stand；`R2` 或 `L2` 触发急停并退出。
+`R1` 返回 stand 并锁存暂停，后续持续目标消息不会再次启动 parkour；需要重启
+onboard 节点才能重新启用自主导航。`R2` 或 `L2` 触发急停并退出。

@@ -120,6 +120,7 @@ class G1NavOnboardOnnxNode(RealsenseMPCamera, UnitreeNode):
         self._goal_pose_subscription = None
         self._odom_subscription = None
         self._goal_start_requested = False
+        self._manual_stand_latched = False
         self._autonomy_fault_latched = False
         self._last_autonomy_fault_reason: str | None = None
         self._last_autonomy_fault_log_time_s = 0.0
@@ -275,6 +276,7 @@ class G1NavOnboardOnnxNode(RealsenseMPCamera, UnitreeNode):
                 self._zero_autonomous_command()
                 self.sru_runtime.reset()
                 self._goal_start_requested = False
+                self._manual_stand_latched = True
                 previous_agent = self.current_agent_name
                 self.current_agent_name = "stand"
                 self.available_agents[self.current_agent_name].reset()
@@ -420,6 +422,14 @@ class G1NavOnboardOnnxNode(RealsenseMPCamera, UnitreeNode):
         goal_xyz = np.asarray([msg.pose.position.x, msg.pose.position.y, msg.pose.position.z], dtype=np.float32)
         distance = float(np.linalg.norm(goal_xyz))
         goal_was_active = self._goal_start_requested
+        if self._manual_stand_latched:
+            self.get_logger().warn(
+                "Ignoring navigation goal because R1 manual-stand is latched. Restart the node to re-arm autonomy.",
+                throttle_duration_sec=2.0,
+            )
+            self._goal_start_requested = False
+            self._zero_autonomous_command()
+            return
         if self._autonomy_fault_latched:
             self.get_logger().warn(
                 f"Ignoring navigation goal because autonomy fault is latched: {self._last_autonomy_fault_reason}. Restart the node to re-arm.",
