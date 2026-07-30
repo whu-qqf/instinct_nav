@@ -16,6 +16,9 @@ logs/
 runs/
 videos/
 artifacts/checkpoints/
+# Official InstinctLab deployment bundle copied locally. Keep model provenance
+# external to the source repository.
+/data&model/
 *.mp4
 *.gif
 *.avi

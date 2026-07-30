@@ -96,15 +96,19 @@ scripts/g1_nav_onboard.py                      Debug-only Python checkpoint inte
 artifacts/high_level/sru_scene_token/sru_high_level_scene_token.onnx
 artifacts/high_level/sru_scene_token/sru_high_level_depth_encoder.onnx
 artifacts/high_level/sru_scene_token/deploy_manifest.json
-artifacts/low_level/g1_parkour/exported/actor.onnx
-artifacts/low_level/g1_parkour/exported/0-depth_encoder.onnx
-artifacts/low_level/g1_parkour/params/agent.yaml
-artifacts/low_level/g1_parkour/params/env.yaml
+data&model/checkpoints/stand_onboard/exported/actor.onnx
+data&model/checkpoints/stand_onboard/exported/0-depth_encoder.onnx
+data&model/checkpoints/stand_onboard/params/env.yaml
+data&model/checkpoints/parkour_onboard_preview_stair/exported/actor.onnx
+data&model/checkpoints/parkour_onboard_preview_stair/exported/0-depth_encoder.onnx
+data&model/checkpoints/parkour_onboard_preview_stair/params/env.yaml
 ```
 
-The stand agent is a separate model. On the current robot it is stored at
-`/workspace/unitree-jetson-container/data/data/checkpoints/stand_onboard`; do not
-pass the parkour directory as `--standdir`.
+These are the official InstinctLab deployment policies. The stand and stair
+policies have the same ONNX input/output shapes but different weights. Always
+pass `stand_onboard` as `--standdir` and `parkour_onboard_preview_stair` as
+`--logdir`; never point both arguments at one directory. The `data&model`
+bundle is intentionally local-only and is not committed to this repository.
 
 The robot-tested `instinct_onboard` source is vendored directly under
 `external/instinct_onboard`. It includes the joystick emergency-stop diagnostics,
