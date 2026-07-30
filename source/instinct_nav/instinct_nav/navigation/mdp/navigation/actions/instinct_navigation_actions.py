@@ -7,7 +7,7 @@ import torch
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers.action_manager import ActionTerm
 
-from .instinct_frozen_backend import InstinctFrozenPolicyBackend
+from .instinct_frozen_backend import InstinctFrozenPolicyBackend, OfficialOnnxFrozenPolicyBackend
 
 if TYPE_CHECKING:
     from .instinct_navigation_actions_cfg import InstinctFrozenNavigationSE2ActionCfg
@@ -37,13 +37,26 @@ class InstinctFrozenNavigationSE2Action(ActionTerm):
         self._policy_scaling = torch.tensor(self.cfg.policy_scaling, device=self.device).repeat(self.num_envs, 1)
         self._policy_bias = torch.zeros(self.num_envs, self._action_dim, device=self.device)
         self._counter = 0
-        self._backend = InstinctFrozenPolicyBackend(
-            self.num_envs,
-            self.low_level_position_action_term.action_dim,
-            self.device,
-            checkpoint_path=self.cfg.checkpoint_path,
-            instinct_rl_root=self.cfg.instinct_rl_root,
-        )
+        if self.cfg.backend_type == "checkpoint":
+            self._backend = InstinctFrozenPolicyBackend(
+                self.num_envs,
+                self.low_level_position_action_term.action_dim,
+                self.device,
+                checkpoint_path=self.cfg.checkpoint_path,
+                instinct_rl_root=self.cfg.instinct_rl_root,
+            )
+        elif self.cfg.backend_type == "official_onnx":
+            if not self.cfg.actor_onnx_path or not self.cfg.depth_encoder_onnx_path:
+                raise ValueError("official_onnx backend requires actor_onnx_path and depth_encoder_onnx_path")
+            self._backend = OfficialOnnxFrozenPolicyBackend(
+                self.num_envs,
+                self.low_level_position_action_term.action_dim,
+                self.device,
+                actor_onnx_path=self.cfg.actor_onnx_path,
+                depth_encoder_onnx_path=self.cfg.depth_encoder_onnx_path,
+            )
+        else:
+            raise ValueError(f"Unknown Instinct frozen backend_type: {self.cfg.backend_type!r}")
 
     @property
     def action_dim(self) -> int:

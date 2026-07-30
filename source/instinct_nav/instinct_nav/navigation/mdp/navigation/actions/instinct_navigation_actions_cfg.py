@@ -31,3 +31,6 @@ class InstinctFrozenNavigationSE2ActionCfg(ActionTermCfg):
         str(_PROJECT_ROOT / "artifacts" / "low_level" / "g1_parkour" / "model_30000.pt"),
     )
     instinct_rl_root: str | None = os.environ.get("SRU_INSTINCT_RL_ROOT", str(_PROJECT_ROOT / "external" / "instinct_rl"))
+    backend_type: str = "checkpoint"
+    actor_onnx_path: str | None = None
+    depth_encoder_onnx_path: str | None = None

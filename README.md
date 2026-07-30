@@ -1574,6 +1574,14 @@ python deploy/scripts/g1_nav_onboard_onnx.py \
 
 ## 2026-07-30 训练匹配低层策略真机命令
 
+> **已停用，禁止真机执行本节命令。**
+>
+> 2026-07-30 MuJoCo 对照发现，`artifacts/low_level/g1_parkour` 在零速度命令下
+> 仍会产生明显后退和大姿态摆动，在 `vx=0.2 m/s` 时反向运动并跌倒。ONNX
+> 与 checkpoint 数值匹配只能证明导出正确，不能证明策略本身可部署。当前完整
+> SRU sim2sim 和后续真机测试必须使用已验证稳定的官方
+> `data&model/checkpoints/parkour_onboard_preview_stair` 底层。
+
 本节覆盖上一节的 parkour 低层选择。数值检查确认，高层 SRU 训练使用的
 `artifacts/low_level/g1_parkour/model_30000.pt` 与仓库内导出的低层 ONNX
 一致：
@@ -1647,3 +1655,118 @@ ros2 topic pub --once /instinct_nav/world_goal_point geometry_msgs/msg/PointStam
 
 `R1` 返回 stand 并锁存暂停，后续持续目标消息不会再次启动 parkour；需要重启
 onboard 节点才能重新启用自主导航。`R2` 或 `L2` 触发急停并退出。
+
+## 2026-07-30 MuJoCo SRU 完整导航 Sim2Sim
+
+完整闭环使用以下频率和数据流：
+
+```text
+MuJoCo 200 Hz -> 动态深度相机 60 Hz -> SRU 5 Hz
+              -> 官方 parkour 50 Hz -> 29 维关节 PD
+```
+
+默认目标是 MuJoCo 世界坐标系中的 `(2.0, 0.0, 0.0)`，到达阈值为 `0.5 m`。
+底层默认使用已验证稳定的官方 `parkour_onboard_preview_stair`，不要替换为
+`artifacts/low_level/g1_parkour`。
+
+### Headless 验证
+
+```bash
+cd /workspace/instinct_nav
+
+/workspace/instinctlab51-env/bin/python \
+  deploy/mujoco/g1_sru_navigation_sim2sim.py \
+  --goal 2.0 0.0 0.0 \
+  --duration 20 \
+  --json_out artifacts/mujoco/sru_navigation_2m.json
+```
+
+### 实时可视化
+
+在远程桌面终端中执行：
+
+```bash
+cd /workspace/instinct_nav
+
+/workspace/instinctlab51-env/bin/python \
+  deploy/mujoco/g1_sru_navigation_sim2sim.py \
+  --goal 2.0 0.0 0.0 \
+  --duration 20 \
+  --viewer \
+  --json_out artifacts/mujoco/sru_navigation_2m_viewer.json
+```
+
+可通过 `--goal X Y Z` 修改世界坐标目标，通过
+`--high_command_limit 0.3 0.2 0.4` 修改高层速度限幅。默认高层 ONNX、
+深度编码器和 manifest 均读取 `artifacts/high_level/sru_scene_token/`。
+
+当前平地验证结果：
+
+```text
+goal=(2.0, 0.0): 4.13 s 到达，未跌倒，最终距离 0.498 m
+goal=(2.0, 1.0): 4.31 s 到达，未跌倒，最终距离 0.499 m
+```
+
+已知现象：当前 SRU 的 `vy` 在上述测试中持续达到 `-0.2 m/s` 限幅，主要依靠
+偏航转向完成目标跟踪。这与 IsaacLab 和实机 dry-run 的横向动作偏置一致，
+后续加入障碍物前必须继续分析，不能据此恢复真机自主导航。
+
+
+## 2026-07-30 基于 Hiking Parkour 低层重新训练 SRU
+
+当前正式训练改用 `artifacts/low_level/g1_parkour_hiking/model_30000.pt`。该 checkpoint 与旧低层及官方 `parkour_onboard_preview_stair` 均不同。本任务冻结 Hiking Parkour 的完整 MoE checkpoint，只重新训练上层 SRU：
+
+```text
+Hiking 低层 checkpoint:
+artifacts/low_level/g1_parkour_hiking/model_30000.pt
+
+checkpoint SHA256:
+7cba14628b1c8fbca1ded875123b162e9f18fd1ac63207910e53511cde88df65
+
+训练任务:
+Instinct-Nav-G1-SRU-SceneTokenRiskNoGoal-SharedLowCam-Query-v0
+```
+
+训练时 checkpoint 会恢复原始 `EncoderMoEActorCritic`，在 GPU 上对所有 Isaac 环境批量推理；所有低层参数均冻结。高层保持 2960 维 actor observation、3 维导航动作、512 维 SRU 和 `64 x 6` scene tokens。该任务默认从零训练高层，不要使用旧 SRU checkpoint 续训。
+
+### 单轮 Smoke Test
+
+```bash
+cd /workspace/instinct_nav
+
+/workspace/instinctlab51-env/bin/python /workspace/instinct_nav/_launcher.py train \
+  --task Instinct-Nav-G1-SRU-SceneTokenRiskNoGoal-SharedLowCam-Query-Dev-v0 \
+  --num_envs 32 \
+  --max_iterations 1 \
+  --seed 72 \
+  --run_name g1_sru_scene_token_risk_no_goal_shared_lowcam_policy_swap_smoke \
+  --wandb \
+  --wandb_entity qqfqqf0612-wuhan-university \
+  --wandb_project instinct_nav \
+  --headless
+```
+
+已验证该命令可完成一次 PPO 更新并生成 `model_0.pt`。
+
+### 正式训练
+
+```bash
+cd /workspace/instinct_nav
+
+/workspace/instinctlab51-env/bin/python /workspace/instinct_nav/_launcher.py train \
+  --task Instinct-Nav-G1-SRU-SceneTokenRiskNoGoal-SharedLowCam-Query-v0 \
+  --num_envs 4096 \
+  --max_iterations 3000 \
+  --seed 72 \
+  --run_name g1_sru_scene_token_risk_no_goal_shared_lowcam_query_v1 \
+  --wandb \
+  --wandb_entity qqfqqf0612-wuhan-university \
+  --wandb_project instinct_nav \
+  --headless
+```
+
+训练产物位于：
+
+```text
+logs/rsl_rl/g1_instinct_navigation_ppo_vismap/
+```

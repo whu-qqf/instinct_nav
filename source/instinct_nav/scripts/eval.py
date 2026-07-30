@@ -3356,6 +3356,69 @@ class EvalDebugDumper:
         with self.index_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
+
+class EvalActionStats:
+    """Accumulate batched policy action statistics for simulation/deployment comparison."""
+
+    def __init__(self):
+        self._raw_chunks: list[np.ndarray] = []
+        self._goal_chunks: list[np.ndarray] = []
+
+    def update(self, obs: torch.Tensor, actions: torch.Tensor) -> None:
+        raw = actions.detach().cpu().numpy().astype(np.float32, copy=False)
+        self._raw_chunks.append(raw[:, :3].copy())
+        if obs.shape[1] >= 16:
+            self._goal_chunks.append(obs[:, 12:16].detach().cpu().numpy().astype(np.float32, copy=True))
+
+    def summarize(self) -> dict[str, object]:
+        if not self._raw_chunks:
+            return {"samples": 0}
+        raw = np.concatenate(self._raw_chunks, axis=0)
+        processed = np.tanh(raw)
+        names = ("vx", "vy", "wz")
+
+        def summarize_array(values: np.ndarray) -> dict[str, object]:
+            return {
+                "mean": dict(zip(names, np.mean(values, axis=0).astype(float).tolist())),
+                "std": dict(zip(names, np.std(values, axis=0).astype(float).tolist())),
+                "min": dict(zip(names, np.min(values, axis=0).astype(float).tolist())),
+                "p01": dict(zip(names, np.quantile(values, 0.01, axis=0).astype(float).tolist())),
+                "p05": dict(zip(names, np.quantile(values, 0.05, axis=0).astype(float).tolist())),
+                "p50": dict(zip(names, np.quantile(values, 0.50, axis=0).astype(float).tolist())),
+                "p95": dict(zip(names, np.quantile(values, 0.95, axis=0).astype(float).tolist())),
+                "p99": dict(zip(names, np.quantile(values, 0.99, axis=0).astype(float).tolist())),
+                "max": dict(zip(names, np.max(values, axis=0).astype(float).tolist())),
+                "negative_rate": dict(zip(names, np.mean(values < 0.0, axis=0).astype(float).tolist())),
+                "positive_rate": dict(zip(names, np.mean(values > 0.0, axis=0).astype(float).tolist())),
+            }
+
+        summary = {
+            "samples": int(raw.shape[0]),
+            "raw": summarize_array(raw),
+            "tanh": summarize_array(processed),
+            "tanh_saturation_rate_abs_ge_0_95": dict(
+                zip(names, np.mean(np.abs(processed) >= 0.95, axis=0).astype(float).tolist())
+            ),
+            "tanh_saturation_rate_abs_ge_0_99": dict(
+                zip(names, np.mean(np.abs(processed) >= 0.99, axis=0).astype(float).tolist())
+            ),
+        }
+        if self._goal_chunks:
+            goal = np.concatenate(self._goal_chunks, axis=0)
+            goal_xy = goal[:, :2]
+            for action_index, action_name in enumerate(names[:2]):
+                for goal_index, goal_name in enumerate(("goal_x", "goal_y")):
+                    summary[f"correlation_{action_name}_{goal_name}"] = float(
+                        np.corrcoef(processed[:, action_index], goal_xy[:, goal_index])[0, 1]
+                    )
+            goal_y_sign = np.sign(goal_xy[:, 1])
+            action_y_sign = np.sign(processed[:, 1])
+            nonzero_goal_y = np.abs(goal_xy[:, 1]) > 1.0e-3
+            summary["vy_goal_y_sign_agreement_rate"] = float(
+                np.mean(action_y_sign[nonzero_goal_y] == goal_y_sign[nonzero_goal_y])
+            )
+        return summary
+
 def _load_inference_policy_for_env(env, agent_cfg: RslRlOnPolicyRunnerCfg, checkpoint_path: str):
     checkpoint_path = os.path.abspath(os.path.expanduser(checkpoint_path))
     policy = try_load_torchscript_policy(checkpoint_path, "cpu")
@@ -3494,6 +3557,7 @@ def _run_eval_pass(
         save_arrays=not args_cli.debug_dump_stats_only,
         label=label,
     )
+    action_stats = EvalActionStats()
 
     goal_term = env.unwrapped.command_manager._terms["robot_goal"]
     success_tracker = goal_term.success_tracker
@@ -3602,6 +3666,7 @@ def _run_eval_pass(
                 reset_policy_state = False
             else:
                 actions = policy(obs)
+            action_stats.update(obs, actions)
             debug_dumper.maybe_dump(env, obs, actions)
             obs, _, dones, _ = env.step(actions)
 
@@ -3747,6 +3812,7 @@ def _run_eval_pass(
         "episodes": total_episodes,
         "successes": total_successes,
         "success_rate": summarize_rates(total_successes, total_episodes),
+        "action_stats": action_stats.summarize(),
         "termination_rates": {
             term_name: {"count": count, "rate": summarize_rates(count, total_episodes)}
             for term_name, count in termination_counts.items()
@@ -4094,6 +4160,7 @@ def main():
         save_arrays=not args_cli.debug_dump_stats_only,
         label="primary",
     )
+    action_stats = EvalActionStats()
 
     print(
         f"[INFO] Starting evaluation: task={args_cli.task}, num_envs={env.unwrapped.num_envs}, "
@@ -4117,6 +4184,7 @@ def main():
             else:
                 actions = policy(obs)
 
+            action_stats.update(obs, actions)
             debug_dumper.maybe_dump(env, obs, actions)
             obs, _, dones, _ = env.step(actions)
 
@@ -4302,6 +4370,7 @@ def main():
         "episodes": total_episodes,
         "successes": total_successes,
         "success_rate": summarize_rates(total_successes, total_episodes),
+        "action_stats": action_stats.summarize(),
         "termination_rates": {
             term_name: {
                 "count": count,

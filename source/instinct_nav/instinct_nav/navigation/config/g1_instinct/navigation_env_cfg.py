@@ -27,6 +27,16 @@ INSTINCT_G1_CHECKPOINT = os.environ.get(
     str(_PROJECT_ROOT / "artifacts" / "low_level" / "g1_parkour" / "model_30000.pt"),
 )
 INSTINCT_RL_ROOT = os.environ.get("SRU_INSTINCT_RL_ROOT", str(_PROJECT_ROOT / "external" / "instinct_rl"))
+HIKING_PARKOUR_CHECKPOINT = os.environ.get(
+    "SRU_G1_HIKING_PARKOUR_CHECKPOINT",
+    str(_PROJECT_ROOT / "artifacts" / "low_level" / "g1_parkour_hiking" / "model_30000.pt"),
+)
+OFFICIAL_PARKOUR_DIR = Path(os.environ.get(
+    "SRU_G1_OFFICIAL_PARKOUR_DIR",
+    str(_PROJECT_ROOT / "data&model" / "checkpoints" / "parkour_onboard_preview_stair"),
+))
+OFFICIAL_PARKOUR_ACTOR_ONNX = str(OFFICIAL_PARKOUR_DIR / "exported" / "actor.onnx")
+OFFICIAL_PARKOUR_DEPTH_ONNX = str(OFFICIAL_PARKOUR_DIR / "exported" / "0-depth_encoder.onnx")
 
 
 
@@ -448,6 +458,12 @@ class G1InstinctNavigationEnvCfg_SCENE_TOKEN_RISK_NOGOAL_SHARED_LOWCAM(
         # inherited SRU raycast camera avoids creating a second camera stream.
         self.scene.raycast_camera = None
 
+        # Keep the established SRU task unchanged; only replace its frozen low-level policy.
+        self.actions.velocity_command.backend_type = "checkpoint"
+        self.actions.velocity_command.checkpoint_path = HIKING_PARKOUR_CHECKPOINT
+        self.actions.velocity_command.actor_onnx_path = None
+        self.actions.velocity_command.depth_encoder_onnx_path = None
+
 
 @configclass
 class G1InstinctNavigationEnvCfg_SCENE_TOKEN_RISK_NOGOAL_SHARED_LOWCAM_DEV(
@@ -475,3 +491,42 @@ class G1InstinctNavigationEnvCfg_SCENE_TOKEN_RISK_NOGOAL_SHARED_LOWCAM_PLAY(
         self.events.base_external_force_torque = None
         self.events.push_robot = None
 
+@configclass
+class G1InstinctNavigationEnvCfg_SCENE_TOKEN_RISK_NOGOAL_SHARED_LOWCAM_OFFICIAL(
+    G1InstinctNavigationEnvCfg_SCENE_TOKEN_RISK_NOGOAL_SHARED_LOWCAM
+):
+    """Final scene-token task using the official stable parkour ONNX policy pair."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        action = self.actions.velocity_command
+        action.backend_type = "official_onnx"
+        action.actor_onnx_path = OFFICIAL_PARKOUR_ACTOR_ONNX
+        action.depth_encoder_onnx_path = OFFICIAL_PARKOUR_DEPTH_ONNX
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_SCENE_TOKEN_RISK_NOGOAL_SHARED_LOWCAM_OFFICIAL_DEV(
+    G1InstinctNavigationEnvCfg_SCENE_TOKEN_RISK_NOGOAL_SHARED_LOWCAM_OFFICIAL
+):
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.num_envs = 32
+        self.scene.terrain.terrain_generator.num_rows = 2
+        self.scene.terrain.terrain_generator.num_cols = 8
+        self.scene.terrain.max_init_terrain_level = 0
+        self.scene.terrain.terrain_generator.difficulty_range = [0.0, 0.0]
+        self.scene.terrain.terrain_generator.curriculum = False
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_SCENE_TOKEN_RISK_NOGOAL_SHARED_LOWCAM_OFFICIAL_PLAY(
+    G1InstinctNavigationEnvCfg_SCENE_TOKEN_RISK_NOGOAL_SHARED_LOWCAM_OFFICIAL
+):
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.num_envs = 20
+        self.scene.env_spacing = 2.5
+        self.observations.policy.enable_corruption = False
+        self.events.base_external_force_torque = None
+        self.events.push_robot = None

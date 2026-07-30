@@ -293,8 +293,13 @@ def _cfg_summary(env_cfg, agent_cfg) -> dict:
         },
         "action": {
             "class_type": str(_safe_attr(action_cfg, "class_type")),
+            "backend_type": _safe_attr(action_cfg, "backend_type"),
             "checkpoint_path": _safe_attr(action_cfg, "checkpoint_path"),
             "checkpoint_sha256": _sha256(_safe_attr(action_cfg, "checkpoint_path")),
+            "actor_onnx_path": _safe_attr(action_cfg, "actor_onnx_path"),
+            "actor_onnx_sha256": _sha256(_safe_attr(action_cfg, "actor_onnx_path")),
+            "depth_encoder_onnx_path": _safe_attr(action_cfg, "depth_encoder_onnx_path"),
+            "depth_encoder_onnx_sha256": _sha256(_safe_attr(action_cfg, "depth_encoder_onnx_path")),
             "instinct_rl_root": _safe_attr(action_cfg, "instinct_rl_root"),
             "low_level_decimation": _safe_attr(action_cfg, "low_level_decimation"),
             "policy_scaling": _safe_attr(action_cfg, "policy_scaling"),

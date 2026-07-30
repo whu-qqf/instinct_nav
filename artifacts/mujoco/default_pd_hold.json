@@ -1,0 +1,24 @@
+{
+  "duration_s": 1.2049999999999963,
+  "command": [
+    0.0,
+    0.0,
+    0.0
+  ],
+  "policy_enabled": false,
+  "fell": true,
+  "initial_action": null,
+  "initial_action_abs_max": null,
+  "final_position": [
+    0.6799253202435318,
+    2.2106904803608354e-05,
+    0.5477936494356056
+  ],
+  "height_min": 0.5477936494356056,
+  "height_final": 0.5477936494356056,
+  "tilt_deg_max": 61.24739780387646,
+  "tilt_deg_final": 61.24739780387646,
+  "max_abs_joint_velocity": 5.254906888169355,
+  "max_abs_torque": 44.498075778844964,
+  "samples": 61
+}
