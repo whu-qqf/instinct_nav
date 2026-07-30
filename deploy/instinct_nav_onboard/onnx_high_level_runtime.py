@@ -238,7 +238,10 @@ class OnnxHighLevelRuntime:
     def _action_to_command(self, action: np.ndarray, timestamp_s: float) -> VelocityCommand:
         mins = np.asarray(self.cfg.command_min, dtype=np.float32)
         maxs = np.asarray(self.cfg.command_max, dtype=np.float32)
-        command = np.clip(action.astype(np.float32), mins, maxs)
+        # Training uses a Gaussian policy and applies tanh in the navigation
+        # action term before writing the low-level velocity command. Keep the
+        # raw action in last_action, but mirror that command transform here.
+        command = np.clip(np.tanh(action.astype(np.float32)), mins, maxs)
         return VelocityCommand(float(command[0]), float(command[1]), float(command[2]), timestamp_s=timestamp_s)
 
     def _maybe_dump(self, packet, encoded_depth, filtered_depth, scene_tokens, actor_obs, raw_action, command) -> None:

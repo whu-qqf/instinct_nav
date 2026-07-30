@@ -13,9 +13,11 @@ from instinct_nav_onboard.bridges import SensorSource
 from instinct_nav_onboard.config import OnboardConfig
 from instinct_nav_onboard.onnx_high_level_runtime import OnnxDebugDumpConfig, OnnxHighLevelRuntime
 from instinct_nav_onboard.packets import SensorPacket
+from instinct_nav_onboard.safety import FallSafetyMonitor, PersistentSafetyLogger, projected_gravity_tilt_deg
 
 from instinct_onboard.agents.base import AgentStatus, ColdStartAgent
 from instinct_onboard.agents.parkour_agent import ParkourAgent, ParkourStandAgent
+from instinct_onboard.joystick import UnitreeJoyStick
 from instinct_onboard.ros_nodes.realsense import RealsenseMPCamera
 from instinct_onboard.ros_nodes.unitree import UnitreeNode
 
@@ -71,6 +73,7 @@ class G1NavOnboardOnnxNode(RealsenseMPCamera, UnitreeNode):
         autonomous_command_timeout_s: float = 0.5,
         camera_frame_timeout_s: float = 0.25,
         auto_start_parkour: bool = False,
+        joystick_topic: str = "/wirelesscontroller",
         goal_pose_topic: str = "/instinct_nav/goal_pose",
         goal_reached_threshold: float = 0.5,
         odom_topic: str = "/dog_odom",
@@ -82,11 +85,16 @@ class G1NavOnboardOnnxNode(RealsenseMPCamera, UnitreeNode):
         command_deadband: tuple[float, float, float] = (0.02, 0.02, 0.02),
         command_slew_rate: tuple[float, float, float] = (0.4, 0.3, 0.6),
         command_lowpass_alpha: float = 0.5,
+        fall_tilt_threshold_deg: float = 55.0,
+        fall_tilt_duration_s: float = 0.15,
+        safety_log_dir: str | None = None,
+        safety_telemetry_hz: float = 10.0,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self.available_agents = {}
         self.current_agent_name: str | None = None
+        self._joystick = UnitreeJoyStick(self, joy_stick_topic=joystick_topic)
         self.base_velocity_cmd = np.zeros(3, dtype=np.float32)
         self.nav_goal_b = np.asarray([1.0, 0.0, 0.0, np.log1p(2.0)], dtype=np.float32)
         self.nav_reset_requested = False
@@ -121,6 +129,23 @@ class G1NavOnboardOnnxNode(RealsenseMPCamera, UnitreeNode):
         self._command_deadband = np.asarray(command_deadband, dtype=np.float32)
         self._command_slew_rate = np.asarray(command_slew_rate, dtype=np.float32)
         self._command_lowpass_alpha = float(np.clip(command_lowpass_alpha, 0.0, 1.0))
+        self._fall_monitor = FallSafetyMonitor(
+            threshold_deg=fall_tilt_threshold_deg,
+            duration_s=fall_tilt_duration_s,
+        )
+        self._fall_shutdown_triggered = False
+        self._safety_telemetry_period_s = 1.0 / max(float(safety_telemetry_hz), 1.0)
+        self._next_safety_telemetry_time_s = 0.0
+        self._safety_logger = PersistentSafetyLogger(safety_log_dir) if safety_log_dir is not None else None
+        if self._safety_logger is not None:
+            self.get_logger().info(f"Persistent safety log enabled: {self._safety_logger.path}")
+            self._write_safety_event(
+                "node_initialized",
+                critical=True,
+                dryrun=bool(self.dryrun),
+                fall_tilt_threshold_deg=self._fall_monitor.threshold_deg,
+                fall_tilt_duration_s=self._fall_monitor.duration_s,
+            )
 
         debug_cfg = None
         if debug_dump_dir is not None:
@@ -148,8 +173,27 @@ class G1NavOnboardOnnxNode(RealsenseMPCamera, UnitreeNode):
     def register_agent(self, name: str, agent) -> None:
         self.available_agents[name] = agent
 
+    def check_buffers_ready(self) -> bool:
+        if not super().check_buffers_ready():
+            return False
+        return self._joystick.data.ly is not None
+
     def start_ros_handlers(self):
         super().start_ros_handlers()
+        projected_gravity = self._get_projected_gravity_obs()
+        preflight_ok, tilt_deg = self._fall_monitor.preflight_ok(projected_gravity)
+        if not preflight_ok:
+            self._trigger_fall_shutdown(
+                reason="startup torso attitude is unsafe or IMU gravity is invalid",
+                tilt_deg=tilt_deg,
+                projected_gravity=projected_gravity,
+            )
+        self._write_safety_event(
+            "attitude_preflight_passed",
+            critical=True,
+            tilt_deg=tilt_deg,
+            projected_gravity_b=projected_gravity,
+        )
         from geometry_msgs.msg import PoseStamped
         from nav_msgs.msg import Odometry
         from sensor_msgs.msg import JointState
@@ -178,18 +222,33 @@ class G1NavOnboardOnnxNode(RealsenseMPCamera, UnitreeNode):
 
     def main_loop_callback(self):
         start_time = time.time()
+        now_monotonic = time.monotonic()
+        self._check_fall_safety(now_monotonic)
+        self._maybe_write_safety_telemetry(now_monotonic)
         if self.current_agent_name is None:
+            if self.dryrun and self._auto_start_parkour:
+                self.get_logger().info("Dry-run auto-start enabled; starting parkour without cold start.")
+                self._auto_start_parkour = False
+                self.current_agent_name = "parkour"
+                self.available_agents[self.current_agent_name].reset()
+                self.nav_reset_requested = True
+                return
             self.get_logger().info("Starting cold start agent automatically.")
             self.current_agent_name = "cold_start"
             self.available_agents[self.current_agent_name].reset()
+            self._write_safety_event("agent_transition", from_agent=None, to_agent="cold_start")
             return
         if self.current_agent_name == "cold_start":
             tjs, status = self.available_agents[self.current_agent_name].step()
             self.send_target_joint_state(tjs)
             if status != AgentStatus.Working:
                 self.get_logger().info("ColdStartAgent done; switching to stand agent.", throttle_duration_sec=2.0)
+                previous_agent = self.current_agent_name
                 self.current_agent_name = "stand" if "stand" in self.available_agents else "parkour"
                 self.available_agents[self.current_agent_name].reset()
+                self._write_safety_event(
+                    "agent_transition", from_agent=previous_agent, to_agent=self.current_agent_name
+                )
         elif self.current_agent_name == "stand":
             tjs, _ = self.available_agents[self.current_agent_name].step()
             self.refresh_camera_data()
@@ -199,9 +258,26 @@ class G1NavOnboardOnnxNode(RealsenseMPCamera, UnitreeNode):
             elif self._auto_start_parkour or self._goal_start_requested:
                 reason = "auto_start_parkour enabled" if self._auto_start_parkour else "navigation goal received"
                 self.get_logger().info(f"{reason}; switching to parkour agent.", once=True)
+                self._auto_start_parkour = False
+                previous_agent = self.current_agent_name
                 self.current_agent_name = "parkour"
                 self.available_agents[self.current_agent_name].reset()
+                self._write_safety_event(
+                    "agent_transition", from_agent=previous_agent, to_agent="parkour", reason=reason
+                )
         elif self.current_agent_name == "parkour":
+            if self._joystick.data.R1:
+                self.get_logger().warn("R1 pressed; stopping autonomous navigation and switching to stand.")
+                self._zero_autonomous_command()
+                self.sru_runtime.reset()
+                self._goal_start_requested = False
+                previous_agent = self.current_agent_name
+                self.current_agent_name = "stand"
+                self.available_agents[self.current_agent_name].reset()
+                self._write_safety_event(
+                    "agent_transition", critical=True, from_agent=previous_agent, to_agent="stand", reason="R1"
+                )
+                return
             self._update_sru_velocity_command_if_due()
             tjs, _ = self.available_agents[self.current_agent_name].step()
             self.send_target_joint_state(tjs)
@@ -251,7 +327,7 @@ class G1NavOnboardOnnxNode(RealsenseMPCamera, UnitreeNode):
         mode = self._odom_twist_frame
         if mode == "auto":
             child_frame = (msg.child_frame_id or "").strip("/")
-            mode = "body" if child_frame in {"base_link", "base", "body", "torso_link"} else "world"
+            mode = "body" if child_frame in {"base_link", "base", "body", "torso_link", "robot_center"} else "world"
         if mode == "body":
             self.base_lin_vel_b = vel
             return
@@ -313,6 +389,7 @@ class G1NavOnboardOnnxNode(RealsenseMPCamera, UnitreeNode):
         self.sru_runtime.reset()
         self._goal_start_requested = False
         self.nav_reset_requested = True
+        self._write_safety_event("autonomy_fault_latched", critical=True, reason=reason)
         if "stand" in self.available_agents and self.current_agent_name != "stand":
             self.current_agent_name = "stand"
             self.available_agents[self.current_agent_name].reset()
@@ -345,17 +422,119 @@ class G1NavOnboardOnnxNode(RealsenseMPCamera, UnitreeNode):
             self.sru_runtime.reset()
             if self.current_agent_name == "parkour" and "stand" in self.available_agents:
                 self.get_logger().info("Navigation goal reached; switching back to stand agent.")
+                previous_agent = self.current_agent_name
                 self.current_agent_name = "stand"
                 self.available_agents[self.current_agent_name].reset()
+                self._write_safety_event(
+                    "agent_transition", from_agent=previous_agent, to_agent="stand", reason="goal_reached"
+                )
         else:
             direction = goal_xyz / max(distance, 1.0e-6)
             goal_b = np.asarray([direction[0], direction[1], direction[2], np.log1p(distance)], dtype=np.float32)
             self._goal_start_requested = True
         self.set_nav_goal_body(goal_b)
+        self._write_safety_event(
+            "body_goal_updated",
+            critical=False,
+            goal_xyz_b=goal_xyz,
+            goal_b=goal_b,
+            goal_start_requested=bool(self._goal_start_requested),
+        )
         self.get_logger().info(
             f"Updated SRU goal from {self._goal_pose_topic}: xyz_b=({goal_xyz[0]:+.2f}, {goal_xyz[1]:+.2f}, {goal_xyz[2]:+.2f}) m, "
             f"goal_b=({goal_b[0]:+.3f}, {goal_b[1]:+.3f}, {goal_b[2]:+.3f}, {goal_b[3]:+.3f})."
         )
+
+    def _check_fall_safety(self, now_monotonic_s: float) -> None:
+        projected_gravity = self._get_projected_gravity_obs()
+        triggered, tilt_deg = self._fall_monitor.update(projected_gravity, now_monotonic_s)
+        if triggered:
+            self._trigger_fall_shutdown(
+                reason="sustained torso tilt exceeded fall threshold or IMU gravity became invalid",
+                tilt_deg=tilt_deg,
+                projected_gravity=projected_gravity,
+            )
+
+    def _trigger_fall_shutdown(self, *, reason: str, tilt_deg: float, projected_gravity: np.ndarray) -> None:
+        if self._fall_shutdown_triggered:
+            raise SystemExit("Fall safety shutdown already triggered.")
+        self._fall_shutdown_triggered = True
+        self._zero_autonomous_command()
+        try:
+            self._write_safety_event(
+                "fall_safety_shutdown",
+                critical=True,
+                reason=reason,
+                tilt_deg=float(tilt_deg),
+                projected_gravity_b=np.asarray(projected_gravity, dtype=np.float32),
+                agent=self.current_agent_name,
+                joint_pos=self.joint_pos_.copy(),
+                joint_vel=self.joint_vel_.copy(),
+            )
+            self.get_logger().fatal(
+                f"Fall safety shutdown: {reason}; torso tilt={tilt_deg:.1f} deg. Turning motors off."
+            )
+        finally:
+            # Motor-off must not be skipped even if persistent logging or ROS
+            # logging itself fails while handling the incident.
+            self._turn_off_motors()
+        raise SystemExit("Fall safety shutdown triggered.")
+
+    def _maybe_write_safety_telemetry(self, now_monotonic_s: float) -> None:
+        if self._safety_logger is None or now_monotonic_s < self._next_safety_telemetry_time_s:
+            return
+        self._next_safety_telemetry_time_s = now_monotonic_s + self._safety_telemetry_period_s
+        projected_gravity = self._get_projected_gravity_obs()
+        odom_age_s = None
+        if self._last_odom_timestamp_s > 0.0:
+            odom_age_s = max(0.0, now_monotonic_s - self._last_odom_timestamp_s)
+        depth_header = getattr(self, "_depth_header", None)
+        depth_frame_counter = int(getattr(depth_header, "frame_counter", 0)) if depth_header is not None else 0
+        last_target_position = None
+        if self.last_sent_target_joint_state is not None:
+            last_target_position = self.last_sent_target_joint_state.position.copy()
+        self._write_safety_event(
+            "telemetry",
+            critical=False,
+            agent=self.current_agent_name,
+            tilt_deg=float(projected_gravity_tilt_deg(projected_gravity)),
+            projected_gravity_b=projected_gravity,
+            base_ang_vel_b=self._get_base_ang_vel_obs(),
+            base_lin_vel_b=self.base_lin_vel_b,
+            base_velocity_cmd=self.base_velocity_cmd,
+            raw_high_level_action=self.sru_runtime.last_action.copy(),
+            nav_goal_b=self.nav_goal_b,
+            joint_pos=self.joint_pos_.copy(),
+            joint_vel=self.joint_vel_.copy(),
+            last_target_joint_pos=last_target_position,
+            max_abs_joint_vel=float(np.max(np.abs(self.joint_vel_))),
+            torque_clip_event_count=int(self.torque_clip_event_count),
+            last_torque_clip_joint_count=int(self.last_torque_clip_joint_count),
+            last_torque_clip_max_position_delta=float(self.last_torque_clip_max_position_delta),
+            odom_age_s=odom_age_s,
+            depth_frame_counter=depth_frame_counter,
+            autonomy_fault_latched=bool(self._autonomy_fault_latched),
+        )
+
+    def _write_safety_event(self, event: str, *, critical: bool = False, **fields) -> None:
+        if self._safety_logger is None:
+            return
+        try:
+            self._safety_logger.write(event, critical=critical, **fields)
+        except Exception as exc:
+            self.get_logger().error(f"Failed to write persistent safety event {event!r}: {exc}")
+
+    def destroy_node(self):
+        if self._safety_logger is not None:
+            self._write_safety_event("node_destroy", critical=True, agent=self.current_agent_name)
+        try:
+            super().destroy_node()
+        finally:
+            if self._safety_logger is not None:
+                try:
+                    self._safety_logger.close()
+                except Exception as exc:
+                    self.get_logger().error(f"Failed to close persistent safety log: {exc}")
 
 
 def _rotate_world_to_body(vec_w: np.ndarray, quat_xyzw: np.ndarray) -> np.ndarray:
@@ -387,6 +566,8 @@ def _rotate_world_to_body(vec_w: np.ndarray, quat_xyzw: np.ndarray) -> np.ndarra
 
 
 def main(args: argparse.Namespace) -> None:
+    if args.nodryrun and (args.safety_log_dir is None or not args.safety_log_dir.strip()):
+        raise ValueError("--safety_log_dir is required with --nodryrun so incident telemetry survives process exit")
     rclpy.init()
     node = G1NavOnboardOnnxNode(
         depth_resolution=(480, 270),
@@ -404,6 +585,7 @@ def main(args: argparse.Namespace) -> None:
         sru_high_level_hz=args.sru_high_level_hz,
         camera_frame_timeout_s=args.camera_frame_timeout_s,
         auto_start_parkour=args.auto_start_parkour,
+        joystick_topic=args.joystick_topic,
         goal_pose_topic=args.goal_pose_topic,
         goal_reached_threshold=args.goal_reached_threshold,
         odom_topic=args.odom_topic,
@@ -415,6 +597,10 @@ def main(args: argparse.Namespace) -> None:
         command_deadband=tuple(args.command_deadband),
         command_slew_rate=tuple(args.command_slew_rate),
         command_lowpass_alpha=args.command_lowpass_alpha,
+        fall_tilt_threshold_deg=args.fall_tilt_threshold_deg,
+        fall_tilt_duration_s=args.fall_tilt_duration_s,
+        safety_log_dir=args.safety_log_dir,
+        safety_telemetry_hz=args.safety_telemetry_hz,
     )
     parkour_agent = ParkourAgent(logdir=args.logdir, ros_node=node, depth_vis=args.depth_vis, pointcloud_vis=args.pointcloud_vis)
     node.register_agent("parkour", parkour_agent)
@@ -431,9 +617,14 @@ def main(args: argparse.Namespace) -> None:
     node.register_agent("cold_start", cold_start_agent)
     if args.depth_vis or args.pointcloud_vis:
         node.publish_auxiliary_static_transforms("camera_depth_link_transform")
-    node.start_ros_handlers()
-    node.get_logger().info("G1NavOnboardOnnxNode is ready to run.")
     try:
+        # start_ros_handlers() spins while waiting for the initial low-state,
+        # IMU and joystick samples.  A joystick emergency stop can therefore
+        # raise SystemExit here, before the regular rclpy.spin() begins.  Keep
+        # startup inside this try/finally so the camera subprocess and shared
+        # memory are released on that path as well.
+        node.start_ros_handlers()
+        node.get_logger().info("G1NavOnboardOnnxNode is ready to run.")
         rclpy.spin(node)
     except KeyboardInterrupt:
         print("Keyboard interrupt received, shutting down...")
@@ -463,6 +654,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pointcloud_vis", action="store_true", default=False)
     parser.add_argument("--nodryrun", action="store_true", default=False)
     parser.add_argument("--auto_start_parkour", action="store_true", default=False)
+    parser.add_argument("--joystick_topic", type=str, default="/wirelesscontroller")
     parser.add_argument("--goal_pose_topic", type=str, default="/instinct_nav/goal_pose")
     parser.add_argument("--goal_reached_threshold", type=float, default=0.5)
     parser.add_argument("--odom_topic", type=str, default="/dog_odom")
@@ -474,6 +666,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--command_deadband", type=float, nargs=3, default=(0.02, 0.02, 0.02), metavar=("VX", "VY", "WZ"))
     parser.add_argument("--command_slew_rate", type=float, nargs=3, default=(0.4, 0.3, 0.6), metavar=("VX", "VY", "WZ"))
     parser.add_argument("--command_lowpass_alpha", type=float, default=0.5)
+    parser.add_argument("--fall_tilt_threshold_deg", type=float, default=55.0)
+    parser.add_argument("--fall_tilt_duration_s", type=float, default=0.15)
+    parser.add_argument("--safety_log_dir", type=str, default=None)
+    parser.add_argument("--safety_telemetry_hz", type=float, default=10.0)
     return parser.parse_args()
 
 

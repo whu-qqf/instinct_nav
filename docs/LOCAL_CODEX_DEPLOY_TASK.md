@@ -4,6 +4,13 @@ Date: 2026-07-28
 Executor: Local Codex on QQF workstation / robot PC
 Project: `instinct_nav`
 
+> Status note (2026-07-30): this document records the original workstation
+> integration task. The production robot entry point is now
+> `deploy/scripts/g1_nav_onboard_onnx.py`. Follow `deploy/README.md` and
+> `DEPLOYMENT_MEMORY.md` for the current artifact layout, safety requirements,
+> and robot-computer commands. Keep the Python checkpoint flow below for
+> observation/debug comparison only.
+
 ## Objective
 
 Set up and validate the lightweight onboard deployment path for `instinct_nav` on the local Ubuntu 24.04 + ROS2 Jazzy machine, reusing the existing `ros_venv` and `colcon_ws` environment from the previous BeyondMimic reproduction.

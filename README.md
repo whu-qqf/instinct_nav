@@ -1258,6 +1258,7 @@ dry-run 下相机约 60Hz，主循环约 50Hz。
 
 ```bash
 sudo docker exec -it unitree.unitree-jetson-container bash
+source /workspace/unitree-jetson-container/env.sh
 source /workspace/unitree-jetson-container/instinct_onboard/instinct_venv/bin/activate
 cd /workspace/unitree-jetson-container/instinct_nav
 export PYTHONPATH=/workspace/unitree-jetson-container/instinct_nav/deploy:/workspace/unitree-jetson-container/instinct_nav/external/instinct_onboard:$PYTHONPATH
@@ -1282,22 +1283,23 @@ python -c "import onnxruntime as ort; d='artifacts/high_level/sru_scene_token'; 
 
 ```bash
 python deploy/scripts/g1_nav_onboard_onnx.py \
-  --standdir artifacts/low_level/g1_parkour \
-  --logdir artifacts/low_level/g1_parkour \
+  --standdir /workspace/unitree-jetson-container/data/data/checkpoints/stand_onboard \
+  --logdir /workspace/unitree-jetson-container/data/data/checkpoints/parkour_onboard_preview_stair \
   --sru_policy_onnx_path artifacts/high_level/sru_scene_token/sru_high_level_scene_token.onnx \
   --sru_depth_encoder_onnx_path artifacts/high_level/sru_scene_token/sru_high_level_depth_encoder.onnx \
   --deploy_manifest_path artifacts/high_level/sru_scene_token/deploy_manifest.json \
   --camera_frame_timeout_s 0.25 \
   --goal_pose_topic /instinct_nav/goal_pose \
   --odom_topic /dog_odom \
-  --odom_twist_frame auto \
+  --odom_twist_frame body \
   --odom_timeout_s 0.5 \
   --command_min -0.3 -0.2 -0.4 \
   --command_max 0.3 0.2 0.4 \
   --command_deadband 0.02 0.02 0.02 \
   --command_slew_rate 0.3 0.2 0.4 \
   --command_lowpass_alpha 0.4 \
-  --debug_dump_dir /tmp/instinct_nav_onboard_onnx_debug \
+  --auto_start_parkour \
+  --debug_dump_dir /workspace/instinct_nav_logs/dryrun \
   --debug_dump_every_steps 5 \
   --debug_dump_max_steps 100
 ```
@@ -1312,9 +1314,10 @@ Torso IMU data received
 All necessary buffers received
 Camera process running at about 60 Hz
 Actual main loop frequency about 50 Hz
+Dry-run auto-start enabled; starting parkour without cold start
 ```
 
-如果这里出现 `Autonomy fault latched`，先不要进入非 dry-run。需要根据日志原因检查相机、odom 或 ONNX bundle。
+`--auto_start_parkour` 在 dry-run 下会跳过无法实际改变关节的 cold-start，用于验证高层 ONNX、相机、odom 和命令链；非 dry-run 首次测试不要添加该参数。如果这里出现 `Autonomy fault latched`，先不要进入非 dry-run。需要根据日志原因检查相机、odom 或 ONNX bundle。
 
 #### 3. 启动目标管理器
 
@@ -1343,25 +1346,33 @@ ros2 topic pub --once /instinct_nav/world_goal_point geometry_msgs/msg/PointStam
 
 #### 5. 非 dry-run 站姿测试
 
-确认机器人处于安全调试/运动控制状态、场地空旷、操作员准备好急停后，停止第 2 步 dry-run 进程，重新启动 onboard 并加 `--nodryrun`。先不要启动目标管理器，也不要发目标：
+> **当前暂停执行：** 真机长距离测试曾发生跌倒。在真机 dump 与匹配的
+> IsaacLab eval dump 完成分布对比、跌倒日志和硬件状态完成复核之前，不得执行本节
+> 或下一节。以下命令仅保留为后续受控站姿验收记录。
+
+恢复测试必须由用户明确确认。机器人需使用吊架/保护绳，现场操作员保持物理急停，
+停止第 2 步 dry-run 进程后再启动 onboard。首次只做站姿，不启动目标管理器且不发布目标：
 
 ```bash
 python deploy/scripts/g1_nav_onboard_onnx.py \
-  --standdir artifacts/low_level/g1_parkour \
-  --logdir artifacts/low_level/g1_parkour \
+  --standdir /workspace/unitree-jetson-container/data/data/checkpoints/stand_onboard \
+  --logdir /workspace/unitree-jetson-container/data/data/checkpoints/parkour_onboard_preview_stair \
   --sru_policy_onnx_path artifacts/high_level/sru_scene_token/sru_high_level_scene_token.onnx \
   --sru_depth_encoder_onnx_path artifacts/high_level/sru_scene_token/sru_high_level_depth_encoder.onnx \
   --deploy_manifest_path artifacts/high_level/sru_scene_token/deploy_manifest.json \
   --camera_frame_timeout_s 0.25 \
   --goal_pose_topic /instinct_nav/goal_pose \
   --odom_topic /dog_odom \
-  --odom_twist_frame auto \
+  --odom_twist_frame body \
   --odom_timeout_s 0.5 \
   --command_min -0.3 -0.2 -0.4 \
   --command_max 0.3 0.2 0.4 \
   --command_deadband 0.02 0.02 0.02 \
   --command_slew_rate 0.3 0.2 0.4 \
   --command_lowpass_alpha 0.4 \
+  --safety_log_dir /workspace/instinct_nav_logs/safety \
+  --debug_dump_dir /workspace/instinct_nav_logs/stand_test \
+  --debug_dump_stats_only \
   --nodryrun
 ```
 
@@ -1369,7 +1380,8 @@ python deploy/scripts/g1_nav_onboard_onnx.py \
 
 #### 6. 非 dry-run 短目标测试
 
-站姿稳定后，再启动第 3 步目标管理器，并发布 0.5m 短目标：
+本节同样处于暂停状态。只有站姿验收、安全日志和 dump 对比均通过后，才可由用户明确
+批准恢复。届时启动第 3 步目标管理器，并只发布 0.5m 短目标：
 
 ```bash
 ros2 topic pub --once /instinct_nav/world_goal_point geometry_msgs/msg/PointStamped \
@@ -1384,9 +1396,18 @@ ros2 topic pub --once /instinct_nav/world_goal_point geometry_msgs/msg/PointStam
 
 任意阶段如果出现 `Autonomy fault latched`，节点会保持 `stand` 并拒绝新目标。处理方式是先查明 fault 原因，然后重启 onboard 节点重新 re-arm。
 
+无线手柄必须保持连接。`R1` 会停止自主导航并回到 stand，`R2` 或 `L2` 会触发电机急停并退出进程。
+
+实机模式还要求显式传入 `--safety_log_dir`，并建议与
+`--debug_dump_dir` 一起放到 `/workspace` 下，不能再放 `/tmp`。部署节点会以
+10 Hz 持久化 IMU 倾角、关节状态、低层目标、高层原始动作、速度命令、相机帧计数、
+odom age 和扭矩裁剪计数。默认躯干倾角超过 `55°` 持续 `0.15 s`，或 IMU
+重力向量失效时，会记录 `fall_safety_shutdown`、发布电机关闭命令并退出。
+电机关闭后机器人会失去支撑，因此仍必须使用吊架/保护绳和现场急停人员。
+
 ### 补充说明
 
-`--odom_twist_frame auto` 的规则是：如果 `/dog_odom.child_frame_id` 是 `base_link/base/body/torso_link`，直接把 twist 当 body-frame 速度；否则把 twist 当 world-frame 速度，并用 odom pose quaternion 旋转到 body frame。现场正式测试建议显式指定 `--odom_twist_frame body` 或 `--odom_twist_frame world`，不要长期依赖 auto heuristic。
+`--odom_twist_frame auto` 的规则是：如果 `/dog_odom.child_frame_id` 是 `base_link/base/body/torso_link/robot_center`，直接把 twist 当 body-frame 速度；否则把 twist 当 world-frame 速度，并用 odom pose quaternion 旋转到 body frame。现场正式测试建议显式指定 `--odom_twist_frame body` 或 `--odom_twist_frame world`，不要长期依赖 auto heuristic。
 
 如果现场确认 `/dog_odom.twist` 不可靠，可以临时加 `--disable_odom_velocity` 回退到旧的零线速度观测，但这会重新引入训练/部署观测不一致。
 
@@ -1404,11 +1425,11 @@ ros2 topic pub --once /instinct_nav/goal_pose geometry_msgs/msg/PoseStamped \
 ```bash
 python deploy/scripts/compare_debug_dumps.py \
   --left /path/to/isaaclab_eval_debug_dump \
-  --right /tmp/instinct_nav_onboard_onnx_debug \
+  --right /workspace/instinct_nav_logs/dryrun \
   --left_label isaaclab \
   --right_label robot \
   --max_files 200 \
-  --output_json /tmp/instinct_nav_dump_compare.json
+  --output_json /workspace/instinct_nav_logs/dump_compare.json
 ```
 
 优先看 `depth_m`、`encoded_depth`、`scene_tokens`、`actor_obs`、`raw_action/command` 的均值、方差、finite ratio 和 `mean_abs_delta`。如果这些分布差异很大，真机行为异常时应先修观测链路，而不是继续改网络。

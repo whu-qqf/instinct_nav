@@ -1,0 +1,131 @@
+diff --git a/instinct_onboard/joystick/unitree.py b/instinct_onboard/joystick/unitree.py
+index b7a0e71..7ec2dfa 100644
+--- a/instinct_onboard/joystick/unitree.py
++++ b/instinct_onboard/joystick/unitree.py
+@@ -67,6 +67,12 @@ class UnitreeJoyStick(JoyStickBase):
+ 
+     def _check_safety_shutdown(self, msg: WirelessController) -> bool:
+         """Shut down when R2 or L2 is pressed."""
+-        return bool(
++        shutdown_requested = bool(
+             (msg.keys & robot_cfgs.UnitreeWirelessButtons.R2) or (msg.keys & robot_cfgs.UnitreeWirelessButtons.L2)
+         )
++        if shutdown_requested:
++            self._ros_node.get_logger().warn(
++                "Emergency-stop button state received: "
++                f"keys=0x{int(msg.keys):04x}, L2={self._data.L2}, R2={self._data.R2}."
++            )
++        return shutdown_requested
+diff --git a/instinct_onboard/ros_nodes/base.py b/instinct_onboard/ros_nodes/base.py
+index 7c8e013..71398a7 100644
+--- a/instinct_onboard/ros_nodes/base.py
++++ b/instinct_onboard/ros_nodes/base.py
+@@ -68,6 +68,9 @@ class RealNode(Node):
+         self.joint_vel_ = np.zeros(self.NUM_JOINTS, dtype=np.float32)
+ 
+         self.last_sent_target_joint_state: TargetJointState | None = None
++        self.torque_clip_event_count = 0
++        self.last_torque_clip_joint_count = 0
++        self.last_torque_clip_max_position_delta = 0.0
+ 
+         # hardware related, in simulation order
+         self.joint_signs = getattr(
+@@ -181,8 +184,16 @@ class RealNode(Node):
+                 p_gains=p_gains,
+                 d_gains=d_gains,
+             )
+-            if (target_joint_pos_send != target_joint_state.position).any():
++            clip_delta = np.abs(target_joint_pos_send - target_joint_state.position)
++            clip_mask = clip_delta > 1.0e-6
++            self.last_torque_clip_joint_count = int(np.count_nonzero(clip_mask))
++            self.last_torque_clip_max_position_delta = float(np.max(clip_delta))
++            if clip_mask.any():
++                self.torque_clip_event_count += 1
+                 self.get_logger().info("Action clipped by torque limits.")
++        else:
++            self.last_torque_clip_joint_count = 0
++            self.last_torque_clip_max_position_delta = 0.0
+ 
+         send_ok = self._publish_motor_cmd(
+             target_joint_pos=target_joint_pos_send,
+diff --git a/instinct_onboard/ros_nodes/camera_base.py b/instinct_onboard/ros_nodes/camera_base.py
+index a3ab019..b2a36fb 100644
+--- a/instinct_onboard/ros_nodes/camera_base.py
++++ b/instinct_onboard/ros_nodes/camera_base.py
+@@ -229,9 +229,13 @@ def camera_subprocess_func(
+     camera_process_start_time = time.time()
+     try:
+         while True:
+-            camera.refresh_camera_data()
++            frame_refreshed = camera.refresh_camera_data()
+ 
+-            if depth_buffer is not None:
++            # Do not republish the previous camera array as a new shared-memory
++            # frame when the hardware read timed out.  Leaving frame_counter
++            # unchanged lets the main process freshness watchdog detect a
++            # genuinely prolonged camera outage.
++            if frame_refreshed and depth_buffer is not None:
+                 depth_data = camera.get_depth_image()
+                 if depth_data is not None:
+                     depth_header.writer_status = 1
+@@ -241,7 +245,7 @@ def camera_subprocess_func(
+                     _release_barrier()  # ensure buffer stores are visible before unlock
+                     depth_header.writer_status = 0
+ 
+-            if color_buffer is not None:
++            if frame_refreshed and color_buffer is not None:
+                 color_data = camera.get_color_image()
+                 if color_data is not None:
+                     color_header.writer_status = 1
+@@ -265,11 +269,20 @@ def camera_subprocess_func(
+             if depth_terminated and color_terminated:
+                 break
+     finally:
+-        camera.destroy_node()
+-        if depth_shm is not None:
+-            depth_shm.close()
+-        if color_shm is not None:
+-            color_shm.close()
++        try:
++            camera.destroy_node()
++        finally:
++            # ctypes.from_buffer() and NumPy arrays export pointers into the
++            # mmap.  Drop every view before SharedMemory.close(), otherwise
++            # Python raises BufferError while unwinding a camera failure.
++            depth_buffer = None
++            color_buffer = None
++            depth_header = None
++            color_header = None
++            if depth_shm is not None:
++                depth_shm.close()
++            if color_shm is not None:
++                color_shm.close()
+ 
+ 
+ # ======================================================================
+diff --git a/instinct_onboard/ros_nodes/realsense.py b/instinct_onboard/ros_nodes/realsense.py
+index 3afe0ec..e6f7050 100644
+--- a/instinct_onboard/ros_nodes/realsense.py
++++ b/instinct_onboard/ros_nodes/realsense.py
+@@ -84,8 +84,19 @@ class RealsenseCamera(CameraBase):
+         if self.color_resolution is not None:
+             fps_values.append(self.color_fps)
+         effective_fps = min(fps_values) if fps_values else 30
+-        timeout_ms = int(1000 / effective_fps)
+-        frames = self.pipeline.wait_for_frames(timeout_ms * 2)
++        # Two frame periods (32 ms at 60 Hz) is too aggressive for a USB
++        # camera on a loaded onboard computer: an otherwise healthy stream can
++        # occasionally miss that deadline because of USB or scheduler jitter.
++        # Give the device a modest grace period, and treat a frame timeout as a
++        # dropped frame rather than a fatal camera-process error.  The parent
++        # node's freshness watchdog still stops autonomy if frames remain stale.
++        timeout_ms = max(int(1000 / effective_fps) * 2, 100)
++        try:
++            frames = self.pipeline.wait_for_frames(timeout_ms)
++        except RuntimeError as exc:
++            if "Frame didn't arrive" in str(exc):
++                return False
++            raise
+ 
+         got_data = False
+ 

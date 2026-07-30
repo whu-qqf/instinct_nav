@@ -15,6 +15,7 @@ wandb/
 logs/
 runs/
 videos/
+artifacts/checkpoints/
 *.mp4
 *.gif
 *.avi

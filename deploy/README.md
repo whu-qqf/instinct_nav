@@ -102,8 +102,26 @@ artifacts/low_level/g1_parkour/params/agent.yaml
 artifacts/low_level/g1_parkour/params/env.yaml
 ```
 
+The stand agent is a separate model. On the current robot it is stored at
+`/workspace/unitree-jetson-container/data/data/checkpoints/stand_onboard`; do not
+pass the parkour directory as `--standdir`.
+
+The parent repository pins `external/instinct_onboard` at upstream commit
+`b6965a4`. Initialize it and apply the robot deployment fixes after cloning:
+
+```bash
+git submodule update --init external/instinct_onboard
+git -C external/instinct_onboard apply ../../deploy/patches/instinct_onboard_robot_safety.patch
+```
+
+Run `git -C external/instinct_onboard status --short` afterward and verify that
+exactly the four files represented by the patch are modified.
+
 4. Run dry mode first: policy outputs commands, but robot actuators are not enabled.
 5. Then enable the low-level policy with strict command clamps and watchdogs.
+
+For the torch-free production path install `requirements.txt`. The legacy Python
+checkpoint/debug tools additionally require `requirements-debug.txt`.
 
 ## Recommended first integration target
 
@@ -267,10 +285,27 @@ field behavior:
 ```text
 --camera_frame_timeout_s   depth frame watchdog; timeout latches autonomy fault
 --odom_timeout_s           odom velocity watchdog; timeout latches autonomy fault
---odom_twist_frame auto    body if child_frame_id is base_link/base/body/torso_link, otherwise world->body rotation
+--odom_twist_frame auto    body if child_frame_id is base_link/base/body/torso_link/robot_center, otherwise world->body rotation
+--fall_tilt_threshold_deg  torso tilt threshold for fall motor-off (default 55 deg)
+--fall_tilt_duration_s     required sustained tilt before motor-off (default 0.15 s)
+--safety_log_dir           persistent 10 Hz incident JSONL directory; required with --nodryrun
 ```
+
+The production node also requires `/wirelesscontroller`: `R1` returns autonomous
+navigation to stand, while `R2` or `L2` triggers the motor-off emergency stop.
+For end-to-end dry-run validation, `--auto_start_parkour` skips cold-start only
+when actuator output is disabled; real-robot startup still performs cold-start.
 
 For field tests, prefer explicit `--odom_twist_frame body` or
 `--odom_twist_frame world` after inspecting `/dog_odom`. The `auto` mode is only
 a convenience heuristic. If any autonomy fault is latched, the node stays in
 `stand` and ignores new navigation goals until the node is restarted.
+
+Real-robot mode now refuses to start without `--safety_log_dir`. Store both
+that directory and `--debug_dump_dir` under `/workspace`, not `/tmp`, so a
+power cycle does not erase incident evidence. The fall monitor checks torso
+projected gravity before every 50 Hz actuator step. If tilt exceeds the
+configured threshold continuously, or the IMU gravity vector becomes invalid,
+it writes a critical event, publishes the existing motor-off command, and
+exits. Motor-off makes the robot limp: a support harness and a spotter are still
+required and this software guard is not a substitute for the physical E-stop.

@@ -1,0 +1,3 @@
+[submodule "external/instinct_onboard"]
+	path = external/instinct_onboard
+	url = https://github.com/project-instinct/instinct_onboard.git
