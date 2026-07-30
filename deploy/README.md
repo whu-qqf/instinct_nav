@@ -293,7 +293,8 @@ field behavior:
 The production node also requires `/wirelesscontroller`: `R1` returns autonomous
 navigation to stand, while `R2` or `L2` triggers the motor-off emergency stop.
 For end-to-end dry-run validation, `--auto_start_parkour` skips cold-start only
-when actuator output is disabled; real-robot startup still performs cold-start.
+when actuator output is disabled. It waits with a zero command and does not run
+the SRU until a real goal arrives; real-robot startup still performs cold-start.
 
 For field tests, prefer explicit `--odom_twist_frame body` or
 `--odom_twist_frame world` after inspecting `/dog_odom`. The `auto` mode is only

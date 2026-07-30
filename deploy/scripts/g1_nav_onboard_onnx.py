@@ -98,7 +98,7 @@ class G1NavOnboardOnnxNode(RealsenseMPCamera, UnitreeNode):
         self.current_agent_name: str | None = None
         self._joystick = UnitreeJoyStick(self, joy_stick_topic=joystick_topic)
         self.base_velocity_cmd = np.zeros(3, dtype=np.float32)
-        self.nav_goal_b = np.asarray([1.0, 0.0, 0.0, np.log1p(2.0)], dtype=np.float32)
+        self.nav_goal_b = np.zeros(4, dtype=np.float32)
         self.nav_reset_requested = False
         self._sru_high_level_period_s = 1.0 / float(sru_high_level_hz)
         self._next_sru_update_time_s = 0.0
@@ -282,7 +282,10 @@ class G1NavOnboardOnnxNode(RealsenseMPCamera, UnitreeNode):
                     "agent_transition", critical=True, from_agent=previous_agent, to_agent="stand", reason="R1"
                 )
                 return
-            self._update_sru_velocity_command_if_due()
+            if self._goal_start_requested:
+                self._update_sru_velocity_command_if_due()
+            else:
+                self._zero_autonomous_command()
             tjs, _ = self.available_agents[self.current_agent_name].step()
             self.send_target_joint_state(tjs)
         if MAIN_LOOP_FREQUENCY_CHECK_INTERVAL > 1:

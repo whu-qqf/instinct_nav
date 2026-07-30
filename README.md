@@ -1317,7 +1317,7 @@ Actual main loop frequency about 50 Hz
 Dry-run auto-start enabled; starting parkour without cold start
 ```
 
-`--auto_start_parkour` 在 dry-run 下会跳过无法实际改变关节的 cold-start，用于验证高层 ONNX、相机、odom 和命令链；非 dry-run 首次测试不要添加该参数。如果这里出现 `Autonomy fault latched`，先不要进入非 dry-run。需要根据日志原因检查相机、odom 或 ONNX bundle。
+`--auto_start_parkour` 在 dry-run 下会跳过无法实际改变关节的 cold-start 并进入 parkour 待命；未收到真实目标时保持零速度且不运行 SRU，收到目标后才验证高层 ONNX、相机、odom 和命令链。非 dry-run 首次测试不要添加该参数。如果这里出现 `Autonomy fault latched`，先不要进入非 dry-run。需要根据日志原因检查相机、odom 或 ONNX bundle。
 
 #### 3. 启动目标管理器
 
@@ -1485,7 +1485,7 @@ export PYTHONPATH=/workspace/unitree-jetson-container/instinct_nav/deploy:/works
 ### 2. 首次运行：dry-run
 
 该命令不会向真实 `/lowcmd` 输出关节控制。`--auto_start_parkour` 仅用于绕过
-dry-run 中无法完成的 cold-start 姿态调整，检查相机、odom、SRU 和动作输出。
+dry-run 中无法完成的 cold-start 姿态调整并进入 parkour 待命。未收到目标时保持零速度且不运行 SRU；发布目标后才开始保存 SRU 和动作 dump。
 
 ```bash
 mkdir -p /workspace/instinct_nav_logs/dryrun
