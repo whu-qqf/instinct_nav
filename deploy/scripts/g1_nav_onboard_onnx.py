@@ -47,6 +47,8 @@ class G1NodeSensorSource(SensorSource):
             depth_m=depth,
             goal_b=self.node.nav_goal_b.astype(np.float32),
             reset=bool(self.node.nav_reset_requested),
+            base_pos_w=self.node.base_pos_w.astype(np.float32),
+            base_yaw_w=float(self.node.base_yaw_w),
         )
 
     @staticmethod
@@ -122,6 +124,8 @@ class G1NavOnboardOnnxNode(RealsenseMPCamera, UnitreeNode):
         self._last_autonomy_fault_reason: str | None = None
         self._last_autonomy_fault_log_time_s = 0.0
         self.base_lin_vel_b = np.zeros(3, dtype=np.float32)
+        self.base_pos_w = np.zeros(3, dtype=np.float32)
+        self.base_yaw_w = 0.0
         self._last_shaped_command = np.zeros(3, dtype=np.float32)
         self._last_command_shape_time_s = 0.0
         self._command_min = tuple(float(v) for v in command_min)
@@ -322,6 +326,10 @@ class G1NavOnboardOnnxNode(RealsenseMPCamera, UnitreeNode):
 
     def _on_odom(self, msg) -> None:
         self._last_odom_timestamp_s = time.monotonic()
+        pose = msg.pose.pose
+        self.base_pos_w = np.asarray([pose.position.x, pose.position.y, pose.position.z], dtype=np.float32)
+        q = pose.orientation
+        self.base_yaw_w = _yaw_from_quat_xyzw(q.x, q.y, q.z, q.w)
         linear = msg.twist.twist.linear
         vel = np.asarray([linear.x, linear.y, linear.z], dtype=np.float32)
         mode = self._odom_twist_frame
@@ -331,7 +339,6 @@ class G1NavOnboardOnnxNode(RealsenseMPCamera, UnitreeNode):
         if mode == "body":
             self.base_lin_vel_b = vel
             return
-        q = msg.pose.pose.orientation
         self.base_lin_vel_b = _rotate_world_to_body(vel, np.asarray([q.x, q.y, q.z, q.w], dtype=np.float32))
 
     def _camera_depth_is_fresh(self, now_monotonic_s: float) -> bool:
@@ -394,9 +401,10 @@ class G1NavOnboardOnnxNode(RealsenseMPCamera, UnitreeNode):
             self.current_agent_name = "stand"
             self.available_agents[self.current_agent_name].reset()
 
-    def set_nav_goal_body(self, goal_b: np.ndarray) -> None:
+    def set_nav_goal_body(self, goal_b: np.ndarray, *, reset_memory: bool = False) -> None:
         self.nav_goal_b = np.asarray(goal_b, dtype=np.float32).reshape(4)
-        self.nav_reset_requested = True
+        if reset_memory:
+            self.nav_reset_requested = True
 
     def _on_goal_pose(self, msg) -> None:
         frame_id = msg.header.frame_id.strip("/") if msg.header.frame_id else "base_link"
@@ -408,6 +416,7 @@ class G1NavOnboardOnnxNode(RealsenseMPCamera, UnitreeNode):
             return
         goal_xyz = np.asarray([msg.pose.position.x, msg.pose.position.y, msg.pose.position.z], dtype=np.float32)
         distance = float(np.linalg.norm(goal_xyz))
+        goal_was_active = self._goal_start_requested
         if self._autonomy_fault_latched:
             self.get_logger().warn(
                 f"Ignoring navigation goal because autonomy fault is latched: {self._last_autonomy_fault_reason}. Restart the node to re-arm.",
@@ -432,7 +441,7 @@ class G1NavOnboardOnnxNode(RealsenseMPCamera, UnitreeNode):
             direction = goal_xyz / max(distance, 1.0e-6)
             goal_b = np.asarray([direction[0], direction[1], direction[2], np.log1p(distance)], dtype=np.float32)
             self._goal_start_requested = True
-        self.set_nav_goal_body(goal_b)
+        self.set_nav_goal_body(goal_b, reset_memory=(not goal_was_active and self._goal_start_requested))
         self._write_safety_event(
             "body_goal_updated",
             critical=False,
@@ -535,6 +544,14 @@ class G1NavOnboardOnnxNode(RealsenseMPCamera, UnitreeNode):
                     self._safety_logger.close()
                 except Exception as exc:
                     self.get_logger().error(f"Failed to close persistent safety log: {exc}")
+
+
+def _yaw_from_quat_xyzw(x: float, y: float, z: float, w: float) -> float:
+    norm = math.sqrt(x * x + y * y + z * z + w * w)
+    if not math.isfinite(norm) or norm <= 1.0e-6:
+        return 0.0
+    x, y, z, w = x / norm, y / norm, z / norm, w / norm
+    return math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
 
 
 def _rotate_world_to_body(vec_w: np.ndarray, quat_xyzw: np.ndarray) -> np.ndarray:
