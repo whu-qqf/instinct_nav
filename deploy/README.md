@@ -106,16 +106,11 @@ The stand agent is a separate model. On the current robot it is stored at
 `/workspace/unitree-jetson-container/data/data/checkpoints/stand_onboard`; do not
 pass the parkour directory as `--standdir`.
 
-The parent repository pins `external/instinct_onboard` at upstream commit
-`b6965a4`. Initialize it and apply the robot deployment fixes after cloning:
-
-```bash
-git submodule update --init external/instinct_onboard
-git -C external/instinct_onboard apply ../../deploy/patches/instinct_onboard_robot_safety.patch
-```
-
-Run `git -C external/instinct_onboard status --short` afterward and verify that
-exactly the four files represented by the patch are modified.
+The robot-tested `instinct_onboard` source is vendored directly under
+`external/instinct_onboard`. It includes the joystick emergency-stop diagnostics,
+torque-clipping counters, RealSense dropped-frame handling, and shared-memory
+cleanup fixes. A normal clone contains these changes; no submodule initialization
+or patch application is required.
 
 4. Run dry mode first: policy outputs commands, but robot actuators are not enabled.
 5. Then enable the low-level policy with strict command clamps and watchdogs.
