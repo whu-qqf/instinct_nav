@@ -1571,3 +1571,77 @@ python deploy/scripts/g1_nav_onboard_onnx.py \
 
 启动后先完成 cold-start 和 stand 验证，再启动目标管理器并发布 0.5 m 目标。
 `R1` 返回 stand；`R2` 或 `L2` 触发急停并退出。
+
+## 2026-07-30 训练匹配低层策略真机命令
+
+本节覆盖上一节的 parkour 低层选择。数值检查确认，高层 SRU 训练使用的
+`artifacts/low_level/g1_parkour/model_30000.pt` 与仓库内导出的低层 ONNX
+一致：
+
+```text
+actor ONNX 最大绝对误差        : 1.19e-6
+depth encoder ONNX 最大绝对误差: 4.77e-7
+```
+
+官方 `parkour_onboard_preview_stair` 是另一套低层权重，不再作为当前高层 SRU
+的匹配低层。站立阶段仍使用已验证的官方 `stand_onboard`：
+
+```text
+stand   : /workspace/unitree-jetson-container/data/data/checkpoints/stand_onboard
+parkour : /workspace/unitree-jetson-container/instinct_nav/artifacts/low_level/g1_parkour
+```
+
+### 1. 启动目标管理器
+
+```bash
+python deploy/scripts/goal_manager.py \
+  --odom_topic /dog_odom \
+  --world_goal_topic /instinct_nav/world_goal_point \
+  --body_goal_topic /instinct_nav/goal_pose \
+  --goal_frame odom \
+  --goal_reached_threshold 0.5 \
+  --stop_publish_count 10
+```
+
+### 2. 启动训练匹配的真机控制
+
+首次测试必须使用吊架或保护绳，并由现场人员持有遥控器。不要添加
+`--auto_start_parkour`。启动后先完成 cold-start 和 stand，未确认站稳前不要
+发布目标。
+
+```bash
+mkdir -p /workspace/instinct_nav_logs/safety /workspace/instinct_nav_logs/nodryrun_ours
+
+python deploy/scripts/g1_nav_onboard_onnx.py \
+  --standdir /workspace/unitree-jetson-container/data/data/checkpoints/stand_onboard \
+  --logdir /workspace/unitree-jetson-container/instinct_nav/artifacts/low_level/g1_parkour \
+  --sru_policy_onnx_path artifacts/high_level/sru_scene_token/sru_high_level_scene_token.onnx \
+  --sru_depth_encoder_onnx_path artifacts/high_level/sru_scene_token/sru_high_level_depth_encoder.onnx \
+  --deploy_manifest_path artifacts/high_level/sru_scene_token/deploy_manifest.json \
+  --camera_frame_timeout_s 0.25 \
+  --goal_pose_topic /instinct_nav/goal_pose \
+  --odom_topic /dog_odom \
+  --odom_twist_frame body \
+  --odom_timeout_s 0.5 \
+  --command_min -0.3 -0.2 -0.4 \
+  --command_max 0.3 0.2 0.4 \
+  --command_deadband 0.02 0.02 0.02 \
+  --command_slew_rate 0.3 0.2 0.4 \
+  --command_lowpass_alpha 0.4 \
+  --safety_log_dir /workspace/instinct_nav_logs/safety \
+  --debug_dump_dir /workspace/instinct_nav_logs/nodryrun_ours \
+  --debug_dump_every_steps 1 \
+  --debug_dump_max_steps 100 \
+  --nodryrun
+```
+
+### 3. 发布首次小目标
+
+确认机器人已稳定站立后，在目标管理器使用的终端发布 `0.3 m` 正前方目标：
+
+```bash
+ros2 topic pub --once /instinct_nav/world_goal_point geometry_msgs/msg/PointStamped \
+"{header: {frame_id: 'odom'}, point: {x: 0.3, y: 0.0, z: 0.0}}"
+```
+
+`R1` 返回 stand；`R2` 或 `L2` 触发急停并退出。
