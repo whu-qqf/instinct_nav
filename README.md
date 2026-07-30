@@ -1459,3 +1459,115 @@ deploy/scripts/g1_nav_onboard_onnx.py
 deploy/scripts/goal_manager.py
 deploy/instinct_nav_onboard/onnx_high_level_runtime.py
 ```
+
+## 2026-07-30 机器人端最终运行命令
+
+以下命令使用已经在真机验证稳定的 InstinctLab 官方双策略：
+
+```text
+stand    : /workspace/unitree-jetson-container/data/data/checkpoints/stand_onboard
+parkour  : /workspace/unitree-jetson-container/data/data/checkpoints/parkour_onboard_preview_stair
+```
+
+`--standdir` 与 `--logdir` 不得指向同一目录。仓库内旧的
+`artifacts/low_level/g1_parkour` 不用于正式真机部署。
+
+### 1. 进入容器并准备环境
+
+```bash
+sudo docker exec -it unitree.unitree-jetson-container bash
+source /workspace/unitree-jetson-container/env.sh
+source /workspace/unitree-jetson-container/instinct_onboard/instinct_venv/bin/activate
+cd /workspace/unitree-jetson-container/instinct_nav
+export PYTHONPATH=/workspace/unitree-jetson-container/instinct_nav/deploy:/workspace/unitree-jetson-container/instinct_nav/external/instinct_onboard:$PYTHONPATH
+```
+
+### 2. 首次运行：dry-run
+
+该命令不会向真实 `/lowcmd` 输出关节控制。`--auto_start_parkour` 仅用于绕过
+dry-run 中无法完成的 cold-start 姿态调整，检查相机、odom、SRU 和动作输出。
+
+```bash
+mkdir -p /workspace/instinct_nav_logs/dryrun
+
+python deploy/scripts/g1_nav_onboard_onnx.py \
+  --standdir /workspace/unitree-jetson-container/data/data/checkpoints/stand_onboard \
+  --logdir /workspace/unitree-jetson-container/data/data/checkpoints/parkour_onboard_preview_stair \
+  --sru_policy_onnx_path artifacts/high_level/sru_scene_token/sru_high_level_scene_token.onnx \
+  --sru_depth_encoder_onnx_path artifacts/high_level/sru_scene_token/sru_high_level_depth_encoder.onnx \
+  --deploy_manifest_path artifacts/high_level/sru_scene_token/deploy_manifest.json \
+  --camera_frame_timeout_s 0.25 \
+  --goal_pose_topic /instinct_nav/goal_pose \
+  --odom_topic /dog_odom \
+  --odom_twist_frame body \
+  --odom_timeout_s 0.5 \
+  --command_min -0.3 -0.2 -0.4 \
+  --command_max 0.3 0.2 0.4 \
+  --command_deadband 0.02 0.02 0.02 \
+  --command_slew_rate 0.3 0.2 0.4 \
+  --command_lowpass_alpha 0.4 \
+  --auto_start_parkour \
+  --debug_dump_dir /workspace/instinct_nav_logs/dryrun \
+  --debug_dump_every_steps 1 \
+  --debug_dump_max_steps 100
+```
+
+### 3. 启动目标管理器
+
+在第二个容器终端重复第 1 步环境准备，然后运行：
+
+```bash
+python deploy/scripts/goal_manager.py \
+  --odom_topic /dog_odom \
+  --world_goal_topic /instinct_nav/world_goal_point \
+  --body_goal_topic /instinct_nav/goal_pose \
+  --goal_frame odom \
+  --goal_reached_threshold 0.5 \
+  --stop_publish_count 10
+```
+
+### 4. 发布 0.5 m 测试目标
+
+```bash
+ros2 topic pub --once /instinct_nav/world_goal_point geometry_msgs/msg/PointStamped \
+"{header: {frame_id: 'odom'}, point: {x: 0.5, y: 0.0, z: 0.0}}"
+```
+
+检查 `/workspace/instinct_nav_logs/dryrun/index.jsonl` 中的 `reset`、
+`policy_saturation_mask`、`command_clip_mask`、`scene_tokens` 和 `command`。
+连续更新同一个目标时，`reset` 不应持续为 `true`。
+
+### 5. 真机受控运行
+
+仅在 dry-run、官方 stand 策略和急停均验证通过后执行。必须使用吊架或保护绳，
+现场人员保持遥控器急停。真机命令不添加 `--auto_start_parkour`，并必须提供持久化
+安全日志目录：
+
+```bash
+mkdir -p /workspace/instinct_nav_logs/safety /workspace/instinct_nav_logs/real
+
+python deploy/scripts/g1_nav_onboard_onnx.py \
+  --standdir /workspace/unitree-jetson-container/data/data/checkpoints/stand_onboard \
+  --logdir /workspace/unitree-jetson-container/data/data/checkpoints/parkour_onboard_preview_stair \
+  --sru_policy_onnx_path artifacts/high_level/sru_scene_token/sru_high_level_scene_token.onnx \
+  --sru_depth_encoder_onnx_path artifacts/high_level/sru_scene_token/sru_high_level_depth_encoder.onnx \
+  --deploy_manifest_path artifacts/high_level/sru_scene_token/deploy_manifest.json \
+  --camera_frame_timeout_s 0.25 \
+  --goal_pose_topic /instinct_nav/goal_pose \
+  --odom_topic /dog_odom \
+  --odom_twist_frame body \
+  --odom_timeout_s 0.5 \
+  --command_min -0.3 -0.2 -0.4 \
+  --command_max 0.3 0.2 0.4 \
+  --command_deadband 0.02 0.02 0.02 \
+  --command_slew_rate 0.3 0.2 0.4 \
+  --command_lowpass_alpha 0.4 \
+  --safety_log_dir /workspace/instinct_nav_logs/safety \
+  --debug_dump_dir /workspace/instinct_nav_logs/real \
+  --debug_dump_every_steps 5 \
+  --debug_dump_max_steps 100 \
+  --nodryrun
+```
+
+启动后先完成 cold-start 和 stand 验证，再启动目标管理器并发布 0.5 m 目标。
+`R1` 返回 stand；`R2` 或 `L2` 触发急停并退出。
