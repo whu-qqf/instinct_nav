@@ -1599,7 +1599,7 @@ python deploy/scripts/goal_manager.py \
   --world_goal_topic /instinct_nav/world_goal_point \
   --body_goal_topic /instinct_nav/goal_pose \
   --goal_frame odom \
-  --goal_reached_threshold 0.5 \
+  --goal_reached_threshold 0.1 \
   --stop_publish_count 10
 ```
 
@@ -1620,6 +1620,7 @@ python deploy/scripts/g1_nav_onboard_onnx.py \
   --deploy_manifest_path artifacts/high_level/sru_scene_token/deploy_manifest.json \
   --camera_frame_timeout_s 0.25 \
   --goal_pose_topic /instinct_nav/goal_pose \
+  --goal_reached_threshold 0.1 \
   --odom_topic /dog_odom \
   --odom_twist_frame body \
   --odom_timeout_s 0.5 \
