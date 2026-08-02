@@ -1867,14 +1867,16 @@ MuJoCo 已验证能够到达目标且不跌倒，但真机 `--nodryrun` 前仍�
 cd /workspace/unitree-jetson-container
 source instinct_onboard/instinct_venv/bin/activate
 source unitree_ros2/setup.sh
-export PYTHONPATH=/workspace/unitree-jetson-container/instinct_nav/deploy:/workspace/unitree-jetson-container/instinct_nav/external/instinct_onboard:/workspace/unitree-jetson-container/instinct_nav/external/instinct_onboard/third_party/g1_crc:$PYTHONPATH
+mkdir -p /tmp/instinct_nav_crc
+ln -sf /workspace/unitree-jetson-container/instinct_onboard/third_party/g1_crc/crc_module.so /tmp/instinct_nav_crc/crc_module.so
+export PYTHONPATH=/workspace/unitree-jetson-container/instinct_nav/deploy:/workspace/unitree-jetson-container/instinct_nav/external/instinct_onboard:/tmp/instinct_nav_crc:$PYTHONPATH
 cd /workspace/unitree-jetson-container/instinct_nav
 ```
 
 不要跳过 import 检查：
 
 ```bash
-python -c "import rclpy; from unitree_go.msg import WirelessController; from crc_module import get_crc; import instinct_nav_onboard, instinct_onboard; print('deployment imports ok')"
+python -c "import rclpy, crc_module; import unitree_hg.unitree_hg_s__rosidl_typesupport_c; from unitree_go.msg import WirelessController; import instinct_nav_onboard, instinct_onboard; print('deployment imports and ROS type support ok')"
 ```
 
 如果 `source unitree_ros2/setup.sh` 没有成功加载 overlay，可显式执行：
@@ -1884,8 +1886,8 @@ source /opt/ros/humble/setup.bash
 source /opt/unitree_ros2/install/setup.bash
 ```
 
-然后重新执行上面的 `export PYTHONPATH=...` 和 import 检查。只有输出
-`deployment imports ok` 后才能启动目标管理器和 onboard 节点。
+然后重新建立 `/tmp/instinct_nav_crc`、执行 `export PYTHONPATH=...` 并进行
+import 检查。只有输出 `deployment imports and ROS type support ok` 后才能启动节点。
 
 确认相机、机器人状态和里程计均可用：
 
@@ -1906,7 +1908,7 @@ python deploy/scripts/goal_manager.py \
   --world_goal_topic /instinct_nav/world_goal_point \
   --body_goal_topic /instinct_nav/goal_pose \
   --goal_frame odom \
-  --goal_reached_threshold 0.5 \
+  --goal_reached_threshold 0.1 \
   --stop_publish_count 10
 ```
 
@@ -1927,7 +1929,7 @@ python deploy/scripts/g1_nav_onboard_onnx.py \
   --deploy_manifest_path artifacts/high_level/g1_sru_shared_lowcam_official_onnx_v1_20260801/deploy_manifest.json \
   --camera_frame_timeout_s 0.25 \
   --goal_pose_topic /instinct_nav/goal_pose \
-  --goal_reached_threshold 0.5 \
+  --goal_reached_threshold 0.1 \
   --odom_topic /dog_odom \
   --odom_twist_frame body \
   --odom_timeout_s 0.5 \
@@ -1942,18 +1944,34 @@ python deploy/scripts/g1_nav_onboard_onnx.py \
   --debug_dump_max_steps 100
 ```
 
-### 4. 发布 Dry-run 目标
+### 4. 查看机器人坐标并发布目标
 
 待终端 B 显示相机约 60 Hz、主循环约 50 Hz，且 low state、IMU、joystick、
-odom 均已收到后，在终端 C 发布起点前方 2 米的 odom 坐标目标：
+odom 均已收到后，在终端 C 查看机器人当前 odom 位姿：
+
+```bash
+ros2 topic echo /dog_odom --once
+```
+
+其中 `pose.pose.position.x/y` 是机器人在 odom 世界坐标系中的平面坐标，
+`orientation` 是机器人朝向四元数。持续查看位置可运行：
+
+```bash
+ros2 topic echo /dog_odom --field pose.pose.position
+```
+
+目标管理器接收的是 odom **绝对坐标**，不是相对位移。若当前机器人约位于
+`(1.478, 0.121)`，朝向约 `19.6 deg`，沿当前朝向前进 `0.8 m` 的目标约为
+`(2.232, 0.389)`，发布示例为：
 
 ```bash
 ros2 topic pub --once /instinct_nav/world_goal_point geometry_msgs/msg/PointStamped \
-"{header: {frame_id: 'odom'}, point: {x: 2.0, y: 0.0, z: 0.0}}"
+"{header: {frame_id: 'odom'}, point: {x: 2.232, y: 0.389, z: 0.0}}"
 ```
 
-检查日志中无 `Autonomy fault latched`、相机/odom 超时或持续异常动作后，使用
-`Ctrl+C` 结束 dry-run。
+实际测试必须先读取当前 odom，并替换示例中的 `x/y`。平面目标的 `z` 保持
+`0.0`。检查日志中无 `Autonomy fault latched`、相机/odom 超时或持续异常
+动作后，使用 `Ctrl+C` 结束 dry-run。
 
 ### 5. 受保护条件下运行真机
 
@@ -1974,14 +1992,14 @@ python deploy/scripts/g1_nav_onboard_onnx.py \
   --deploy_manifest_path artifacts/high_level/g1_sru_shared_lowcam_official_onnx_v1_20260801/deploy_manifest.json \
   --camera_frame_timeout_s 0.25 \
   --goal_pose_topic /instinct_nav/goal_pose \
-  --goal_reached_threshold 0.5 \
+  --goal_reached_threshold 0.1 \
   --odom_topic /dog_odom \
   --odom_twist_frame body \
   --odom_timeout_s 0.5 \
-  --command_min -0.3 -0.2 -0.4 \
-  --command_max 0.3 0.2 0.4 \
+  --command_min -0.1 -0.05 -0.15 \
+  --command_max 0.1 0.05 0.15 \
   --command_deadband 0.02 0.02 0.02 \
-  --command_slew_rate 0.3 0.2 0.4 \
+  --command_slew_rate 0.1 0.05 0.15 \
   --command_lowpass_alpha 0.4 \
   --safety_log_dir /workspace/instinct_nav_logs/safety_official_v1 \
   --debug_dump_dir /workspace/instinct_nav_logs/nodryrun_official_v1 \
@@ -1990,5 +2008,6 @@ python deploy/scripts/g1_nav_onboard_onnx.py \
   --nodryrun
 ```
 
-确认机器人独立稳定保持 stand 后，再使用终端 C 发布目标。首次目标应保持正前方、
-距离短且明显大于 `0.5 m` 到达阈值；测试区域必须平整、无人员和障碍物。
+确认机器人独立稳定保持 stand 后，先读取最新 odom 坐标，再发布正前方短距离
+绝对目标。目标距离应明显大于 `0.1 m` 到达阈值；测试区域必须平整且无人。
+首次真机保持上述低限速，不要直接恢复 `0.3/0.2/0.4`。
