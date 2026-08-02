@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import socket
 import sys
 import time
 from collections import deque
@@ -33,6 +34,32 @@ from g1_parkour_sim2sim import (  # noqa: E402
 
 OFFICIAL_PARKOUR = ROOT / "data&model/checkpoints/parkour_onboard_preview_stair"
 HIGH_LEVEL = ROOT / "artifacts/high_level/sru_scene_token"
+
+
+class InteractiveGoalReceiver:
+    """Receive world-frame XYZ goals over a localhost UDP socket."""
+
+    def __init__(self, port: int):
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(("127.0.0.1", port))
+        self.socket.setblocking(False)
+
+    def receive_latest(self) -> np.ndarray | None:
+        latest = None
+        while True:
+            try:
+                payload, _ = self.socket.recvfrom(1024)
+            except BlockingIOError:
+                break
+            values = json.loads(payload.decode("utf-8"))
+            goal = np.asarray(values, dtype=np.float64)
+            if goal.shape != (3,) or not np.all(np.isfinite(goal)):
+                raise ValueError("interactive goal must contain three finite XYZ values")
+            latest = goal
+        return latest
+
+    def close(self) -> None:
+        self.socket.close()
 
 
 def _yaw_from_matrix(rotation: np.ndarray) -> float:
@@ -265,6 +292,10 @@ def run(args: argparse.Namespace) -> dict:
     target_joint_pos = params["default"].copy()
     velocity_command = np.zeros(3, dtype=np.float32)
     goal_w = np.asarray(args.goal, dtype=np.float64)
+    interactive = args.interactive_goal_port > 0
+    goal_receiver = InteractiveGoalReceiver(args.interactive_goal_port) if interactive else None
+    goal_active = not interactive
+    reset_high_runtime = True
     next_camera = next_low = next_high = 0.0
     fell = reached = False
     command_records: list[np.ndarray] = []
@@ -276,13 +307,33 @@ def run(args: argparse.Namespace) -> dict:
 
         viewer = mj_viewer.launch_passive(model, data)
 
-    while data.time < args.duration:
+    if interactive and viewer is None:
+        goal_receiver.close()
+        raise ValueError("--interactive_goal_port requires --viewer")
+    if interactive:
+        goal_w = data.qpos[:3].copy()
+        print(
+            f"[MuJoCo] Waiting for goals on 127.0.0.1:{args.interactive_goal_port}. "
+            "Close the viewer or press Ctrl+C to stop.",
+            flush=True,
+        )
+
+    while (interactive and viewer.is_running()) or (not interactive and data.time < args.duration):
+        if goal_receiver is not None:
+            new_goal = goal_receiver.receive_latest()
+            if new_goal is not None:
+                goal_w = new_goal
+                goal_active = True
+                reached = False
+                reset_high_runtime = True
+                print(f"[MuJoCo] New world goal: {goal_w.tolist()}", flush=True)
+
         if data.time + 1.0e-9 >= next_camera:
             depth = camera.capture(data)
             depth_frames.append(depth.copy())
             next_camera += 1.0 / args.camera_hz
 
-        if data.time + 1.0e-9 >= next_high:
+        if data.time + 1.0e-9 >= next_high and goal_active:
             velocity = np.zeros(6, dtype=np.float64)
             mujoco.mj_objectVelocity(
                 model, data, mujoco.mjtObj.mjOBJ_BODY, torso_id, velocity, 1
@@ -300,14 +351,18 @@ def run(args: argparse.Namespace) -> dict:
                 joint_vel=data.qvel[dof_ids].astype(np.float32),
                 depth_m=depth.astype(np.float32),
                 goal_b=goal_b,
-                reset=next_high == 0.0,
+                reset=reset_high_runtime,
                 base_pos_w=data.qpos[:3].astype(np.float32),
                 base_yaw_w=_yaw_from_matrix(torso_rotation),
             )
             velocity_command = high_runtime.step(packet).as_array()
             command_records.append(velocity_command.copy())
+            reset_high_runtime = False
             next_high += 1.0 / cfg.high_level_hz
 
+        elif data.time + 1.0e-9 >= next_high:
+            velocity_command.fill(0.0)
+            next_high += 1.0 / cfg.high_level_hz
         if data.time + 1.0e-9 >= next_low:
             angular_velocity, gravity = body_obs(model, data, torso_id)
             low_terms = {
@@ -347,9 +402,17 @@ def run(args: argparse.Namespace) -> dict:
         gravity_b = torso_rotation.T @ np.asarray([0.0, 0.0, -1.0])
         tilt_deg = math.degrees(math.acos(float(np.clip(-gravity_b[2], -1.0, 1.0))))
         distance_xy = float(np.linalg.norm(goal_w[:2] - data.qpos[:2]))
-        if distance_xy <= args.goal_threshold:
+        if goal_active and distance_xy <= args.goal_threshold:
             reached = True
-            break
+            if interactive:
+                goal_active = False
+                velocity_command.fill(0.0)
+                print(
+                    f"[MuJoCo] Goal reached at {data.qpos[:3].tolist()}; waiting for next goal.",
+                    flush=True,
+                )
+            else:
+                break
         if data.qpos[2] < args.fall_height or tilt_deg > args.fall_tilt:
             fell = True
             break
@@ -366,6 +429,8 @@ def run(args: argparse.Namespace) -> dict:
         viewer.close()
 
     commands = np.stack(command_records) if command_records else np.zeros((0, 3))
+    if goal_receiver is not None:
+        goal_receiver.close()
     path = np.stack(path_records) if path_records else np.zeros((0, 3))
     result = {
         "duration_s": float(data.time),
@@ -410,7 +475,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--viewer", action="store_true")
     parser.add_argument("--no_debug_visuals", action="store_true")
     parser.add_argument("--camera_frustum_length", type=float, default=3.0)
-    parser.add_argument("--terrain", choices=("flat", "stairs", "ramp"), default="flat")
+    parser.add_argument("--terrain", choices=("flat", "stairs", "ramp", "custom"), default="flat")
+    parser.add_argument("--terrain_file", type=Path, default=ROOT / "deploy/mujoco/terrains/rich_course.json")
+    parser.add_argument("--interactive_goal_port", type=int, default=0)
     parser.add_argument("--terrain_start_x", type=float, default=1.5)
     parser.add_argument("--terrain_width", type=float, default=2.0)
     parser.add_argument("--stair_height", type=float, default=0.12)

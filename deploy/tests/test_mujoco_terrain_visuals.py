@@ -1,4 +1,6 @@
 import contextlib
+import json
+import socket
 import sys
 from pathlib import Path
 
@@ -11,6 +13,18 @@ sys.path.insert(0, str(MUJOCO_DIR))
 
 import g1_parkour_sim2sim as low  # noqa: E402
 import g1_sru_navigation_sim2sim as navigation  # noqa: E402
+
+
+def test_interactive_goal_receiver_uses_latest_goal():
+    receiver = navigation.InteractiveGoalReceiver(0)
+    try:
+        port = receiver.socket.getsockname()[1]
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client:
+            client.sendto(json.dumps([1.0, 2.0, 0.0]).encode(), ("127.0.0.1", port))
+            client.sendto(json.dumps([3.0, 4.0, 0.5]).encode(), ("127.0.0.1", port))
+        np.testing.assert_allclose(receiver.receive_latest(), [3.0, 4.0, 0.5])
+    finally:
+        receiver.close()
 
 
 def _terrain_names(model):
@@ -77,3 +91,13 @@ def test_debug_overlay_contains_frustum_frame_and_goal():
 
     # 8 camera-frustum lines, 3 frame axes, 1 goal sphere and 1 goal-height line.
     assert viewer.user_scn.ngeom == 13
+
+
+def test_default_rich_course_loads_all_objects():
+    terrain_file = MUJOCO_DIR / "terrains" / "rich_course.json"
+    model = low.build_model(
+        low.URDF,
+        0.005,
+        low.TerrainConfig(terrain="custom", terrain_file=terrain_file),
+    )
+    names = _terrain_names(model)

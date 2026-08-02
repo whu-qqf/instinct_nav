@@ -2049,3 +2049,44 @@ MuJoCo 导航脚本支持 `flat`、`stairs` 和 `ramp` 三种地形。使用 `--
 `--terrain_width` 调整通道宽度，`--camera_frustum_length` 只调整黄色视锥的
 显示长度，不改变策略实际使用的相机参数。需要隐藏所有标记时添加
 `--no_debug_visuals`。不使用 `--viewer` 即可进行无界面批量 sim2sim 测试。
+
+### 双终端交互目标模式
+
+交互模式下，窗口不会因到达目标或 `--duration` 到期而关闭。机器人启动后保持
+站立并等待目标；到达后停止，再等待下一个世界坐标目标。关闭 viewer 才会结束。
+
+终端 1 启动持续运行的楼梯场景：
+
+```bash
+/workspace/instinctlab51-env/bin/python deploy/mujoco/g1_sru_navigation_sim2sim.py \
+  --low_policy_dir 'data&model/checkpoints/parkour_onboard_preview_stair' \
+  --high_policy artifacts/high_level/g1_sru_shared_lowcam_official_onnx_v1_20260801/sru_high_level_scene_token.onnx \
+  --high_depth_encoder artifacts/high_level/g1_sru_shared_lowcam_official_onnx_v1_20260801/sru_high_level_depth_encoder.onnx \
+  --manifest artifacts/high_level/g1_sru_shared_lowcam_official_onnx_v1_20260801/deploy_manifest.json \
+  --terrain stairs --terrain_start_x 1.5 --stair_height 0.12 --stair_depth 0.50 --stair_steps 4 \
+  --goal_threshold 0.5 --interactive_goal_port 5555 --viewer
+```
+
+终端 2 随时发送 MuJoCo 世界坐标系中的 `x y z`：
+
+```bash
+/workspace/instinctlab51-env/bin/python deploy/mujoco/send_goal.py 4.5 0.0 0.48
+```
+
+再次运行 `send_goal.py` 会立即替换当前目标并重置高层 SRU 状态。例如返回平地
+上的另一个位置：`send_goal.py 0.5 -1.0 0.0`。自定义端口时，两边都使用
+相同的 `--port`/`--interactive_goal_port` 数值。
+
+### 默认丰富地形
+
+默认文件为 `deploy/mujoco/terrains/rich_course.json`。其中包含宽楼梯、高台、
+错位落脚台、走廊边界、矮障碍和终点平台，可直接手工修改对象参数。
+
+在上面的持续交互命令中，将地形参数替换为：
+
+```bash
+--terrain custom --terrain_file deploy/mujoco/terrains/rich_course.json
+```
+
+每个对象的 `position` 和 `size` 使用米，`rotation_rpy_deg` 使用角度。当前支持
+可碰撞的 `box`，所有对象同时进入深度相机射线检测和 MuJoCo 接触计算。

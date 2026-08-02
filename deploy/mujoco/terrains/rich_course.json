@@ -1,0 +1,20 @@
+{
+  "name": "rich_course",
+  "description": "Wide stairs, elevated platform, offset stepping pads, corridor walls and slalom blocks.",
+  "objects": [
+    {"name": "step_1", "type": "box", "position": [1.25, 0.0, 0.06], "size": [0.50, 2.40, 0.12], "color": [0.35, 0.48, 0.62, 1.0]},
+    {"name": "step_2", "type": "box", "position": [1.75, 0.0, 0.12], "size": [0.50, 2.40, 0.24], "color": [0.38, 0.51, 0.65, 1.0]},
+    {"name": "step_3", "type": "box", "position": [2.25, 0.0, 0.18], "size": [0.50, 2.40, 0.36], "color": [0.41, 0.54, 0.68, 1.0]},
+    {"name": "step_4", "type": "box", "position": [2.75, 0.0, 0.24], "size": [0.50, 2.40, 0.48], "color": [0.44, 0.57, 0.71, 1.0]},
+    {"name": "upper_platform", "type": "box", "position": [3.50, 0.0, 0.24], "size": [1.00, 2.40, 0.48], "color": [0.32, 0.45, 0.38, 1.0]},
+    {"name": "offset_pad_left", "type": "box", "position": [4.35, 0.38, 0.18], "size": [0.70, 0.85, 0.36], "color": [0.58, 0.48, 0.28, 1.0]},
+    {"name": "offset_pad_right", "type": "box", "position": [5.05, -0.32, 0.14], "size": [0.70, 0.85, 0.28], "color": [0.62, 0.50, 0.30, 1.0]},
+    {"name": "offset_pad_center", "type": "box", "position": [5.75, 0.18, 0.10], "size": [0.70, 0.90, 0.20], "color": [0.66, 0.52, 0.32, 1.0]},
+    {"name": "corridor_left", "type": "box", "position": [4.90, 1.25, 0.35], "size": [3.40, 0.16, 0.70], "color": [0.48, 0.48, 0.50, 1.0]},
+    {"name": "corridor_right", "type": "box", "position": [4.90, -1.25, 0.35], "size": [3.40, 0.16, 0.70], "color": [0.48, 0.48, 0.50, 1.0]},
+    {"name": "slalom_left", "type": "box", "position": [6.65, 0.62, 0.16], "size": [0.28, 0.55, 0.32], "rotation_rpy_deg": [0, 0, 18], "color": [0.72, 0.30, 0.24, 1.0]},
+    {"name": "slalom_right", "type": "box", "position": [7.30, -0.62, 0.18], "size": [0.30, 0.58, 0.36], "rotation_rpy_deg": [0, 0, -18], "color": [0.72, 0.30, 0.24, 1.0]},
+    {"name": "slalom_center", "type": "box", "position": [7.95, 0.35, 0.14], "size": [0.28, 0.52, 0.28], "rotation_rpy_deg": [0, 0, 12], "color": [0.72, 0.30, 0.24, 1.0]},
+    {"name": "finish_platform", "type": "box", "position": [8.80, 0.0, 0.08], "size": [1.20, 2.20, 0.16], "color": [0.25, 0.58, 0.38, 1.0]}
+  ]
+}

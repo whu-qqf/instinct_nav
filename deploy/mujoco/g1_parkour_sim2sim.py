@@ -18,10 +18,43 @@ class TerrainConfig:
  ramp_angle_deg: float = 12.0
  ramp_length: float = 3.0
  ramp_thickness: float = 0.10
+ terrain_file: Path | None = None
+
+def custom_terrain_geoms_xml(path):
+ if path is None:
+  raise ValueError('custom terrain requires --terrain_file')
+ path=Path(path)
+ data=json.loads(path.read_text())
+ objects=data.get('objects')
+ if not isinstance(objects,list) or not objects:
+  raise ValueError('custom terrain file must contain a non-empty objects list')
+ geoms=[]
+ for index,obj in enumerate(objects):
+  if obj.get('type','box') != 'box':
+   raise ValueError('custom terrain currently supports box objects only')
+  name=str(obj.get('name',f'object_{index}'))
+  if re.fullmatch(r'[A-Za-z0-9_-]+',name) is None:
+   raise ValueError(f'invalid terrain object name: {name}')
+  position=np.asarray(obj['position'],dtype=float)
+  size=np.asarray(obj['size'],dtype=float)
+  euler=np.asarray(obj.get('rotation_rpy_deg',[0,0,0]),dtype=float)
+  color=np.asarray(obj.get('color',[0.42,0.46,0.50,1.0]),dtype=float)
+  if position.shape != (3,) or size.shape != (3,) or np.any(size <= 0):
+   raise ValueError(f'invalid position or size for terrain object: {name}')
+  if euler.shape != (3,) or color.shape != (4,):
+   raise ValueError(f'invalid rotation or color for terrain object: {name}')
+  geoms.append(
+   f'<geom name="terrain_{name}" type="box" pos="{" ".join(map(str,position))}" '
+   f'size="{" ".join(map(str,size*0.5))}" euler="{" ".join(map(str,euler))}" '
+   f'group="0" rgba="{" ".join(map(str,color))}"/>'
+  )
+ return ''.join(geoms)
 
 def terrain_geoms_xml(cfg):
  if cfg.terrain == 'flat':
   return ''
+ if cfg.terrain == 'custom':
+  return custom_terrain_geoms_xml(cfg.terrain_file)
  if cfg.width <= 0:
   raise ValueError('terrain width must be positive')
  if cfg.terrain == 'stairs':
@@ -58,7 +91,7 @@ def terrain_config_from_args(a):
  return TerrainConfig(
   terrain=a.terrain,start_x=a.terrain_start_x,width=a.terrain_width,
   stair_height=a.stair_height,stair_depth=a.stair_depth,stair_steps=a.stair_steps,
-  ramp_angle_deg=a.ramp_angle_deg,ramp_length=a.ramp_length,
+  ramp_angle_deg=a.ramp_angle_deg,ramp_length=a.ramp_length,terrain_file=a.terrain_file,
  )
 def mapped(names,cfg):
  out=np.zeros(len(names),np.float32)
@@ -145,7 +178,7 @@ def run(a):
  r=np.array(rec); out={'duration_s':float(data.time),'command':cmd.tolist(),'policy_enabled':not a.disable_policy,'fell':fell,'initial_action':None if first_action is None else first_action.tolist(),'initial_action_abs_max':None if first_action is None else float(np.max(np.abs(first_action))),'final_position':data.qpos[:3].tolist(),'height_min':float(r[:,1].min()),'height_final':float(r[-1,1]),'tilt_deg_max':float(r[:,2].max()),'tilt_deg_final':float(r[-1,2]),'max_abs_joint_velocity':float(r[:,3].max()),'max_abs_torque':float(r[:,4].max()),'samples':len(rec)}; a.json_out.parent.mkdir(parents=True,exist_ok=True); a.json_out.write_text(json.dumps(out,indent=2)+'\n'); return out
 def cli():
  p=argparse.ArgumentParser(); p.add_argument('--policy_dir',type=Path,default=POLICY); p.add_argument('--urdf',type=Path,default=URDF); p.add_argument('--duration',type=float,default=8.); p.add_argument('--command_start',type=float,default=3.); p.add_argument('--command',nargs=3,type=float,default=(0.,0.,0.)); p.add_argument('--dt',type=float,default=.005); p.add_argument('--policy_hz',type=float,default=50.); p.add_argument('--height',type=float,default=.9); p.add_argument('--disable_policy',action='store_true'); p.add_argument('--viewer',action='store_true'); p.add_argument('--depth_npz',type=Path,default=None); p.add_argument('--fall_height',type=float,default=.45); p.add_argument('--fall_tilt',type=float,default=60.); p.add_argument('--json_out',type=Path,default=ROOT/'artifacts/mujoco/low_level_smoke.json')
- p.add_argument('--terrain',choices=('flat','stairs','ramp'),default='flat'); p.add_argument('--terrain_start_x',type=float,default=1.5); p.add_argument('--terrain_width',type=float,default=2.0)
+ p.add_argument('--terrain',choices=('flat','stairs','ramp','custom'),default='flat'); p.add_argument('--terrain_file',type=Path,default=ROOT/'deploy/mujoco/terrains/rich_course.json'); p.add_argument('--terrain_start_x',type=float,default=1.5); p.add_argument('--terrain_width',type=float,default=2.0)
  p.add_argument('--stair_height',type=float,default=0.12); p.add_argument('--stair_depth',type=float,default=0.50); p.add_argument('--stair_steps',type=int,default=4)
  p.add_argument('--ramp_angle_deg',type=float,default=12.0); p.add_argument('--ramp_length',type=float,default=3.0); return p.parse_args()
 if __name__=='__main__': print(json.dumps(run(cli()),indent=2))
