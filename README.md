@@ -1712,22 +1712,22 @@ goal=(2.0, 1.0): 4.31 s 到达，未跌倒，最终距离 0.499 m
 后续加入障碍物前必须继续分析，不能据此恢复真机自主导航。
 
 
-## 2026-07-30 基于 Hiking Parkour 低层重新训练 SRU
+## 2026-07-31 基于官方 Parkour ONNX 低层重新训练 SRU
 
-当前正式训练改用 `artifacts/low_level/g1_parkour_hiking/model_30000.pt`。该 checkpoint 与旧低层及官方 `parkour_onboard_preview_stair` 均不同。本任务冻结 Hiking Parkour 的完整 MoE checkpoint，只重新训练上层 SRU：
+Hiking Parkour checkpoint 的行走流畅性不理想，当前正式训练改用已验证稳定的官方 `parkour_onboard_preview_stair` 低层。任务、SRU、PPO、观测和奖励保持不变，只将冻结低层替换为官方 ONNX：
 
 ```text
-Hiking 低层 checkpoint:
-artifacts/low_level/g1_parkour_hiking/model_30000.pt
+actor:
+data&model/checkpoints/parkour_onboard_preview_stair/exported/actor.onnx
 
-checkpoint SHA256:
-7cba14628b1c8fbca1ded875123b162e9f18fd1ac63207910e53511cde88df65
+depth encoder:
+data&model/checkpoints/parkour_onboard_preview_stair/exported/0-depth_encoder.onnx
 
 训练任务:
 Instinct-Nav-G1-SRU-SceneTokenRiskNoGoal-SharedLowCam-Query-v0
 ```
 
-训练时 checkpoint 会恢复原始 `EncoderMoEActorCritic`，在 GPU 上对所有 Isaac 环境批量推理；所有低层参数均冻结。高层保持 2960 维 actor observation、3 维导航动作、512 维 SRU 和 `64 x 6` scene tokens。该任务默认从零训练高层，不要使用旧 SRU checkpoint 续训。
+训练时 ONNX 权重会加载到等价的 PyTorch 模块，在 GPU 上对所有 Isaac 环境批量推理；所有低层参数均冻结。高层保持 2960 维 actor observation、3 维导航动作、512 维 SRU 和 `64 x 6` scene tokens。该任务默认从零训练高层，不要使用旧 SRU checkpoint 续训。
 
 ### 单轮 Smoke Test
 
@@ -1739,7 +1739,7 @@ cd /workspace/instinct_nav
   --num_envs 32 \
   --max_iterations 1 \
   --seed 72 \
-  --run_name g1_sru_scene_token_risk_no_goal_shared_lowcam_policy_swap_smoke \
+  --run_name g1_sru_scene_token_risk_no_goal_shared_lowcam_official_onnx_smoke \
   --wandb \
   --wandb_entity qqfqqf0612-wuhan-university \
   --wandb_project instinct_nav \
@@ -1758,7 +1758,7 @@ cd /workspace/instinct_nav
   --num_envs 4096 \
   --max_iterations 3000 \
   --seed 72 \
-  --run_name g1_sru_scene_token_risk_no_goal_shared_lowcam_query_v1 \
+  --run_name g1_sru_scene_token_risk_no_goal_shared_lowcam_official_onnx_v1 \
   --wandb \
   --wandb_entity qqfqqf0612-wuhan-university \
   --wandb_project instinct_nav \
@@ -1770,3 +1770,83 @@ cd /workspace/instinct_nav
 ```text
 logs/rsl_rl/g1_instinct_navigation_ppo_vismap/
 ```
+
+## 2026-08-02 官方 Parkour 低层 SRU 训练完成与 Sim2Sim
+
+正式训练已完成。训练使用固定的官方 Parkour ONNX 低层、4096 个 IsaacLab
+并行环境和 seed 72；高层 SRU 从零训练，没有从旧 checkpoint 续训。
+
+```text
+run:
+logs/rsl_rl/g1_instinct_navigation_ppo_vismap/
+2026-08-01_16-04-56_g1_sru_scene_token_risk_no_goal_shared_lowcam_official_onnx_v1/
+
+final checkpoint:
+model_3000.pt
+```
+
+不要将 `--num_envs` 直接提高到 8192。实测该配置在完成数轮更新后触发
+PhysX `Patch buffer overflow`，随后以 CUDA `invalid configuration argument`
+退出；4096 是当前已经完整验证的配置。
+
+### 导出高层部署 ONNX
+
+高层 SRU policy 使用最终 checkpoint 导出，并执行 PyTorch/ONNX 数值一致性检查：
+
+```bash
+cd /workspace/instinct_nav
+
+/workspace/instinctlab51-env/bin/python \
+  deploy/scripts/export_high_level_sru_onnx.py \
+  --checkpoint_path logs/rsl_rl/g1_instinct_navigation_ppo_vismap/2026-08-01_16-04-56_g1_sru_scene_token_risk_no_goal_shared_lowcam_official_onnx_v1/model_3000.pt \
+  --output_dir artifacts/high_level/g1_sru_shared_lowcam_official_onnx_v1_20260801 \
+  --require_onnx_parity
+
+/workspace/instinctlab51-env/bin/python \
+  deploy/scripts/export_high_level_depth_encoder_onnx.py \
+  --weights_path source/instinct_nav/instinct_nav/navigation/assets/data/Policies/depth_encoder/vae_pretrain_new.pth \
+  --output_dir artifacts/high_level/g1_sru_shared_lowcam_official_onnx_v1_20260801
+```
+
+部署目录包含：
+
+```text
+artifacts/high_level/g1_sru_shared_lowcam_official_onnx_v1_20260801/
+├── deploy_manifest.json
+├── sru_high_level_depth_encoder.onnx
+└── sru_high_level_scene_token.onnx
+```
+
+导出检查已通过，接口保持为 2960 维观测、3 维动作以及一层 512 维 SRU
+hidden/cell state。
+
+### MuJoCo 闭环结果
+
+测试链路为动态深度相机、高层 SRU、官方 Parkour ONNX 和 29 维关节 PD
+闭环。当前平地 headless 结果：
+
+```text
+goal=(2.0, 0.0, 0.0): 3.85 s 到达，未跌倒，最终距离 0.500 m
+goal=(4.0, 0.0, 0.0): 8.85 s 到达，未跌倒，最终距离 0.499 m
+```
+
+4 米可视化命令：
+
+```bash
+cd /workspace/instinct_nav
+
+/workspace/instinctlab51-env/bin/python \
+  deploy/mujoco/g1_sru_navigation_sim2sim.py \
+  --low_policy_dir 'data&model/checkpoints/parkour_onboard_preview_stair' \
+  --high_policy artifacts/high_level/g1_sru_shared_lowcam_official_onnx_v1_20260801/sru_high_level_scene_token.onnx \
+  --high_depth_encoder artifacts/high_level/g1_sru_shared_lowcam_official_onnx_v1_20260801/sru_high_level_depth_encoder.onnx \
+  --manifest artifacts/high_level/g1_sru_shared_lowcam_official_onnx_v1_20260801/deploy_manifest.json \
+  --goal 4.0 0.0 0.0 \
+  --duration 20 \
+  --viewer \
+  --json_out artifacts/mujoco/g1_sru_official_onnx_v1_20260801_4m_viewer.json
+```
+
+当前测试中前进指令持续达到 `0.3 m/s` 上限，侧移和旋转也出现瞬时限幅。
+MuJoCo 已验证能够到达目标且不跌倒，但真机 `--nodryrun` 前仍需先完成
+不同方向目标的 Sim2Sim 和机器人端 dry-run 动作分布检查。
