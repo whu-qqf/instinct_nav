@@ -1859,14 +1859,33 @@ MuJoCo 已验证能够到达目标且不跌倒，但真机 `--nodryrun` 前仍�
 
 ### 1. 准备终端环境
 
+每个新终端进入容器后都必须完整执行以下命令。先激活师兄已有的
+`instinct_venv`，再加载 ROS 2 和 Unitree overlay，最后加入本项目、
+`instinct_onboard` 与 CRC 扩展的 Python 路径：
+
 ```bash
 cd /workspace/unitree-jetson-container
 source instinct_onboard/instinct_venv/bin/activate
-source /opt/ros/humble/setup.bash
-source /opt/unitree_ros2/install/setup.bash
 source unitree_ros2/setup.sh
+export PYTHONPATH=/workspace/unitree-jetson-container/instinct_nav/deploy:/workspace/unitree-jetson-container/instinct_nav/external/instinct_onboard:/workspace/unitree-jetson-container/instinct_nav/external/instinct_onboard/third_party/g1_crc:$PYTHONPATH
 cd /workspace/unitree-jetson-container/instinct_nav
 ```
+
+不要跳过 import 检查：
+
+```bash
+python -c "import rclpy; from unitree_go.msg import WirelessController; from crc_module import get_crc; import instinct_nav_onboard, instinct_onboard; print('deployment imports ok')"
+```
+
+如果 `source unitree_ros2/setup.sh` 没有成功加载 overlay，可显式执行：
+
+```bash
+source /opt/ros/humble/setup.bash
+source /opt/unitree_ros2/install/setup.bash
+```
+
+然后重新执行上面的 `export PYTHONPATH=...` 和 import 检查。只有输出
+`deployment imports ok` 后才能启动目标管理器和 onboard 节点。
 
 确认相机、机器人状态和里程计均可用：
 
