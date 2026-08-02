@@ -1850,3 +1850,126 @@ cd /workspace/instinct_nav
 当前测试中前进指令持续达到 `0.3 m/s` 上限，侧移和旋转也出现瞬时限幅。
 MuJoCo 已验证能够到达目标且不跌倒，但真机 `--nodryrun` 前仍需先完成
 不同方向目标的 Sim2Sim 和机器人端 dry-run 动作分布检查。
+
+## 2026-08-02 最新机器人部署命令
+
+以下命令在机器人 Jetson 的既有 `unitree.unitree-jetson-container` 容器内执行。
+高层使用本轮 `model_3000.pt` 导出的 ONNX，stand 和 parkour 使用机器人上已经
+验证稳定的官方 checkpoint。首次启动必须先运行 dry-run。
+
+### 1. 准备终端环境
+
+```bash
+cd /workspace/unitree-jetson-container
+source instinct_onboard/instinct_venv/bin/activate
+source /opt/ros/humble/setup.bash
+source /opt/unitree_ros2/install/setup.bash
+source unitree_ros2/setup.sh
+cd /workspace/unitree-jetson-container/instinct_nav
+```
+
+确认相机、机器人状态和里程计均可用：
+
+```bash
+rs-enumerate-devices | head
+ros2 topic list | grep -E 'lowstate|secondary_imu|lowcmd|dog_odom|wirelesscontroller'
+```
+
+### 2. 启动目标管理器
+
+在终端 A 中运行：
+
+```bash
+cd /workspace/unitree-jetson-container/instinct_nav
+
+python deploy/scripts/goal_manager.py \
+  --odom_topic /dog_odom \
+  --world_goal_topic /instinct_nav/world_goal_point \
+  --body_goal_topic /instinct_nav/goal_pose \
+  --goal_frame odom \
+  --goal_reached_threshold 0.5 \
+  --stop_publish_count 10
+```
+
+### 3. 最新模型 Dry-run
+
+在终端 B 中运行。该命令只发布到随机命名的 `/lowcmd_dryrun_*`，不会控制真实
+关节；`--auto_start_parkour` 仅用于 dry-run 跳过无法真实完成的 cold-start。
+
+```bash
+cd /workspace/unitree-jetson-container/instinct_nav
+mkdir -p /workspace/instinct_nav_logs/dryrun_official_v1
+
+python deploy/scripts/g1_nav_onboard_onnx.py \
+  --standdir /workspace/unitree-jetson-container/data/data/checkpoints/stand_onboard \
+  --logdir /workspace/unitree-jetson-container/data/data/checkpoints/parkour_onboard_preview_stair \
+  --sru_policy_onnx_path artifacts/high_level/g1_sru_shared_lowcam_official_onnx_v1_20260801/sru_high_level_scene_token.onnx \
+  --sru_depth_encoder_onnx_path artifacts/high_level/g1_sru_shared_lowcam_official_onnx_v1_20260801/sru_high_level_depth_encoder.onnx \
+  --deploy_manifest_path artifacts/high_level/g1_sru_shared_lowcam_official_onnx_v1_20260801/deploy_manifest.json \
+  --camera_frame_timeout_s 0.25 \
+  --goal_pose_topic /instinct_nav/goal_pose \
+  --goal_reached_threshold 0.5 \
+  --odom_topic /dog_odom \
+  --odom_twist_frame body \
+  --odom_timeout_s 0.5 \
+  --command_min -0.3 -0.2 -0.4 \
+  --command_max 0.3 0.2 0.4 \
+  --command_deadband 0.02 0.02 0.02 \
+  --command_slew_rate 0.3 0.2 0.4 \
+  --command_lowpass_alpha 0.4 \
+  --auto_start_parkour \
+  --debug_dump_dir /workspace/instinct_nav_logs/dryrun_official_v1 \
+  --debug_dump_every_steps 1 \
+  --debug_dump_max_steps 100
+```
+
+### 4. 发布 Dry-run 目标
+
+待终端 B 显示相机约 60 Hz、主循环约 50 Hz，且 low state、IMU、joystick、
+odom 均已收到后，在终端 C 发布起点前方 2 米的 odom 坐标目标：
+
+```bash
+ros2 topic pub --once /instinct_nav/world_goal_point geometry_msgs/msg/PointStamped \
+"{header: {frame_id: 'odom'}, point: {x: 2.0, y: 0.0, z: 0.0}}"
+```
+
+检查日志中无 `Autonomy fault latched`、相机/odom 超时或持续异常动作后，使用
+`Ctrl+C` 结束 dry-run。
+
+### 5. 受保护条件下运行真机
+
+首次真机测试必须使用吊架或保护绳，现场人员持续持有遥控器。机器人先按官方
+流程退出 sport mode 并复位关节。命令中不要添加 `--auto_start_parkour`；节点会
+依次执行 cold-start、stand，收到目标后才进入 parkour。`R1` 回到 stand，`L2`
+或 `R2` 触发安全退出。
+
+```bash
+cd /workspace/unitree-jetson-container/instinct_nav
+mkdir -p /workspace/instinct_nav_logs/safety_official_v1 /workspace/instinct_nav_logs/nodryrun_official_v1
+
+python deploy/scripts/g1_nav_onboard_onnx.py \
+  --standdir /workspace/unitree-jetson-container/data/data/checkpoints/stand_onboard \
+  --logdir /workspace/unitree-jetson-container/data/data/checkpoints/parkour_onboard_preview_stair \
+  --sru_policy_onnx_path artifacts/high_level/g1_sru_shared_lowcam_official_onnx_v1_20260801/sru_high_level_scene_token.onnx \
+  --sru_depth_encoder_onnx_path artifacts/high_level/g1_sru_shared_lowcam_official_onnx_v1_20260801/sru_high_level_depth_encoder.onnx \
+  --deploy_manifest_path artifacts/high_level/g1_sru_shared_lowcam_official_onnx_v1_20260801/deploy_manifest.json \
+  --camera_frame_timeout_s 0.25 \
+  --goal_pose_topic /instinct_nav/goal_pose \
+  --goal_reached_threshold 0.5 \
+  --odom_topic /dog_odom \
+  --odom_twist_frame body \
+  --odom_timeout_s 0.5 \
+  --command_min -0.3 -0.2 -0.4 \
+  --command_max 0.3 0.2 0.4 \
+  --command_deadband 0.02 0.02 0.02 \
+  --command_slew_rate 0.3 0.2 0.4 \
+  --command_lowpass_alpha 0.4 \
+  --safety_log_dir /workspace/instinct_nav_logs/safety_official_v1 \
+  --debug_dump_dir /workspace/instinct_nav_logs/nodryrun_official_v1 \
+  --debug_dump_every_steps 1 \
+  --debug_dump_max_steps 100 \
+  --nodryrun
+```
+
+确认机器人独立稳定保持 stand 后，再使用终端 C 发布目标。首次目标应保持正前方、
+距离短且明显大于 `0.5 m` 到达阈值；测试区域必须平整、无人员和障碍物。
