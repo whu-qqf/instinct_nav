@@ -1,11 +1,65 @@
 """MuJoCo sim2sim smoke test for the frozen Instinct G1 parkour policy."""
 from __future__ import annotations
-import argparse,json,re,tempfile,time
+import argparse,json,math,re,tempfile,time
 from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 import mujoco,numpy as np,onnxruntime as ort,yaml
 ROOT=Path(__file__).resolve().parents[2]; POLICY=ROOT/'artifacts/low_level/g1_parkour'; URDF=ROOT/'external/instinctlab/instinctlab/tasks/parkour/urdf/g1_29dof_torsoBase_popsicle_with_shoe.urdf'
 JOINTS='left_shoulder_pitch_joint right_shoulder_pitch_joint waist_pitch_joint left_shoulder_roll_joint right_shoulder_roll_joint waist_roll_joint left_shoulder_yaw_joint right_shoulder_yaw_joint waist_yaw_joint left_elbow_joint right_elbow_joint left_hip_pitch_joint right_hip_pitch_joint left_wrist_roll_joint right_wrist_roll_joint left_hip_roll_joint right_hip_roll_joint left_wrist_pitch_joint right_wrist_pitch_joint left_hip_yaw_joint right_hip_yaw_joint left_wrist_yaw_joint right_wrist_yaw_joint left_knee_joint right_knee_joint left_ankle_pitch_joint right_ankle_pitch_joint left_ankle_roll_joint right_ankle_roll_joint'.split()
+@dataclass(frozen=True)
+class TerrainConfig:
+ terrain: str = 'flat'
+ start_x: float = 1.5
+ width: float = 2.0
+ stair_height: float = 0.12
+ stair_depth: float = 0.50
+ stair_steps: int = 4
+ ramp_angle_deg: float = 12.0
+ ramp_length: float = 3.0
+ ramp_thickness: float = 0.10
+
+def terrain_geoms_xml(cfg):
+ if cfg.terrain == 'flat':
+  return ''
+ if cfg.width <= 0:
+  raise ValueError('terrain width must be positive')
+ if cfg.terrain == 'stairs':
+  if cfg.stair_height <= 0 or cfg.stair_depth <= 0 or cfg.stair_steps <= 0:
+   raise ValueError('stair dimensions and step count must be positive')
+  geoms=[]
+  for i in range(cfg.stair_steps):
+   top=(i+1)*cfg.stair_height
+   x=cfg.start_x+(i+0.5)*cfg.stair_depth
+   geoms.append(
+    f'<geom name="terrain_stair_{i}" type="box" '
+    f'pos="{x:.6f} 0 {top*0.5:.6f}" '
+    f'size="{cfg.stair_depth*0.5:.6f} {cfg.width*0.5:.6f} {top*0.5:.6f}" '
+    f'group="0" rgba="0.42 0.46 0.50 1"/>'
+   )
+  return ''.join(geoms)
+ if cfg.terrain == 'ramp':
+  if cfg.ramp_length <= 0 or cfg.ramp_thickness <= 0:
+   raise ValueError('ramp length and thickness must be positive')
+  angle=math.radians(cfg.ramp_angle_deg)
+  if not 0 < angle < math.radians(45):
+   raise ValueError('ramp angle must be between 0 and 45 degrees')
+  x=cfg.start_x+0.5*cfg.ramp_length*math.cos(angle)
+  z=0.5*cfg.ramp_length*math.sin(angle)+0.5*cfg.ramp_thickness*math.cos(angle)
+  return (
+   f'<geom name="terrain_ramp" type="box" '
+   f'pos="{x:.6f} 0 {z:.6f}" '
+   f'size="{cfg.ramp_length*0.5:.6f} {cfg.width*0.5:.6f} {cfg.ramp_thickness*0.5:.6f}" '
+   f'euler="0 {-cfg.ramp_angle_deg:.6f} 0" group="0" rgba="0.42 0.46 0.50 1"/>'
+  )
+ raise ValueError(f'unsupported terrain: {cfg.terrain}')
+
+def terrain_config_from_args(a):
+ return TerrainConfig(
+  terrain=a.terrain,start_x=a.terrain_start_x,width=a.terrain_width,
+  stair_height=a.stair_height,stair_depth=a.stair_depth,stair_steps=a.stair_steps,
+  ramp_angle_deg=a.ramp_angle_deg,ramp_length=a.ramp_length,
+ )
 def mapped(names,cfg):
  out=np.zeros(len(names),np.float32)
  for pat,val in cfg.items():
@@ -21,13 +75,14 @@ def load_params(path):
    arr[ids]=mapped([JOINTS[i] for i in ids],val) if isinstance(val,dict) else float(val)
   out[key]=arr
  return out
-def build_model(path,dt):
+def build_model(path,dt,terrain_cfg=None):
+ terrain_xml=terrain_geoms_xml(terrain_cfg or TerrainConfig())
  if path.suffix.lower() != ".urdf":
   loaded=mujoco.MjModel.from_xml_path(str(path))
   with tempfile.TemporaryDirectory() as td:
    saved=Path(td)/"robot.xml"; mujoco.mj_saveLastXML(str(saved),loaded); xml=saved.read_text()
    xml=re.sub(r'file="([^"]+)"',lambda m:'file="'+str((path.parent/"meshes"/m.group(1)).resolve())+'"',xml)
-   xml=xml.replace('<worldbody>','<worldbody><geom name="floor" type="plane" size="20 20 0.1" friction="1 0.005 0.0001"/>',1)
+   xml=xml.replace('<worldbody>','<worldbody><geom name="floor" type="plane" size="20 20 0.1" friction="1 0.005 0.0001" group="0"/>'+terrain_xml,1)
    model=mujoco.MjModel.from_xml_string(xml)
    model.opt.timestep=dt; model.opt.gravity[:]=[0,0,-9.81]; model.opt.integrator=mujoco.mjtIntegrator.mjINT_IMPLICITFAST
    return model
@@ -42,7 +97,7 @@ def build_model(path,dt):
   opening=f'''<option timestep="{dt}" gravity="0 0 -9.81" integrator="implicitfast"/>
   <default><geom friction="1 0.005 0.0001" condim="3"/></default>
   <worldbody>
-    <geom name="floor" type="plane" size="20 20 0.1"/>'''
+    <geom name="floor" type="plane" size="20 20 0.1" group="0"/>{terrain_xml}'''
   return mujoco.MjModel.from_xml_string(xml.replace('<worldbody>',opening,1))
 def ids(model):
  q,d=[],[]
@@ -54,7 +109,7 @@ def ids(model):
 def body_obs(model,data,bid):
  v=np.zeros(6); mujoco.mj_objectVelocity(model,data,mujoco.mjtObj.mjOBJ_BODY,bid,v,1); g=data.xmat[bid].reshape(3,3).T@np.array([0.,0.,-1.]); return v[:3].astype(np.float32),g.astype(np.float32)
 def run(a):
- p=load_params(a.policy_dir); model=build_model(a.urdf,a.dt); data=mujoco.MjData(model); qi,di=ids(model); bid=mujoco.mj_name2id(model,mujoco.mjtObj.mjOBJ_BODY,'torso_link'); model.dof_armature[di]=p['armature']
+ p=load_params(a.policy_dir); model=build_model(a.urdf,a.dt,terrain_config_from_args(a)); data=mujoco.MjData(model); qi,di=ids(model); bid=mujoco.mj_name2id(model,mujoco.mjtObj.mjOBJ_BODY,'torso_link'); model.dof_armature[di]=p['armature']
  actor=ort.InferenceSession(str(a.policy_dir/'exported/actor.onnx'),providers=['CPUExecutionProvider']); enc=ort.InferenceSession(str(a.policy_dir/'exported/0-depth_encoder.onnx'),providers=['CPUExecutionProvider'])
  data.qpos[:7]=[0,0,a.height,1,0,0,0]; data.qpos[qi]=p['default']; mujoco.mj_forward(model,data); last=np.zeros(29,np.float32); ang,grav=body_obs(model,data,bid); cmd=np.array(a.command,np.float32)
  vals={'ang':ang*.25,'grav':grav,'cmd':np.zeros(3,np.float32),'q':np.zeros(29,np.float32),'dq':np.zeros(29,np.float32),'act':last}; hist={k:deque([v.copy() for _ in range(8)],maxlen=8) for k,v in vals.items()}; depth=np.ones((1,8,18,32),np.float32)
@@ -89,5 +144,8 @@ def run(a):
  if viewer is not None: viewer.close()
  r=np.array(rec); out={'duration_s':float(data.time),'command':cmd.tolist(),'policy_enabled':not a.disable_policy,'fell':fell,'initial_action':None if first_action is None else first_action.tolist(),'initial_action_abs_max':None if first_action is None else float(np.max(np.abs(first_action))),'final_position':data.qpos[:3].tolist(),'height_min':float(r[:,1].min()),'height_final':float(r[-1,1]),'tilt_deg_max':float(r[:,2].max()),'tilt_deg_final':float(r[-1,2]),'max_abs_joint_velocity':float(r[:,3].max()),'max_abs_torque':float(r[:,4].max()),'samples':len(rec)}; a.json_out.parent.mkdir(parents=True,exist_ok=True); a.json_out.write_text(json.dumps(out,indent=2)+'\n'); return out
 def cli():
- p=argparse.ArgumentParser(); p.add_argument('--policy_dir',type=Path,default=POLICY); p.add_argument('--urdf',type=Path,default=URDF); p.add_argument('--duration',type=float,default=8.); p.add_argument('--command_start',type=float,default=3.); p.add_argument('--command',nargs=3,type=float,default=(0.,0.,0.)); p.add_argument('--dt',type=float,default=.005); p.add_argument('--policy_hz',type=float,default=50.); p.add_argument('--height',type=float,default=.9); p.add_argument('--disable_policy',action='store_true'); p.add_argument('--viewer',action='store_true'); p.add_argument('--depth_npz',type=Path,default=None); p.add_argument('--fall_height',type=float,default=.45); p.add_argument('--fall_tilt',type=float,default=60.); p.add_argument('--json_out',type=Path,default=ROOT/'artifacts/mujoco/low_level_smoke.json'); return p.parse_args()
+ p=argparse.ArgumentParser(); p.add_argument('--policy_dir',type=Path,default=POLICY); p.add_argument('--urdf',type=Path,default=URDF); p.add_argument('--duration',type=float,default=8.); p.add_argument('--command_start',type=float,default=3.); p.add_argument('--command',nargs=3,type=float,default=(0.,0.,0.)); p.add_argument('--dt',type=float,default=.005); p.add_argument('--policy_hz',type=float,default=50.); p.add_argument('--height',type=float,default=.9); p.add_argument('--disable_policy',action='store_true'); p.add_argument('--viewer',action='store_true'); p.add_argument('--depth_npz',type=Path,default=None); p.add_argument('--fall_height',type=float,default=.45); p.add_argument('--fall_tilt',type=float,default=60.); p.add_argument('--json_out',type=Path,default=ROOT/'artifacts/mujoco/low_level_smoke.json')
+ p.add_argument('--terrain',choices=('flat','stairs','ramp'),default='flat'); p.add_argument('--terrain_start_x',type=float,default=1.5); p.add_argument('--terrain_width',type=float,default=2.0)
+ p.add_argument('--stair_height',type=float,default=0.12); p.add_argument('--stair_depth',type=float,default=0.50); p.add_argument('--stair_steps',type=int,default=4)
+ p.add_argument('--ramp_angle_deg',type=float,default=12.0); p.add_argument('--ramp_length',type=float,default=3.0); return p.parse_args()
 if __name__=='__main__': print(json.dumps(run(cli()),indent=2))

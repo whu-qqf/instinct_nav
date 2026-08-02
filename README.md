@@ -2011,3 +2011,41 @@ python deploy/scripts/g1_nav_onboard_onnx.py \
 确认机器人独立稳定保持 stand 后，先读取最新 odom 坐标，再发布正前方短距离
 绝对目标。目标距离应明显大于 `0.1 m` 到达阈值；测试区域必须平整且无人。
 首次真机保持上述低限速，不要直接恢复 `0.3/0.2/0.4`。
+
+## MuJoCo 地形与导航可视化
+
+MuJoCo 导航脚本支持 `flat`、`stairs` 和 `ramp` 三种地形。使用 `--viewer`
+时默认显示以下调试标记：
+
+- 黄色线框：机器人深度相机的视锥覆盖范围。
+- 红、绿、蓝箭头：机器人躯干上方的 X、Y、Z 坐标轴。
+- 绿色球体和竖线：世界坐标系中的目标点。
+
+楼梯场景：
+
+```bash
+/workspace/instinctlab51-env/bin/python deploy/mujoco/g1_sru_navigation_sim2sim.py \
+  --low_policy_dir 'data&model/checkpoints/parkour_onboard_preview_stair' \
+  --high_policy artifacts/high_level/g1_sru_shared_lowcam_official_onnx_v1_20260801/sru_high_level_scene_token.onnx \
+  --high_depth_encoder artifacts/high_level/g1_sru_shared_lowcam_official_onnx_v1_20260801/sru_high_level_depth_encoder.onnx \
+  --manifest artifacts/high_level/g1_sru_shared_lowcam_official_onnx_v1_20260801/deploy_manifest.json \
+  --terrain stairs --terrain_start_x 1.5 --stair_height 0.12 \
+  --stair_depth 0.50 --stair_steps 4 \
+  --goal 4.5 0.0 0.48 --duration 30 --viewer
+```
+
+斜坡场景：
+
+```bash
+/workspace/instinctlab51-env/bin/python deploy/mujoco/g1_sru_navigation_sim2sim.py \
+  --low_policy_dir 'data&model/checkpoints/parkour_onboard_preview_stair' \
+  --high_policy artifacts/high_level/g1_sru_shared_lowcam_official_onnx_v1_20260801/sru_high_level_scene_token.onnx \
+  --high_depth_encoder artifacts/high_level/g1_sru_shared_lowcam_official_onnx_v1_20260801/sru_high_level_depth_encoder.onnx \
+  --manifest artifacts/high_level/g1_sru_shared_lowcam_official_onnx_v1_20260801/deploy_manifest.json \
+  --terrain ramp --terrain_start_x 1.5 --ramp_angle_deg 12 \
+  --ramp_length 3.0 --goal 4.5 0.0 0.6 --duration 30 --viewer
+```
+
+`--terrain_width` 调整通道宽度，`--camera_frustum_length` 只调整黄色视锥的
+显示长度，不改变策略实际使用的相机参数。需要隐藏所有标记时添加
+`--no_debug_visuals`。不使用 `--viewer` 即可进行无界面批量 sim2sim 测试。

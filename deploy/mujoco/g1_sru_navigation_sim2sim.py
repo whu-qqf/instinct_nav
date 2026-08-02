@@ -21,7 +21,15 @@ from instinct_nav_onboard.config import OnboardConfig  # noqa: E402
 from instinct_nav_onboard.onnx_high_level_runtime import OnnxHighLevelRuntime  # noqa: E402
 from instinct_nav_onboard.packets import SensorPacket  # noqa: E402
 
-from g1_parkour_sim2sim import JOINTS, URDF, body_obs, build_model, ids, load_params  # noqa: E402
+from g1_parkour_sim2sim import (  # noqa: E402
+    JOINTS,
+    URDF,
+    body_obs,
+    build_model,
+    ids,
+    load_params,
+    terrain_config_from_args,
+)
 
 OFFICIAL_PARKOUR = ROOT / "data&model/checkpoints/parkour_onboard_preview_stair"
 HIGH_LEVEL = ROOT / "artifacts/high_level/sru_scene_token"
@@ -97,12 +105,105 @@ class RayDepthCamera:
         return depth.reshape(self.cfg.height, self.cfg.width)
 
 
+def _append_connector(scene, geom_type, start, end, width, rgba):
+    if scene.ngeom >= scene.maxgeom:
+        return
+    geom = scene.geoms[scene.ngeom]
+    mujoco.mjv_initGeom(
+        geom,
+        geom_type,
+        np.zeros(3, dtype=np.float64),
+        np.zeros(3, dtype=np.float64),
+        np.eye(3, dtype=np.float64).reshape(-1),
+        np.asarray(rgba, dtype=np.float32),
+    )
+    mujoco.mjv_connector(
+        geom,
+        geom_type,
+        width,
+        np.asarray(start, dtype=np.float64),
+        np.asarray(end, dtype=np.float64),
+    )
+    scene.ngeom += 1
+
+
+def _append_sphere(scene, position, radius, rgba):
+    if scene.ngeom >= scene.maxgeom:
+        return
+    mujoco.mjv_initGeom(
+        scene.geoms[scene.ngeom],
+        mujoco.mjtGeom.mjGEOM_SPHERE,
+        np.asarray([radius, radius, radius], dtype=np.float64),
+        np.asarray(position, dtype=np.float64),
+        np.eye(3, dtype=np.float64).reshape(-1),
+        np.asarray(rgba, dtype=np.float32),
+    )
+    scene.ngeom += 1
+
+
+def _update_debug_visuals(viewer, data, camera, torso_id, goal_w, frustum_length):
+    torso_rotation = data.xmat[torso_id].reshape(3, 3)
+    torso_position = data.xpos[torso_id]
+    camera_origin = torso_position + torso_rotation @ camera.offset
+    camera_rotation = torso_rotation @ camera.camera_rotation
+    corner_indices = (
+        0,
+        camera.cfg.width - 1,
+        camera.cfg.height * camera.cfg.width - 1,
+        (camera.cfg.height - 1) * camera.cfg.width,
+    )
+    corner_rays = camera.local_rays[list(corner_indices)] @ camera_rotation.T
+    corners = camera_origin[None, :] + float(frustum_length) * corner_rays
+
+    with viewer.lock():
+        scene = viewer.user_scn
+        scene.ngeom = 0
+
+        frustum_color = (1.0, 0.78, 0.05, 0.9)
+        for corner in corners:
+            _append_connector(
+                scene, mujoco.mjtGeom.mjGEOM_LINE, camera_origin, corner, 2.0, frustum_color
+            )
+        for index in range(4):
+            _append_connector(
+                scene,
+                mujoco.mjtGeom.mjGEOM_LINE,
+                corners[index],
+                corners[(index + 1) % 4],
+                2.0,
+                frustum_color,
+            )
+
+        frame_origin = torso_position + torso_rotation @ np.asarray([0.0, 0.0, 0.55])
+        axis_colors = (
+            (0.95, 0.10, 0.10, 1.0),
+            (0.10, 0.85, 0.15, 1.0),
+            (0.10, 0.35, 1.0, 1.0),
+        )
+        for axis, color in enumerate(axis_colors):
+            endpoint = frame_origin + 0.30 * torso_rotation[:, axis]
+            _append_connector(
+                scene, mujoco.mjtGeom.mjGEOM_ARROW, frame_origin, endpoint, 0.015, color
+            )
+
+        goal_position = np.asarray(goal_w, dtype=np.float64).copy()
+        goal_position[2] = max(goal_position[2], 0.10)
+        _append_sphere(scene, goal_position, 0.10, (0.1, 1.0, 0.2, 0.9))
+        _append_connector(
+            scene,
+            mujoco.mjtGeom.mjGEOM_LINE,
+            (goal_position[0], goal_position[1], 0.0),
+            (goal_position[0], goal_position[1], goal_position[2] + 0.50),
+            4.0,
+            (0.1, 1.0, 0.2, 0.8),
+        )
 def _prepare_raycast_groups(model: mujoco.MjModel) -> None:
     """Keep robot geometry out of camera rays while preserving contact behavior."""
-    floor_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "floor")
     model.geom_group[:] = 1
-    if floor_id >= 0:
-        model.geom_group[floor_id] = 0
+    for geom_id in range(model.ngeom):
+        name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, geom_id) or ""
+        if name == "floor" or name.startswith("terrain_"):
+            model.geom_group[geom_id] = 0
 
 
 def _low_level_depth_history(frames: deque[np.ndarray], cfg: OnboardConfig) -> np.ndarray:
@@ -121,7 +222,7 @@ def run(args: argparse.Namespace) -> dict:
         command_max=tuple(abs(v) for v in args.high_command_limit),
     )
     params = load_params(args.low_policy_dir)
-    model = build_model(args.urdf, args.dt)
+    model = build_model(args.urdf, args.dt, terrain_config_from_args(args))
     _prepare_raycast_groups(model)
     data = mujoco.MjData(model)
     qpos_ids, dof_ids = ids(model)
@@ -254,6 +355,10 @@ def run(args: argparse.Namespace) -> dict:
             break
 
         if viewer is not None:
+            if not args.no_debug_visuals:
+                _update_debug_visuals(
+                    viewer, data, camera, torso_id, goal_w, args.camera_frustum_length
+                )
             viewer.sync()
             time.sleep(args.dt)
 
@@ -264,6 +369,7 @@ def run(args: argparse.Namespace) -> dict:
     path = np.stack(path_records) if path_records else np.zeros((0, 3))
     result = {
         "duration_s": float(data.time),
+        "terrain": args.terrain,
         "goal_w": goal_w.tolist(),
         "reached": reached,
         "fell": fell,
@@ -302,6 +408,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fall_height", type=float, default=0.45)
     parser.add_argument("--fall_tilt", type=float, default=60.0)
     parser.add_argument("--viewer", action="store_true")
+    parser.add_argument("--no_debug_visuals", action="store_true")
+    parser.add_argument("--camera_frustum_length", type=float, default=3.0)
+    parser.add_argument("--terrain", choices=("flat", "stairs", "ramp"), default="flat")
+    parser.add_argument("--terrain_start_x", type=float, default=1.5)
+    parser.add_argument("--terrain_width", type=float, default=2.0)
+    parser.add_argument("--stair_height", type=float, default=0.12)
+    parser.add_argument("--stair_depth", type=float, default=0.50)
+    parser.add_argument("--stair_steps", type=int, default=4)
+    parser.add_argument("--ramp_angle_deg", type=float, default=12.0)
+    parser.add_argument("--ramp_length", type=float, default=3.0)
     parser.add_argument(
         "--json_out",
         type=Path,
