@@ -168,3 +168,22 @@ _register_navigation_task(
     navigation_env_cfg.G1InstinctNavigationEnvCfg_SCENE_TOKEN_RISK_NOGOAL_SHARED_LOWCAM_OFFICIAL_PLAY,
     agents.rsl_rl_cfg.G1InstinctNavPPOSceneTokenRiskNoGoalSharedLowCamOfficialRunnerCfg,
 )
+
+# Continuous confidence visibility-map ablation; legacy binary tasks stay unchanged.
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-SceneTokenScoreVis-SharedLowCam-OfficialParkour-Query-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_SCENE_TOKEN_SCORE_VIS_SHARED_LOWCAM_OFFICIAL,
+    agents.rsl_rl_cfg.G1InstinctNavPPOSceneTokenScoreVisOfficialRunnerCfg,
+)
+
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-SceneTokenScoreVis-SharedLowCam-OfficialParkour-Query-Dev-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_SCENE_TOKEN_SCORE_VIS_SHARED_LOWCAM_OFFICIAL_DEV,
+    agents.rsl_rl_cfg.G1InstinctNavPPOSceneTokenScoreVisOfficialRunnerDevCfg,
+)
+
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-SceneTokenScoreVis-SharedLowCam-OfficialParkour-Query-Play-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_SCENE_TOKEN_SCORE_VIS_SHARED_LOWCAM_OFFICIAL_PLAY,
+    agents.rsl_rl_cfg.G1InstinctNavPPOSceneTokenScoreVisOfficialRunnerCfg,
+)

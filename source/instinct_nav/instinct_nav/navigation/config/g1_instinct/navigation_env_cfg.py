@@ -525,3 +525,42 @@ class G1InstinctNavigationEnvCfg_SCENE_TOKEN_RISK_NOGOAL_SHARED_LOWCAM_OFFICIAL_
         self.observations.policy.enable_corruption = False
         self.events.base_external_force_torque = None
         self.events.push_robot = None
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_SCENE_TOKEN_SCORE_VIS_SHARED_LOWCAM_OFFICIAL(
+    G1InstinctNavigationEnvCfg_SCENE_TOKEN_RISK_NOGOAL_SHARED_LOWCAM_OFFICIAL
+):
+    """Continuous visibility-confidence scene tokens with official parkour."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.observations.policy.scene_tokens.params["decay"] = 0.995
+        self.observations.critic.scene_tokens.params["decay"] = 0.995
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_SCENE_TOKEN_SCORE_VIS_SHARED_LOWCAM_OFFICIAL_DEV(
+    G1InstinctNavigationEnvCfg_SCENE_TOKEN_SCORE_VIS_SHARED_LOWCAM_OFFICIAL
+):
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.num_envs = 32
+        self.scene.terrain.terrain_generator.num_rows = 2
+        self.scene.terrain.terrain_generator.num_cols = 8
+
+        self.scene.terrain.max_init_terrain_level = 0
+        self.scene.terrain.terrain_generator.difficulty_range = [0.0, 0.0]
+        self.scene.terrain.terrain_generator.curriculum = False
+
+@configclass
+class G1InstinctNavigationEnvCfg_SCENE_TOKEN_SCORE_VIS_SHARED_LOWCAM_OFFICIAL_PLAY(
+    G1InstinctNavigationEnvCfg_SCENE_TOKEN_SCORE_VIS_SHARED_LOWCAM_OFFICIAL
+):
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.num_envs = 20
+        self.observations.policy.enable_corruption = False
+        self.scene.env_spacing = 2.5
+        self.events.base_external_force_torque = None
+        self.events.push_robot = None

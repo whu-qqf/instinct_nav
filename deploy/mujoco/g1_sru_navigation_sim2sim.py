@@ -247,6 +247,7 @@ def run(args: argparse.Namespace) -> dict:
     cfg = OnboardConfig(
         command_min=tuple(-abs(v) for v in args.high_command_limit),
         command_max=tuple(abs(v) for v in args.high_command_limit),
+        visibility_decay=args.visibility_decay,
     )
     params = load_params(args.low_policy_dir)
     model = build_model(args.urdf, args.dt, terrain_config_from_args(args))
@@ -475,6 +476,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--viewer", action="store_true")
     parser.add_argument("--no_debug_visuals", action="store_true")
     parser.add_argument("--camera_frustum_length", type=float, default=3.0)
+    parser.add_argument("--visibility_decay", type=float, default=1.0)
     parser.add_argument("--terrain", choices=("flat", "stairs", "ramp", "custom"), default="flat")
     parser.add_argument("--terrain_file", type=Path, default=ROOT / "deploy/mujoco/terrains/rich_course.json")
     parser.add_argument("--interactive_goal_port", type=int, default=0)

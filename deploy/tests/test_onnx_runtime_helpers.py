@@ -15,9 +15,9 @@ from instinct_nav_onboard.onnx_high_level_runtime import (
 )
 
 
-def _runtime_without_onnx() -> OnnxHighLevelRuntime:
+def _runtime_without_onnx(cfg: OnboardConfig | None = None) -> OnnxHighLevelRuntime:
     runtime = OnnxHighLevelRuntime.__new__(OnnxHighLevelRuntime)
-    runtime.cfg = OnboardConfig()
+    runtime.cfg = cfg or OnboardConfig()
     runtime.visibility = np.zeros((1, 1, 64, 64), dtype=np.float32)
     runtime.last_base_pos_w = np.zeros(3, dtype=np.float32)
     runtime.last_base_yaw_w = 0.0
@@ -70,3 +70,28 @@ def test_action_transform_matches_training_tanh_before_safety_clip():
     command = runtime._action_to_command(raw, timestamp_s=1.0).as_array()
     expected = np.clip(np.tanh(raw), runtime.cfg.command_min, runtime.cfg.command_max)
     np.testing.assert_allclose(command, expected, rtol=0.0, atol=1.0e-7)
+
+def test_score_visibility_accumulates_repeated_hits_and_decays_when_stale():
+    runtime = _runtime_without_onnx(OnboardConfig(visibility_decay=0.9))
+    depth = np.full((36, 64), 2.0, dtype=np.float32)
+
+    first_tokens = runtime.build_scene_tokens(depth).reshape(64, 6)
+    first_score = first_tokens[:, 2].sum()
+    second_tokens = runtime.build_scene_tokens(depth).reshape(64, 6)
+    second_score = second_tokens[:, 2].sum()
+    assert second_score > first_score > 0.0
+
+    stale_depth = np.zeros((36, 64), dtype=np.float32)
+    stale_tokens = runtime.build_scene_tokens(stale_depth).reshape(64, 6)
+    assert stale_tokens[:, 2].sum() < second_score
+
+
+def test_legacy_visibility_remains_binary_and_does_not_decay():
+    runtime = _runtime_without_onnx()
+    depth = np.full((36, 64), 2.0, dtype=np.float32)
+
+    runtime.build_scene_tokens(depth)
+    first_visibility = runtime.visibility.copy()
+    runtime.build_scene_tokens(np.zeros((36, 64), dtype=np.float32))
+
+    np.testing.assert_array_equal(runtime.visibility, first_visibility)

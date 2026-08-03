@@ -96,7 +96,14 @@ class HighLevelObsBuilder:
         valid = torch.isfinite(depth_image) & (depth_image > depth_min_m) & (depth_image < depth_max_m)
 
         current_visibility = self._depth_to_current_visibility(depth_image, valid, size_m=size_m, grid_size=grid_size)
-        self.visibility = torch.maximum(self.visibility, current_visibility)
+        if self.cfg.visibility_decay < 1.0:
+            self.visibility.mul_(self.cfg.visibility_decay)
+            self.visibility.add_(
+                self.cfg.visibility_score_alpha_up * current_visibility * (1.0 - self.visibility)
+            )
+            self.visibility.clamp_(0.0, 1.0)
+        else:
+            self.visibility = torch.maximum(self.visibility, current_visibility)
 
         patch_size = grid_size // token_grid
         visible_ratio = F.avg_pool2d(self.visibility, kernel_size=patch_size, stride=patch_size).flatten(start_dim=1)
@@ -121,10 +128,17 @@ class HighLevelObsBuilder:
         depth_edge = F.adaptive_avg_pool2d((grad_x + grad_y).unsqueeze(1), (token_grid, token_grid)).flatten(start_dim=1)
         depth_edge = depth_edge.clamp(0.0, 1.0)
 
-        visibility_binary = (self.visibility > 0.5).to(dtype=torch.float32)
-        unknown = 1.0 - visibility_binary
-        frontier_x = F.pad((unknown[..., 1:] - unknown[..., :-1]).abs(), (0, 1, 0, 0))
-        frontier_y = F.pad((unknown[..., 1:, :] - unknown[..., :-1, :]).abs(), (0, 0, 0, 1))
+        frontier_source = (
+            self.visibility
+            if self.cfg.visibility_decay < 1.0
+            else (self.visibility > 0.5).to(dtype=torch.float32)
+        )
+        frontier_x = F.pad(
+            (frontier_source[..., 1:] - frontier_source[..., :-1]).abs(), (0, 1, 0, 0)
+        )
+        frontier_y = F.pad(
+            (frontier_source[..., 1:, :] - frontier_source[..., :-1, :]).abs(), (0, 0, 0, 1)
+        )
         frontier = F.avg_pool2d((frontier_x + frontier_y).clamp(0.0, 1.0), kernel_size=patch_size, stride=patch_size)
         frontier = frontier.flatten(start_dim=1)
 

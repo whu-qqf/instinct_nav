@@ -205,3 +205,22 @@ class G1InstinctNavPPOSceneTokenRiskNoGoalSharedLowCamOfficialRunnerDevCfg(
         self.max_iterations = 10
         self.experiment_name = "g1_instinct_navigation_ppo_scene_token_official_parkour_dev"
         self.logger = "tensorboard"
+
+
+@configclass
+class G1InstinctNavPPOSceneTokenScoreVisOfficialRunnerCfg(
+    G1InstinctNavPPOSceneTokenRiskNoGoalSharedLowCamOfficialRunnerCfg
+):
+    def __post_init__(self):
+        super().__post_init__()
+        self.run_name = "scene_token_score_vis_shared_lowcam_official_parkour"
+
+
+@configclass
+class G1InstinctNavPPOSceneTokenScoreVisOfficialRunnerDevCfg(
+    G1InstinctNavPPOSceneTokenScoreVisOfficialRunnerCfg
+):
+    def __post_init__(self):
+        super().__post_init__()
+        self.max_iterations = 10
+        self.experiment_name = "g1_instinct_navigation_score_vis_dev"

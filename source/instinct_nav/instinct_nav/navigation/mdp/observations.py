@@ -160,10 +160,11 @@ class LocalVisibilityMapManager:
         self.depth_max_m = max(float(depth_max_m), self.depth_min_m + 1.0e-3)
         self.pixel_stride = max(int(pixel_stride), 1)
 
-        # ``decay`` is kept in the API for ablations, but the current paper-style
-        # visibility map uses no decay: once a cell is observed in the local map,
-        # it remains observed until reset or until warping moves it out of frame.
-        self.decay = 1.0
+        # decay=1 preserves the legacy binary map; lower values enable confidence.
+        self.decay = min(max(float(decay), 0.0), 1.0)
+        self.score_mode = self.decay < 1.0
+        self.score_alpha_up = 0.15
+        # Repeated hits rise toward one while stale cells decay gradually.
         self.cell_size = self.size_m / float(self.grid_size)
         self.half_size = self.size_m / 2.0
 
@@ -269,9 +270,10 @@ class LocalVisibilityMapManager:
         warped = F.grid_sample(
             self.map, sample_grid, mode="bilinear", padding_mode="zeros", align_corners=True
         )
+        warped_memory = warped if self.score_mode else (warped > 0.5).to(warped.dtype)
         self.map = torch.where(
             self.pose_valid.view(-1, 1, 1, 1),
-            (warped > 0.5).to(warped.dtype),
+            warped_memory,
             torch.zeros_like(warped),
         )
 
@@ -370,16 +372,19 @@ class LocalVisibilityMapManager:
         values = valid.to(dtype=updates.dtype)
         updates.scatter_reduce_(1, linear_idx, values, reduce="amax", include_self=True)
 
-        # Accumulate visibility over time. This is not occupancy integration: no
-        # negative evidence is inserted and cells are simply remembered as seen.
-        self.map = torch.maximum(self.map, updates.view_as(self.map))
+        current_hits = updates.view_as(self.map)
+        if self.score_mode:
+            self.map.mul_(self.decay)
+            self.map.add_(self.score_alpha_up * current_hits * (1.0 - self.map))
+            self.map.clamp_(0.0, 1.0)
+        else:
+            self.map = torch.maximum(self.map, current_hits)
 
-        # Save current pose for next-step warping and re-binarize to remove any
-        # fractional interpolation values introduced by grid_sample.
         self.last_root_pos_w.copy_(root_pos_w)
         self.last_root_yaw.copy_(root_yaw)
         self.pose_valid[:] = True
-        self.map = (self.map > 0.5).to(self.map.dtype)
+        if not self.score_mode:
+            self.map = (self.map > 0.5).to(self.map.dtype)
         return self.map.flatten(start_dim=1)
 
 
@@ -1097,7 +1102,9 @@ def local_visibility_map(
     pixel_stride: int = 2,
     decay: float = 1.0,
 ):
-    """Return a flattened binary robot-centric visibility map built from noisy, delayed depth.
+    """Return a robot-centric visibility memory built from noisy, delayed depth.
+
+    ``decay=1`` preserves a binary seen/unseen map; ``decay<1`` returns confidence scores.
 
     The delayed raw sample packs depth, camera pose, and intrinsics together so the
     back-projection uses a temporally consistent camera frame. The map contains no
@@ -1455,10 +1462,13 @@ def scene_tokens_risk_no_goal_from_visibility_map(
     depth_edge = F.adaptive_avg_pool2d((grad_x + grad_y).unsqueeze(1), (token_grid_size, token_grid_size)).flatten(start_dim=1)
     depth_edge = depth_edge.clamp(0.0, 1.0)
 
-    visibility_binary = (visibility > 0.5).to(dtype=dtype)
-    unknown = 1.0 - visibility_binary
-    frontier_x = F.pad((unknown[..., 1:] - unknown[..., :-1]).abs(), (0, 1, 0, 0))
-    frontier_y = F.pad((unknown[..., 1:, :] - unknown[..., :-1, :]).abs(), (0, 0, 0, 1))
+    frontier_source = visibility if decay < 1.0 else (visibility > 0.5).to(dtype=dtype)
+    frontier_x = F.pad(
+        (frontier_source[..., 1:] - frontier_source[..., :-1]).abs(), (0, 1, 0, 0)
+    )
+    frontier_y = F.pad(
+        (frontier_source[..., 1:, :] - frontier_source[..., :-1, :]).abs(), (0, 0, 0, 1)
+    )
     frontier = F.avg_pool2d((frontier_x + frontier_y).clamp(0.0, 1.0), kernel_size=patch_size, stride=patch_size)
     frontier = frontier.flatten(start_dim=1)
 

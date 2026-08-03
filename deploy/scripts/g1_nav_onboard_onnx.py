@@ -87,6 +87,7 @@ class G1NavOnboardOnnxNode(RealsenseMPCamera, UnitreeNode):
         command_deadband: tuple[float, float, float] = (0.02, 0.02, 0.02),
         command_slew_rate: tuple[float, float, float] = (0.4, 0.3, 0.6),
         command_lowpass_alpha: float = 0.5,
+        visibility_decay: float = 1.0,
         fall_tilt_threshold_deg: float = 55.0,
         fall_tilt_duration_s: float = 0.15,
         safety_log_dir: str | None = None,
@@ -165,7 +166,12 @@ class G1NavOnboardOnnxNode(RealsenseMPCamera, UnitreeNode):
                 f"max_steps={debug_cfg.max_steps}, save_arrays={debug_cfg.save_arrays}."
             )
         self.sru_runtime = OnnxHighLevelRuntime(
-            cfg=OnboardConfig(high_level_hz=float(sru_high_level_hz), command_min=self._command_min, command_max=self._command_max),
+            cfg=OnboardConfig(
+                high_level_hz=float(sru_high_level_hz),
+                command_min=self._command_min,
+                command_max=self._command_max,
+                visibility_decay=float(visibility_decay),
+            ),
             policy_onnx_path=sru_policy_onnx_path,
             depth_encoder_onnx_path=sru_depth_encoder_onnx_path,
             command_sink=None,
@@ -627,6 +633,7 @@ def main(args: argparse.Namespace) -> None:
         command_deadband=tuple(args.command_deadband),
         command_slew_rate=tuple(args.command_slew_rate),
         command_lowpass_alpha=args.command_lowpass_alpha,
+        visibility_decay=args.visibility_decay,
         fall_tilt_threshold_deg=args.fall_tilt_threshold_deg,
         fall_tilt_duration_s=args.fall_tilt_duration_s,
         safety_log_dir=args.safety_log_dir,
@@ -678,6 +685,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--debug_dump_stats_only", action="store_true", default=False)
     parser.add_argument("--sru_high_level_hz", type=float, default=5.0)
     parser.add_argument("--camera_frame_timeout_s", type=float, default=0.25)
+    parser.add_argument("--visibility_decay", type=float, default=1.0)
     parser.add_argument("--startup_step_size", type=float, default=0.2)
     parser.add_argument("--kpkd_factor", type=float, default=2.0)
     parser.add_argument("--depth_vis", action="store_true", default=False)

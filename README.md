@@ -2090,3 +2090,96 @@ MuJoCo 导航脚本支持 `flat`、`stairs` 和 `ramp` 三种地形。使用 `--
 
 每个对象的 `position` 和 `size` 使用米，`rotation_rpy_deg` 使用角度。当前支持
 可碰撞的 `box`，所有对象同时进入深度相机射线检测和 MuJoCo 接触计算。
+
+## 连续可见性得分（ScoreVis）
+
+日期：2026-08-03；执行者：Codex。
+
+原任务继续使用二值 visibility map，不改变已有 checkpoint 的输入语义。新增
+`ScoreVis` 任务使用连续置信度：当前帧命中的栅格逐步向 1 累积，未命中的
+历史栅格按 `0.995` 弱衰减。更新式为：
+
+```text
+decayed_t = 0.995 * score_(t-1)
+score_t = clamp(decayed_t + 0.15 * hit_t * (1 - decayed_t), 0, 1)
+```
+
+scene token 的维度仍为 `64 x 6`；第三维从二值 patch 可见比例变为平均置信度，
+`frontier` 改为连续置信度的空间梯度。该变化需要重新训练，不能直接复用旧
+二值 visibility checkpoint。
+
+训练命令：
+
+```bash
+/workspace/instinctlab51-env/bin/python /workspace/instinct_nav/_launcher.py train \
+  --task Instinct-Nav-G1-SRU-SceneTokenScoreVis-SharedLowCam-OfficialParkour-Query-v0 \
+  --num_envs 4096 --max_iterations 3000 --seed 72 \
+  --run_name g1_sru_scene_token_score_vis_official_parkour_v1 \
+  --wandb --wandb_entity qqfqqf0612-wuhan-university \
+  --wandb_project instinct_nav --headless
+```
+
+导出新 checkpoint 后，MuJoCo 必须显式启用相同衰减：
+
+```bash
+/workspace/instinctlab51-env/bin/python deploy/mujoco/g1_sru_navigation_sim2sim.py \
+  --low_policy_dir 'data&model/checkpoints/parkour_onboard_preview_stair' \
+  --high_policy /path/to/score_vis/sru_high_level_scene_token.onnx \
+  --high_depth_encoder /path/to/score_vis/sru_high_level_depth_encoder.onnx \
+  --manifest /path/to/score_vis/deploy_manifest.json \
+  --visibility_decay 0.995 --terrain custom \
+  --terrain_file deploy/mujoco/terrains/rich_course.json --viewer
+```
+
+真机部署 ScoreVis 权重时同样添加 `--visibility_decay 0.995`。旧 ONNX 不添加该
+参数，默认值 `1.0` 会严格保留原二值地图行为。
+
+### Visibility 生成链路
+
+1. 复用底层 parkour 与高层 SRU 共用的深度相机，读取带噪声和延迟的深度图。
+2. 使用与深度帧同一时刻的相机位姿、四元数和内参，将有效深度像素反投影为 3D 点。
+3. 将点转换到机器人 yaw 对齐的局部坐标系，并投影到机器人周围
+   `6.4 m x 6.4 m`、分辨率为 `64 x 64` 的 BEV 网格。
+4. 根据机器人连续两帧的根位姿变化，对历史地图进行平移和旋转补偿；ScoreVis
+   模式保留双线性插值后的连续值，旧二值模式仍重新阈值化。
+5. 当前帧命中的网格增加置信度，未命中的历史网格执行弱衰减。episode reset
+   时地图、历史位姿和缓存一起清零。
+6. 将 `64 x 64` 地图划分为 `8 x 8` 个 patch，得到 64 个 scene token。
+
+每个 token 保持 6 维：
+
+```text
+[x_center, y_center, visibility_score, depth_mean, depth_edge, frontier]
+```
+
+- `visibility_score`：patch 内连续可见性置信度的平均值。
+- `depth_mean`：当前深度图在该区域的归一化平均深度。
+- `depth_edge`：深度图水平与垂直梯度的区域平均值。
+- `frontier`：连续 visibility score 的空间梯度，表示已充分观测区域与低置信区域的边界。
+
+最终 scene-token observation 仍为 `64 x 6 = 384` 维，因此 SRU 的网络输入尺寸
+没有变化；变化的是这 384 维中 visibility/frontier 的数值分布，所以必须重新训练。
+
+### 新增任务
+
+```text
+Instinct-Nav-G1-SRU-SceneTokenScoreVis-SharedLowCam-OfficialParkour-Query-v0
+Instinct-Nav-G1-SRU-SceneTokenScoreVis-SharedLowCam-OfficialParkour-Query-Dev-v0
+Instinct-Nav-G1-SRU-SceneTokenScoreVis-SharedLowCam-OfficialParkour-Query-Play-v0
+```
+
+实现同步覆盖以下链路：
+
+- IsaacLab 训练 observation 与任务注册。
+- Torch onboard observation builder。
+- ONNX 高层运行时及 visibility 位姿补偿。
+- MuJoCo sim2sim，通过 `--visibility_decay 0.995` 启用。
+- 真机 ONNX 部署，通过同名参数启用。
+
+### 今日验证
+
+- 所有修改文件通过 `py_compile`。
+- `deploy/tests` 全量测试通过：`18 passed`。
+- 连续模式回归测试确认：重复命中时得分升高，停止命中时得分衰减。
+- 兼容性测试确认：默认 `visibility_decay=1.0` 时旧地图仍为二值且不会衰减。
+- ScoreVis Dev 任务已在 IsaacLab 中成功注册、解析并初始化。

@@ -207,7 +207,12 @@ class OnnxHighLevelRuntime:
                 grid_size=grid_size,
             )
         current_visibility = self._depth_to_current_visibility(depth, valid, size_m=size_m, grid_size=grid_size)
-        self.visibility = np.maximum(self.visibility, current_visibility)
+        if self.cfg.visibility_decay < 1.0:
+            self.visibility *= self.cfg.visibility_decay
+            self.visibility += self.cfg.visibility_score_alpha_up * current_visibility * (1.0 - self.visibility)
+            np.clip(self.visibility, 0.0, 1.0, out=self.visibility)
+        else:
+            self.visibility = np.maximum(self.visibility, current_visibility)
 
         vis = self.visibility.reshape(1, 1, 8, 8, 8, 8).mean(axis=(3, 5)).reshape(1, 64)
         rows, cols = np.meshgrid(np.arange(token_grid, dtype=np.float32), np.arange(token_grid, dtype=np.float32), indexing="ij")
@@ -223,10 +228,9 @@ class OnnxHighLevelRuntime:
         grad_y = np.pad(np.abs(depth_norm[1:, :] - depth_norm[:-1, :]), ((0, 1), (0, 0)))
         depth_edge = np.clip(_adaptive_avg_pool2d(grad_x + grad_y, token_grid, token_grid), 0.0, 1.0).reshape(1, -1)
 
-        visibility_binary = (self.visibility > 0.5).astype(np.float32)[0, 0]
-        unknown = 1.0 - visibility_binary
-        frontier_x = np.pad(np.abs(unknown[:, 1:] - unknown[:, :-1]), ((0, 0), (0, 1)))
-        frontier_y = np.pad(np.abs(unknown[1:, :] - unknown[:-1, :]), ((0, 1), (0, 0)))
+        frontier_source = self.visibility[0, 0] if self.cfg.visibility_decay < 1.0 else (self.visibility[0, 0] > 0.5).astype(np.float32)
+        frontier_x = np.pad(np.abs(frontier_source[:, 1:] - frontier_source[:, :-1]), ((0, 0), (0, 1)))
+        frontier_y = np.pad(np.abs(frontier_source[1:, :] - frontier_source[:-1, :]), ((0, 1), (0, 0)))
         frontier_grid = np.clip(frontier_x + frontier_y, 0.0, 1.0).reshape(8, 8, 8, 8).mean(axis=(1, 3))
         frontier = frontier_grid.reshape(1, -1)
 
@@ -272,7 +276,10 @@ class OnnxHighLevelRuntime:
         row_prev = (half_size - x_prev) / cell_size - 0.5
         col_prev = (half_size - y_prev) / cell_size - 0.5
         warped = _bilinear_sample_grid(self.visibility[0, 0], row_prev, col_prev)
-        self.visibility[0, 0] = (warped > 0.5).astype(np.float32)
+        if self.cfg.visibility_decay < 1.0:
+            self.visibility[0, 0] = warped
+        else:
+            self.visibility[0, 0] = (warped > 0.5).astype(np.float32)
         self.last_base_pos_w = base_pos_w.copy()
         self.last_base_yaw_w = float(base_yaw_w)
 
