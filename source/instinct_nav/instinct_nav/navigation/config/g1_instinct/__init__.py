@@ -187,3 +187,20 @@ _register_navigation_task(
     navigation_env_cfg.G1InstinctNavigationEnvCfg_SCENE_TOKEN_SCORE_VIS_SHARED_LOWCAM_OFFICIAL_PLAY,
     agents.rsl_rl_cfg.G1InstinctNavPPOSceneTokenScoreVisOfficialRunnerCfg,
 )
+
+# Stage-3 dynamic obstacle curriculum (ScoreVis + moving obstacles).
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-SceneTokenScoreVis-DynamicObstacle-OfficialParkour-Query-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_DYNAMIC_OFFICIAL,
+    agents.rsl_rl_cfg.G1InstinctNavPPOSceneTokenScoreVisDynamicOfficialRunnerCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-SceneTokenScoreVis-DynamicObstacle-OfficialParkour-Query-Dev-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_DYNAMIC_OFFICIAL_DEV,
+    agents.rsl_rl_cfg.G1InstinctNavPPOSceneTokenScoreVisDynamicOfficialRunnerDevCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-SceneTokenScoreVis-DynamicObstacle-OfficialParkour-Query-Play-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_DYNAMIC_OFFICIAL_PLAY,
+    agents.rsl_rl_cfg.G1InstinctNavPPOSceneTokenScoreVisDynamicOfficialRunnerCfg,
+)

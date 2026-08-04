@@ -360,6 +360,13 @@ parser.add_argument(
         "Enabled by default; use modest num_envs because observation panels are cached for every env."
     ),
 )
+
+parser.add_argument(
+    "--failure_rgb_min_episode",
+    type=int,
+    default=0,
+    help="Only export failure/success RGB GIFs for episodes whose global episode index is >= this value. 0 disables filtering.",
+)
 parser.add_argument(
     "--failure_rgb_gif_frame_ms",
     type=int,
@@ -1799,12 +1806,28 @@ def _visibility_map_to_rgb(visibility_map: np.ndarray) -> np.ndarray:
     return rgb
 
 
-def _scene_tokens_to_rgb(scene_tokens: np.ndarray, token_grid_size: int = 8) -> np.ndarray:
+def _visibility_score_map_to_rgb(visibility_map: np.ndarray) -> np.ndarray:
+    """Render a continuous visibility-confidence (ScoreVis) map as a BEV heatmap."""
+    visibility = np.asarray(visibility_map, dtype=np.float32)
+    rgb = _scalar_frame_to_rgb(visibility, value_min=0.0, value_max=1.0, cmap_name="magma")
+    center_y = visibility.shape[0] // 2
+    center_x = visibility.shape[1] // 2
+    radius = max(1, min(visibility.shape) // 32)
+    y0, y1 = max(0, center_y - radius), min(visibility.shape[0], center_y + radius + 1)
+    x0, x1 = max(0, center_x - radius), min(visibility.shape[1], center_x + radius + 1)
+    rgb[y0:y1, x0:x1] = np.array([255, 40, 60], dtype=np.uint8)
+    return rgb
+
+
+def _scene_tokens_to_rgb(scene_tokens: np.ndarray, token_grid_size: int = 8, layout: str = "v1") -> np.ndarray:
     """Render scene-token observations as compact BEV heatmaps.
 
-    The current SceneToken-Query policy uses 64 tokens with six fields:
-    [x, y, visible_ratio, dist_to_goal, cos_to_goal, sin_to_goal].
-    For visual debugging we render visible_ratio and dist_to_goal side by side.
+    ``layout="v1"`` renders the legacy 6D tokens ``[x, y, visible_ratio,
+    dist_to_goal, cos_to_goal, sin_to_goal]`` side by side.
+
+    ``layout="no_goal"`` renders the 6D no-goal risk tokens used by the
+    v3/ScoreVis tasks: ``[x, y, visibility_score, depth_mean, depth_edge,
+    frontier]``, showing the continuous visibility score and normalized depth.
     """
     tokens = np.asarray(scene_tokens, dtype=np.float32)
     if tokens.ndim == 1:
@@ -1814,6 +1837,14 @@ def _scene_tokens_to_rgb(scene_tokens: np.ndarray, token_grid_size: int = 8) -> 
     expected_tokens = token_grid_size * token_grid_size
     if tokens.shape[0] != expected_tokens or tokens.shape[1] < 4:
         raise ValueError(f"Expected [{expected_tokens}, >=4] scene tokens, got {tokens.shape}")
+
+    if layout == "no_goal":
+        visibility_score = tokens[:, 2].reshape(token_grid_size, token_grid_size)
+        depth_mean = tokens[:, 3].reshape(token_grid_size, token_grid_size)
+        visibility_rgb = _scalar_frame_to_rgb(visibility_score, value_min=0.0, value_max=1.0, cmap_name="magma")
+        depth_rgb = _scalar_frame_to_rgb(depth_mean, value_min=0.0, value_max=1.0, cmap_name="viridis")
+        separator = np.full((token_grid_size, 1, 3), 245, dtype=np.uint8)
+        return np.concatenate([visibility_rgb, separator, depth_rgb], axis=1)
 
     visible_ratio = tokens[:, 2].reshape(token_grid_size, token_grid_size)
     dist_to_goal = tokens[:, 3].reshape(token_grid_size, token_grid_size)
@@ -1949,6 +1980,19 @@ def _capture_observation_frame_cache(
             cached_frames["local_gradient"][env_id] = local_terrain_map.gradient_frame(env_id)
 
     if depth_sensor is not None and depth_sensor_cfg is not None:
+        # Match the scene-token observation term the environment actually uses so
+        # the GIF panels show the same visibility decay / token layout as the
+        # policy. ScoreVis tasks set decay=0.995 (continuous confidence).
+        policy_obs_cfg = getattr(env.unwrapped.cfg.observations, "policy", None)
+        scene_tokens_term = getattr(policy_obs_cfg, "scene_tokens", None)
+        token_func_name = getattr(getattr(scene_tokens_term, "func", None), "__name__", "")
+        term_params = getattr(scene_tokens_term, "params", None) or {}
+        try:
+            decay = float(term_params.get("decay", 1.0))
+        except (TypeError, ValueError):
+            decay = 1.0
+        score_mode = decay < 1.0
+        use_no_goal_tokens = token_func_name == "scene_tokens_risk_no_goal_from_visibility_map"
         try:
             visibility_obs = nav_observations.local_visibility_map(
                 env.unwrapped,
@@ -1959,29 +2003,48 @@ def _capture_observation_frame_cache(
                 depth_min_m=0.5,
                 depth_max_m=8.0,
                 pixel_stride=2,
-                decay=1.0,
+                decay=decay,
             )
             visibility_np = visibility_obs.detach().cpu().view(num_envs, 64, 64).numpy()
             for env_id in range(num_envs):
-                cached_frames["visibility_obs"][env_id] = _visibility_map_to_rgb(visibility_np[env_id])
+                if score_mode:
+                    cached_frames["visibility_obs"][env_id] = _visibility_score_map_to_rgb(visibility_np[env_id])
+                else:
+                    cached_frames["visibility_obs"][env_id] = _visibility_map_to_rgb(visibility_np[env_id])
         except Exception as exc:
             print(f"[WARN] Failed to capture actor visibility-map observation: {exc}")
         try:
-            scene_tokens = nav_observations.scene_tokens_from_visibility_map(
-                env.unwrapped,
-                sensor_cfg=depth_sensor_cfg,
-                asset_cfg=SceneEntityCfg("robot"),
-                size_m=6.4,
-                grid_size=64,
-                token_grid_size=8,
-                depth_min_m=0.5,
-                depth_max_m=8.0,
-                pixel_stride=2,
-                decay=1.0,
-            )
+            if use_no_goal_tokens:
+                scene_tokens = nav_observations.scene_tokens_risk_no_goal_from_visibility_map(
+                    env.unwrapped,
+                    sensor_cfg=depth_sensor_cfg,
+                    asset_cfg=SceneEntityCfg("robot"),
+                    size_m=6.4,
+                    grid_size=64,
+                    token_grid_size=8,
+                    depth_min_m=0.5,
+                    depth_max_m=8.0,
+                    pixel_stride=2,
+                    decay=decay,
+                )
+            else:
+                scene_tokens = nav_observations.scene_tokens_from_visibility_map(
+                    env.unwrapped,
+                    sensor_cfg=depth_sensor_cfg,
+                    asset_cfg=SceneEntityCfg("robot"),
+                    size_m=6.4,
+                    grid_size=64,
+                    token_grid_size=8,
+                    depth_min_m=0.5,
+                    depth_max_m=8.0,
+                    pixel_stride=2,
+                    decay=decay,
+                )
             scene_tokens_np = scene_tokens.detach().cpu().view(num_envs, 64, 6).numpy()
             for env_id in range(num_envs):
-                cached_frames["scene_tokens"][env_id] = _scene_tokens_to_rgb(scene_tokens_np[env_id])
+                cached_frames["scene_tokens"][env_id] = _scene_tokens_to_rgb(
+                    scene_tokens_np[env_id], layout="no_goal" if use_no_goal_tokens else "v1"
+                )
         except Exception as exc:
             print(f"[WARN] Failed to capture actor scene-token observation: {exc}")
 
@@ -3735,7 +3798,7 @@ def _run_eval_pass(
         else:
             base_contact_records = []
 
-        if failure_rgb_output_dir is not None:
+        if failure_rgb_output_dir is not None and episode_start_index >= args_cli.failure_rgb_min_episode:
             remaining_success_budget = max(0, failure_rgb_success_limit - failure_rgb_success_rendered_count)
             remaining_failure_budget = max(0, failure_rgb_failure_limit - failure_rgb_failure_rendered_count)
             rendered_success_count, rendered_failure_count, skipped_success_distance_count, skipped_success_height_delta_count, rendered_paths = capture_failure_rgb_screenshots(
@@ -4272,7 +4335,7 @@ def main():
             topdown_rendered_count += rendered_count
             topdown_rendered_paths.extend(rendered_paths)
 
-        if failure_rgb_output_dir is not None:
+        if failure_rgb_output_dir is not None and episode_start_index >= args_cli.failure_rgb_min_episode:
             remaining_success_budget = max(0, failure_rgb_success_limit - failure_rgb_success_rendered_count)
             remaining_failure_budget = max(0, failure_rgb_failure_limit - failure_rgb_failure_rendered_count)
             rendered_success_count, rendered_failure_count, skipped_success_distance_count, skipped_success_height_delta_count, rendered_paths = capture_failure_rgb_screenshots(

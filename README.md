@@ -2113,7 +2113,7 @@ scene token 的维度仍为 `64 x 6`；第三维从二值 patch 可见比例变�
 ```bash
 /workspace/instinctlab51-env/bin/python /workspace/instinct_nav/_launcher.py train \
   --task Instinct-Nav-G1-SRU-SceneTokenScoreVis-SharedLowCam-OfficialParkour-Query-v0 \
-  --num_envs 4096 --max_iterations 3000 --seed 72 \
+  --num_envs 4096 --max_iterations 6000 --seed 72 \
   --run_name g1_sru_scene_token_score_vis_official_parkour_v1 \
   --wandb --wandb_entity qqfqqf0612-wuhan-university \
   --wandb_project instinct_nav --headless
@@ -2183,3 +2183,65 @@ Instinct-Nav-G1-SRU-SceneTokenScoreVis-SharedLowCam-OfficialParkour-Query-Play-v
 - 连续模式回归测试确认：重复命中时得分升高，停止命中时得分衰减。
 - 兼容性测试确认：默认 `visibility_decay=1.0` 时旧地图仍为二值且不会衰减。
 - ScoreVis Dev 任务已在 IsaacLab 中成功注册、解析并初始化。
+
+
+## 动态障碍课程（Dynamic Obstacle Curriculum）
+
+日期：2026-08-04；执行者：Codex。
+
+在 ScoreVis 基础上新增阶段三：动态障碍避障课程。低层 parkour 保持冻结，只往场景里加脚本化运动的刚体障碍，并接入相机射线、避障奖励与碰撞终止。
+
+### 新增内容
+
+- `mdp/dynamic_obstacles.py`：`DynamicObstacleManager`，支持 `patrol`（折线往返）与 `random_walk`（随机转向）两种运动模式；reset 时在机器人周围环形区域采样并避开目标点；高度由地形高度场实时查询，保证障碍贴着地面移动。
+- env cfg：每个 env 生成 4 个 0.5×0.5×0.8 m 的橙色箱子（`RigidObjectCfg`），共享相机 `mesh_prim_paths` 加入障碍（`track_mesh_transforms=True`，保证移动网格实时参与 raycast）。
+- 事件：`dynamic_obstacles_reset`（reset 模式）、`dynamic_obstacles_update`（interval 0.0s，即每个 env step 更新一次）。
+- 奖励/终止：`obstacle_proximity`（-0.5，指数 shaping，penalty_radius=1.2m、falloff=0.3）、`obstacle_approach_penalty`（-0.3，接近速度惩罚）、`obstacle_collision`（0.6m 内终止）。
+
+### 新增任务
+
+```text
+Instinct-Nav-G1-SRU-SceneTokenScoreVis-DynamicObstacle-OfficialParkour-Query-v0
+Instinct-Nav-G1-SRU-SceneTokenScoreVis-DynamicObstacle-OfficialParkour-Query-Dev-v0
+Instinct-Nav-G1-SRU-SceneTokenScoreVis-DynamicObstacle-OfficialParkour-Query-Play-v0
+```
+
+### 训练命令
+
+```bash
+/workspace/instinctlab51-env/bin/python /workspace/instinct_nav/_launcher.py train   --task Instinct-Nav-G1-SRU-SceneTokenScoreVis-DynamicObstacle-OfficialParkour-Query-v0   --num_envs 4096 --max_iterations 6000 --seed 72   --run_name g1_sru_scene_token_score_vis_dynamic_official_parkour_v1   --wandb --wandb_entity qqfqqf0612-wuhan-university   --wandb_project instinct_nav --headless
+```
+
+### 参数（可调课程项）
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `num_obstacles` | 4 | 每 env 障碍数 |
+| `obstacle_speed_range` | (0.3, 0.6) | 运动速度 m/s |
+| `obstacle_pattern` | patrol | patrol / random_walk |
+| `obstacle_half_extent_m` | 2.0 | 巡逻盒半宽 |
+| `obstacle_min/max_start_dist` | 1.5 / 3.2 | 初始环形采样半径 |
+| `obstacle_collision_radius` | 0.6 | 碰撞终止半径 |
+| `obstacle_penalty_radius` | 1.2 | 近障惩罚半径 |
+| `obstacle_auto_switch_success` | 0.9 | 普通阶段窗口成功率达标后自动开启动态 |
+| `obstacle_max_switch_iteration` | 3000 | 最迟在第 3000 轮强制开启动态（保证动态阶段训练量） |
+| `obstacle_switch_check_interval` | 100 | 每 100 env step 检查一次切换条件 |
+
+### 课程切换机制（单次训练内自动切换）
+
+一次训练共 6000 轮，不需要 resume_checkpoint：
+
+1. **静态阶段**（约前 0~3000 轮）：障碍停在离机器人 12m 远的驻车位置，速度为 0，深度/可见性看不到它们，`obstacle_proximity / approach / collision` 天然约为 0，等价于普通 ScoreVis 训练；
+2. 每 100 env step 检查一次窗口成功率（`robot_goal` 的 success buffer 均值，约 4096×10 个 episode 的滚动窗口）；
+3. **切换触发**：窗口成功率 ≥ 0.9 **或** 迭代数达到 3000（硬上限，保证动态阶段至少 ~3000 轮训练量）→ 障碍自动传送到机器人周围环形区域并开始运动（避开当前机器人位置和目标点）；
+4. **动态阶段**（切换到第 6000 轮）：正常避障训练，proximity/approach 惩罚与碰撞终止生效。
+
+日志会打印 `[DynamicObstacleManager] Switching curriculum at step ...`。
+
+
+### 今日验证
+
+- 所有新增/修改文件通过 `py_compile`。
+- Dev smoke test 通过：`--num_envs 32 --max_iterations 1` 成功创建 32 env（含 4×32 个动态障碍）、事件/奖励/终止全部激活、产出 `model_0.pt`。
+- 单任务课程切换 smoke test 通过：静态阶段障碍驻车在远处、奖励/终止保持 ~0，自动切换逻辑（窗口成功率 ≥ 0.9 或第 3000 轮）已接入并验证不报错。
+- 待办（未做）：动态场景 eval manifest（统计 success + collision frequency）、MuJoCo 移动 box 扩展、真机侧同步。

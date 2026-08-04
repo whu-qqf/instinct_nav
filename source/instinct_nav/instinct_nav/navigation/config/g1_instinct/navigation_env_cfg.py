@@ -5,11 +5,17 @@ import math
 import os
 from pathlib import Path
 
+import isaaclab.sim as sim_utils
+
+from isaaclab.assets import RigidObjectCfg
 from isaaclab.managers import EventTermCfg as EventTerm
+from isaaclab.managers import RewardTermCfg as RewTerm
+from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import RayCasterCfg, patterns
+from isaaclab.sensors.ray_caster.multi_mesh_ray_caster_cfg import MultiMeshRayCasterCfg
 from isaaclab.sensors.ray_caster.patterns import PinholeCameraPatternCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
@@ -556,6 +562,140 @@ class G1InstinctNavigationEnvCfg_SCENE_TOKEN_SCORE_VIS_SHARED_LOWCAM_OFFICIAL_DE
 @configclass
 class G1InstinctNavigationEnvCfg_SCENE_TOKEN_SCORE_VIS_SHARED_LOWCAM_OFFICIAL_PLAY(
     G1InstinctNavigationEnvCfg_SCENE_TOKEN_SCORE_VIS_SHARED_LOWCAM_OFFICIAL
+):
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.num_envs = 20
+        self.observations.policy.enable_corruption = False
+        self.scene.env_spacing = 2.5
+        self.events.base_external_force_torque = None
+        self.events.push_robot = None
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_DYNAMIC_OFFICIAL(
+    G1InstinctNavigationEnvCfg_SCENE_TOKEN_SCORE_VIS_SHARED_LOWCAM_OFFICIAL
+):
+    """Stage-3 dynamic obstacle curriculum on top of ScoreVis shared-lowcam.
+
+    Adds per-env scripted rigid obstacles that are ray-castable by the shared
+    camera, reset away from spawn/goal, and drive obstacle-avoidance reward and
+    termination. The low-level parkour policy stays frozen.
+    """
+
+    num_obstacles: int = 4
+    obstacle_speed_range: tuple[float, float] = (0.3, 0.6)
+    obstacle_pattern: str = "patrol"
+    obstacle_half_extent_m: float = 2.0
+    obstacle_min_start_dist: float = 1.5
+    obstacle_max_start_dist: float = 3.2
+    obstacle_goal_clearance_m: float = 1.0
+    obstacle_half_height: float = 0.4
+    obstacle_collision_radius: float = 0.6
+    obstacle_penalty_radius: float = 1.2
+    obstacle_auto_switch_success: float = 0.9
+    obstacle_max_switch_iteration: int = 3000
+    obstacle_switch_check_interval: int = 100
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        obstacle_names = []
+        for index in range(self.num_obstacles):
+            name = f"obstacle_{index}"
+            obstacle_names.append(name)
+            setattr(
+                self.scene,
+                name,
+                RigidObjectCfg(
+                    prim_path=f"{{ENV_REGEX_NS}}/Obstacle_{index}",
+                    spawn=sim_utils.CuboidCfg(
+                        size=(0.5, 0.5, 0.8),
+                        rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                            max_depenetration_velocity=1.0,
+                        ),
+                        mass_props=sim_utils.MassPropertiesCfg(mass=8.0),
+                        collision_props=sim_utils.CollisionPropertiesCfg(),
+                        physics_material=sim_utils.RigidBodyMaterialCfg(),
+                        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.9, 0.35, 0.1)),
+                    ),
+                    init_state=RigidObjectCfg.InitialStateCfg(pos=(0.0, 0.0, 0.5)),
+                ),
+            )
+
+        # Let the shared camera ray-cast against the moving obstacles.
+        extra_targets = [
+            MultiMeshRayCasterCfg.RaycastTargetCfg(
+                prim_expr=f"{{ENV_REGEX_NS}}/Obstacle_{index}",
+                is_shared=False,
+                track_mesh_transforms=True,
+            )
+            for index in range(self.num_obstacles)
+        ]
+        self.scene.camera.mesh_prim_paths = list(self.scene.camera.mesh_prim_paths) + extra_targets
+
+        event_params = {
+            "obstacle_names": obstacle_names,
+            "speed_range": self.obstacle_speed_range,
+            "pattern": self.obstacle_pattern,
+            "half_extent_m": self.obstacle_half_extent_m,
+            "min_start_dist": self.obstacle_min_start_dist,
+            "max_start_dist": self.obstacle_max_start_dist,
+            "goal_clearance_m": self.obstacle_goal_clearance_m,
+            "obstacle_half_height": self.obstacle_half_height,
+            "auto_switch_success": self.obstacle_auto_switch_success,
+            "max_switch_iteration": self.obstacle_max_switch_iteration,
+            "switch_check_interval": self.obstacle_switch_check_interval,
+        }
+        self.events.dynamic_obstacles_reset = EventTerm(
+            func=nav_mdp.reset_dynamic_obstacles,
+            mode="reset",
+            params=dict(event_params),
+        )
+        self.events.dynamic_obstacles_update = EventTerm(
+            func=nav_mdp.update_dynamic_obstacles,
+            mode="interval",
+            interval_range_s=(0.0, 0.0),
+            params=dict(event_params),
+        )
+
+        self.rewards.obstacle_proximity = RewTerm(
+            func=nav_mdp.obstacle_proximity,
+            weight=-0.5,
+            params={
+                "obstacle_names": obstacle_names,
+                "penalty_radius": self.obstacle_penalty_radius,
+                "falloff": 0.3,
+            },
+        )
+        self.rewards.obstacle_approach_penalty = RewTerm(
+            func=nav_mdp.obstacle_approach_penalty,
+            weight=-0.3,
+            params={"obstacle_names": obstacle_names, "speed_scale": 1.0},
+        )
+        self.terminations.obstacle_collision = DoneTerm(
+            func=nav_mdp.obstacle_collision,
+            params={"obstacle_names": obstacle_names, "collision_radius": self.obstacle_collision_radius},
+        )
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_DYNAMIC_OFFICIAL_DEV(
+    G1InstinctNavigationEnvCfg_DYNAMIC_OFFICIAL
+):
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.num_envs = 32
+        self.scene.terrain.terrain_generator.num_rows = 2
+        self.scene.terrain.terrain_generator.num_cols = 8
+        self.scene.terrain.max_init_terrain_level = 0
+        self.scene.terrain.terrain_generator.difficulty_range = [0.0, 0.0]
+        self.scene.terrain.terrain_generator.curriculum = False
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_DYNAMIC_OFFICIAL_PLAY(
+    G1InstinctNavigationEnvCfg_DYNAMIC_OFFICIAL
 ):
     def __post_init__(self):
         super().__post_init__()

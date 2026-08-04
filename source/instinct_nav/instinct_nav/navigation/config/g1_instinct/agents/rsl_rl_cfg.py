@@ -224,3 +224,26 @@ class G1InstinctNavPPOSceneTokenScoreVisOfficialRunnerDevCfg(
         super().__post_init__()
         self.max_iterations = 10
         self.experiment_name = "g1_instinct_navigation_score_vis_dev"
+
+
+@configclass
+class G1InstinctNavPPOSceneTokenScoreVisDynamicOfficialRunnerCfg(
+    G1InstinctNavPPOSceneTokenScoreVisOfficialRunnerCfg
+):
+    """Stage-3 dynamic obstacle curriculum runner (6000 total iterations)."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.run_name = "scene_token_score_vis_dynamic_official_parkour"
+        self.max_iterations = 6000
+
+
+@configclass
+class G1InstinctNavPPOSceneTokenScoreVisDynamicOfficialRunnerDevCfg(
+    G1InstinctNavPPOSceneTokenScoreVisDynamicOfficialRunnerCfg
+):
+    def __post_init__(self):
+        super().__post_init__()
+        self.max_iterations = 10
+        self.experiment_name = "g1_instinct_navigation_score_vis_dynamic_dev"
+        self.logger = "tensorboard"
