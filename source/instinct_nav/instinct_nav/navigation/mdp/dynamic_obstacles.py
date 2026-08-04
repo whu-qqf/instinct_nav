@@ -112,7 +112,7 @@ class DynamicObstacleManager:
         # In-run curriculum state: obstacles stay parked (far away, static) until
         # the static-phase success rate reaches the switch threshold.
         self.enabled = False
-        self.park_offset_m = 12.0
+        self.park_offset_m = 40.0
         self.auto_switch_success = 0.9
         self.max_switch_iteration = 3000
         self.switch_check_interval = 100
@@ -222,10 +222,15 @@ class DynamicObstacleManager:
 
         positions = torch.zeros(n, self.num_obstacles, 3, device=self.device)
         positions[:, :, :2] = center
-        flat_pos = positions.reshape(-1, 3)
-        flat_ids = env_ids.repeat_interleave(self.num_obstacles)
-        z = _terrain_z_at(self.env, self.terrain_lookup, flat_pos, flat_ids).reshape(n, self.num_obstacles)
-        positions[:, :, 2] = z + self.obstacle_half_height
+        if self.enabled:
+            flat_pos = positions.reshape(-1, 3)
+            flat_ids = env_ids.repeat_interleave(self.num_obstacles)
+            z = _terrain_z_at(self.env, self.terrain_lookup, flat_pos, flat_ids).reshape(n, self.num_obstacles)
+            positions[:, :, 2] = z + self.obstacle_half_height
+        else:
+            # Parked far outside the terrain tile; gravity is disabled so the
+            # obstacles float in place and can never interact with the robot.
+            positions[:, :, 2] = 0.5
 
         self.centers[env_ids] = center
         self.speeds[env_ids] = speeds
@@ -471,6 +476,8 @@ def obstacle_proximity(
     if not obstacle_names:
         return torch.zeros(env.num_envs, device=env.device)
     manager = _get_or_create_dynamic_obstacle_manager(env, obstacle_names=obstacle_names)
+    if not manager.enabled:
+        return torch.zeros(env.num_envs, device=env.device)
     dist = manager.min_dist_to_robot()
     falloff = max(float(falloff), 1.0e-3)
     return torch.exp(-(dist - penalty_radius) / falloff)
@@ -489,6 +496,8 @@ def obstacle_approach_penalty(
     if not obstacle_names:
         return torch.zeros(env.num_envs, device=env.device)
     manager = _get_or_create_dynamic_obstacle_manager(env, obstacle_names=obstacle_names)
+    if not manager.enabled:
+        return torch.zeros(env.num_envs, device=env.device)
     closing = manager.closing_speed_to_robot()
     speed_scale = max(float(speed_scale), 1.0e-3)
     return (closing / speed_scale).clamp(max=2.0)
@@ -503,4 +512,6 @@ def obstacle_collision(
     if not obstacle_names:
         return torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)
     manager = _get_or_create_dynamic_obstacle_manager(env, obstacle_names=obstacle_names)
+    if not manager.enabled:
+        return torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)
     return manager.min_dist_to_robot() < collision_radius

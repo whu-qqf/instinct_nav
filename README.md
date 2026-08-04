@@ -2231,7 +2231,7 @@ Instinct-Nav-G1-SRU-SceneTokenScoreVis-DynamicObstacle-OfficialParkour-Query-Pla
 
 一次训练共 6000 轮，不需要 resume_checkpoint：
 
-1. **静态阶段**（约前 0~3000 轮）：障碍停在离机器人 12m 远的驻车位置，速度为 0，深度/可见性看不到它们，`obstacle_proximity / approach / collision` 天然约为 0，等价于普通 ScoreVis 训练；
+1. **静态阶段**（约前 0~3000 轮）：障碍停在离机器人 40m 远的驻车位置（超出 30m 地形块，机器人永远走不到）、重力关闭、速度为 0，深度/可见性看不到它们；且奖励/终止函数在未启用时**显式返回 0/False**，静态阶段完全等价于普通 ScoreVis 训练；
 2. 每 100 env step 检查一次窗口成功率（`robot_goal` 的 success buffer 均值，约 4096×10 个 episode 的滚动窗口）；
 3. **切换触发**：窗口成功率 ≥ 0.9 **或** 迭代数达到 3000（硬上限，保证动态阶段至少 ~3000 轮训练量）→ 障碍自动传送到机器人周围环形区域并开始运动（避开当前机器人位置和目标点）；
 4. **动态阶段**（切换到第 6000 轮）：正常避障训练，proximity/approach 惩罚与碰撞终止生效。

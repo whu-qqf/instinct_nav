@@ -613,6 +613,7 @@ class G1InstinctNavigationEnvCfg_DYNAMIC_OFFICIAL(
                         size=(0.5, 0.5, 0.8),
                         rigid_props=sim_utils.RigidBodyPropertiesCfg(
                             max_depenetration_velocity=1.0,
+                            disable_gravity=True,
                         ),
                         mass_props=sim_utils.MassPropertiesCfg(mass=8.0),
                         collision_props=sim_utils.CollisionPropertiesCfg(),
