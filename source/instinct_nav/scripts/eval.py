@@ -4082,14 +4082,24 @@ def main():
     env = LegacyRslRlVecEnvWrapper(env)
 
     if args_cli.force_dynamic_obstacles:
-        manager = getattr(env.unwrapped, "_dynamic_obstacle_manager", None)
-        if manager is not None:
+        from instinct_nav.navigation.mdp.dynamic_obstacles import _get_or_create_dynamic_obstacle_manager
+
+        # Build the manager explicitly from the configured event params instead of
+        # relying on the reset chain having already created it. This guarantees the
+        # flag is never a silent no-op.
+        update_term = getattr(getattr(env.unwrapped.cfg, "events", None), "dynamic_obstacles_update", None)
+        params = dict(getattr(update_term, "params", {}) or {})
+        obstacle_names = params.pop("obstacle_names", None)
+        if obstacle_names:
+            manager = _get_or_create_dynamic_obstacle_manager(
+                env.unwrapped, obstacle_names=list(obstacle_names), **params
+            )
             manager.enable()
             print("[INFO] Dynamic obstacles forced ENABLED for evaluation.")
         else:
             print(
-                "[WARN] --force_dynamic_obstacles set but no dynamic obstacle manager "
-                "found (task may not include obstacles); ignoring."
+                "[WARN] --force_dynamic_obstacles set but task has no dynamic-obstacle "
+                "event term; ignoring."
             )
 
     policy_reset = None
