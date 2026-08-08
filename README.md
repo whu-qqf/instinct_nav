@@ -2224,7 +2224,8 @@ Instinct-Nav-G1-SRU-SceneTokenScoreVis-DynamicObstacle-OfficialParkour-Query-Pla
 | `obstacle_collision_radius` | 0.6 | 碰撞终止半径 |
 | `obstacle_penalty_radius` | 1.2 | 近障惩罚半径 |
 | `obstacle_auto_switch_success` | 0.9 | 普通阶段窗口成功率达标后自动开启动态 |
-| `obstacle_max_switch_iteration` | 3000 | 最迟在第 3000 轮强制开启动态（保证动态阶段训练量） |
+| `obstacle_max_switch_iteration` | 3000 | 最迟在第 3000 个 PPO iteration 强制开启动态（保证动态阶段训练量） |
+| `obstacle_env_steps_per_iteration` | 16 | 每 PPO iteration 的 env step 数，用于把轮数换算成 env step（3000 × 16 = 48000） |
 | `obstacle_switch_check_interval` | 100 | 每 100 env step 检查一次切换条件 |
 
 ### 课程切换机制（单次训练内自动切换）
@@ -2233,10 +2234,10 @@ Instinct-Nav-G1-SRU-SceneTokenScoreVis-DynamicObstacle-OfficialParkour-Query-Pla
 
 1. **静态阶段**（约前 0~3000 轮）：障碍停在离机器人 40m 远的驻车位置（超出 30m 地形块，机器人永远走不到）、重力关闭、速度为 0，深度/可见性看不到它们；且奖励/终止函数在未启用时**显式返回 0/False**，静态阶段完全等价于普通 ScoreVis 训练；
 2. 每 100 env step 检查一次窗口成功率（`robot_goal` 的 success buffer 均值，约 4096×10 个 episode 的滚动窗口）；
-3. **切换触发**：窗口成功率 ≥ 0.9 **或** 迭代数达到 3000（硬上限，保证动态阶段至少 ~3000 轮训练量）→ 障碍自动传送到机器人周围环形区域并开始运动（避开当前机器人位置和目标点）；
+3. **切换触发**：窗口成功率 ≥ 0.9 **或** PPO 迭代数达到 3000（硬上限 = 3000 × 16 = 48000 env step，保证动态阶段至少 ~3000 轮训练量）→ 障碍自动传送到机器人周围环形区域并开始运动（避开当前机器人位置和目标点）；
 4. **动态阶段**（切换到第 6000 轮）：正常避障训练，proximity/approach 惩罚与碰撞终止生效。
 
-日志会打印 `[DynamicObstacleManager] Switching curriculum at step ...`。
+日志会打印 `[DynamicObstacleManager] Switching curriculum at env step ... (~iteration ...) ...`。新增 TensorBoard/WandB 指标：`Metrics/dynamic_obstacles/enabled`（0/1）与 `Metrics/dynamic_obstacles/min_dist_mean`（平均最近障碍距离，静态阶段为 40m）。
 
 
 ### 今日验证

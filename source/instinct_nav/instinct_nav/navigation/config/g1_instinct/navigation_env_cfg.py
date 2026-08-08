@@ -595,6 +595,7 @@ class G1InstinctNavigationEnvCfg_DYNAMIC_OFFICIAL(
     obstacle_penalty_radius: float = 1.2
     obstacle_auto_switch_success: float = 0.9
     obstacle_max_switch_iteration: int = 3000
+    obstacle_env_steps_per_iteration: int = 16
     obstacle_switch_check_interval: int = 100
 
     def __post_init__(self):
@@ -646,6 +647,7 @@ class G1InstinctNavigationEnvCfg_DYNAMIC_OFFICIAL(
             "obstacle_half_height": self.obstacle_half_height,
             "auto_switch_success": self.obstacle_auto_switch_success,
             "max_switch_iteration": self.obstacle_max_switch_iteration,
+            "env_steps_per_iteration": self.obstacle_env_steps_per_iteration,
             "switch_check_interval": self.obstacle_switch_check_interval,
         }
         self.events.dynamic_obstacles_reset = EventTerm(

@@ -115,6 +115,7 @@ class DynamicObstacleManager:
         self.park_offset_m = 40.0
         self.auto_switch_success = 0.9
         self.max_switch_iteration = 3000
+        self.env_steps_per_iteration = 16
         self.switch_check_interval = 100
         self._last_switch_check = -1
 
@@ -242,6 +243,7 @@ class DynamicObstacleManager:
     def update(self, dt: float):
         """Advance scripted motion for every env and write poses to the simulator."""
         dt = float(dt)
+        self._log_metrics()
         if not self.enabled:
             # Static-phase obstacles stay parked; check whether to switch the
             # curriculum on (windowed static success >= threshold or iteration cap).
@@ -286,6 +288,23 @@ class DynamicObstacleManager:
         self.enabled = True
         self.reset(env_ids)
         print(f"[DynamicObstacleManager] Dynamic obstacles ENABLED (step {self.env.common_step_counter}).")
+        self._log_metrics()
+
+    def _log_metrics(self):
+        """Expose dynamic-obstacle state to TensorBoard/WandB via env.extras log."""
+        extras = getattr(self.env, "extras", None)
+        if extras is None:
+            return
+        log = extras.setdefault("log", {})
+        log["Metrics/dynamic_obstacles/enabled"] = float(self.enabled)
+        if self.enabled:
+            log["Metrics/dynamic_obstacles/min_dist_mean"] = float(
+                self.min_dist_to_robot().mean().item()
+            )
+        else:
+            log["Metrics/dynamic_obstacles/min_dist_mean"] = float(
+                self.park_offset_m
+            )
 
     def _mean_success_rate(self) -> float:
         """Windowed mean success rate from the robot-goal command tracker."""
@@ -311,14 +330,22 @@ class DynamicObstacleManager:
         self._last_switch_check = step
         if step % self.switch_check_interval != 0:
             return
+        # max_switch_iteration is in PPO iterations; convert to env steps so the
+        # static phase lasts until ~max_switch_iteration learning iterations.
+        steps_per_iter = max(1, int(self.env_steps_per_iteration))
+        cap_env_steps = int(self.max_switch_iteration) * steps_per_iter
         mean_success = self._mean_success_rate()
-        if mean_success >= self.auto_switch_success or step >= self.max_switch_iteration:
+        if mean_success >= self.auto_switch_success or step >= cap_env_steps:
+            approx_iteration = step // steps_per_iter
             reason = (
                 f"success={mean_success:.3f} >= {self.auto_switch_success}"
                 if mean_success >= self.auto_switch_success
                 else f"iteration cap {self.max_switch_iteration}"
             )
-            print(f"[DynamicObstacleManager] Switching curriculum at step {step} ({reason}).")
+            print(
+                f"[DynamicObstacleManager] Switching curriculum at env step {step} "
+                f"(~iteration {approx_iteration}) ({reason})."
+            )
             self.enable()
 
     def min_dist_to_robot(self) -> torch.Tensor:
@@ -342,8 +369,9 @@ class DynamicObstacleManager:
 
         obs_vel = self.dirs * self.speeds.unsqueeze(-1)  # [num_envs, K, 2] world XY
         robot_vel = robot.data.root_lin_vel_w[:, :2].unsqueeze(1)  # [num_envs, 1, 2]
-        rel_vel = obs_vel - robot_vel
-        closing = torch.sum(rel_vel * unit, dim=-1)  # [num_envs, K]
+        # closing speed = -d(dist)/dt = dot(robot_vel - obs_vel, unit); positive
+        # when the obstacle is approaching (distance shrinking).
+        closing = torch.sum((robot_vel - obs_vel) * unit, dim=-1)  # [num_envs, K]
         return closing.clamp_min(0.0).max(dim=-1).values
 
 
@@ -359,6 +387,7 @@ def _get_or_create_dynamic_obstacle_manager(
     obstacle_half_height: float = 0.4,
     auto_switch_success: float = 0.9,
     max_switch_iteration: int = 3000,
+    env_steps_per_iteration: int = 16,
     switch_check_interval: int = 100,
 ) -> DynamicObstacleManager:
     manager = getattr(env, "_dynamic_obstacle_manager", None)
@@ -376,6 +405,7 @@ def _get_or_create_dynamic_obstacle_manager(
         )
         manager.auto_switch_success = float(auto_switch_success)
         manager.max_switch_iteration = int(max_switch_iteration)
+        manager.env_steps_per_iteration = int(env_steps_per_iteration)
         manager.switch_check_interval = int(switch_check_interval)
         env._dynamic_obstacle_manager = manager
     return manager
@@ -399,6 +429,7 @@ def reset_dynamic_obstacles(
     obstacle_half_height: float = 0.4,
     auto_switch_success: float = 0.9,
     max_switch_iteration: int = 3000,
+    env_steps_per_iteration: int = 16,
     switch_check_interval: int = 100,
 ):
     """Reset event: place obstacles away from spawn/goal and randomize motion."""
@@ -416,6 +447,7 @@ def reset_dynamic_obstacles(
         obstacle_half_height=obstacle_half_height,
         auto_switch_success=auto_switch_success,
         max_switch_iteration=max_switch_iteration,
+        env_steps_per_iteration=env_steps_per_iteration,
         switch_check_interval=switch_check_interval,
     )
     manager.reset(env_ids)
@@ -434,6 +466,7 @@ def update_dynamic_obstacles(
     obstacle_half_height: float = 0.4,
     auto_switch_success: float = 0.9,
     max_switch_iteration: int = 3000,
+    env_steps_per_iteration: int = 16,
     switch_check_interval: int = 100,
 ):
     """Interval event: advance scripted obstacle motion every environment step."""
@@ -451,6 +484,7 @@ def update_dynamic_obstacles(
         obstacle_half_height=obstacle_half_height,
         auto_switch_success=auto_switch_success,
         max_switch_iteration=max_switch_iteration,
+        env_steps_per_iteration=env_steps_per_iteration,
         switch_check_interval=switch_check_interval,
     )
     manager.update(env.step_dt)

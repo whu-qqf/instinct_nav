@@ -367,6 +367,13 @@ parser.add_argument(
     default=0,
     help="Only export failure/success RGB GIFs for episodes whose global episode index is >= this value. 0 disables filtering.",
 )
+
+parser.add_argument(
+    "--force_dynamic_obstacles",
+    action="store_true",
+    default=False,
+    help="Force-enable scripted dynamic obstacles for evaluation, so moving obstacles are active from the first episode.",
+)
 parser.add_argument(
     "--failure_rgb_gif_frame_ms",
     type=int,
@@ -4073,6 +4080,17 @@ def main():
 
     env = gym.make(args_cli.task, cfg=env_cfg)
     env = LegacyRslRlVecEnvWrapper(env)
+
+    if args_cli.force_dynamic_obstacles:
+        manager = getattr(env.unwrapped, "_dynamic_obstacle_manager", None)
+        if manager is not None:
+            manager.enable()
+            print("[INFO] Dynamic obstacles forced ENABLED for evaluation.")
+        else:
+            print(
+                "[WARN] --force_dynamic_obstacles set but no dynamic obstacle manager "
+                "found (task may not include obstacles); ignoring."
+            )
 
     policy_reset = None
     if using_torchscript_policy:
