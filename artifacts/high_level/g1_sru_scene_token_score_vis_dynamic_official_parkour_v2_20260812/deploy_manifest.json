@@ -1,0 +1,22 @@
+{
+  "format_version": 1,
+  "policy_onnx": "sru_high_level_scene_token.onnx",
+  "policy_onnx_sha256": "473a618f632b8c04fa63b72039f570c3f00ef6b220520e4cf2bd772dc7c5f606",
+  "checkpoint_path": "/workspace/instinct_nav/logs/rsl_rl/g1_instinct_navigation_ppo_vismap/2026-08-09_21-13-05_g1_sru_scene_token_score_vis_dynamic_official_parkour_v2/model_5999.pt",
+  "checkpoint_iteration": 5999,
+  "obs_dim": 2960,
+  "num_actions": 3,
+  "rnn_num_layers": 1,
+  "rnn_hidden_size": 512,
+  "scene_token_num_tokens": 64,
+  "scene_token_dim": 6,
+  "scene_token_features_total": 384,
+  "encoded_depth_dim": 2560,
+  "proprio_dim": 16,
+  "image_input_dims": [
+    64,
+    5,
+    8
+  ],
+  "opset": 17
+}

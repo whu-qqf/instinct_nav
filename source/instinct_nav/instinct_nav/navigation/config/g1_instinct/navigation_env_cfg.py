@@ -601,6 +601,11 @@ class G1InstinctNavigationEnvCfg_DYNAMIC_OFFICIAL(
     def __post_init__(self):
         super().__post_init__()
 
+        # 4 obstacles per env across many envs increases the GPU narrowphase
+        # contact load; enlarge the PhysX rigid patch buffer so contact reports
+        # (base_contact / obstacle_collision) stay accurate.
+        self.sim.physx.gpu_max_rigid_patch_count = 2**18
+
         obstacle_names = []
         for index in range(self.num_obstacles):
             name = f"obstacle_{index}"
