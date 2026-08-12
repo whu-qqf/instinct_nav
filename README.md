@@ -2246,3 +2246,84 @@ Instinct-Nav-G1-SRU-SceneTokenScoreVis-DynamicObstacle-OfficialParkour-Query-Pla
 - Dev smoke test 通过：`--num_envs 32 --max_iterations 1` 成功创建 32 env（含 4×32 个动态障碍）、事件/奖励/终止全部激活、产出 `model_0.pt`。
 - 单任务课程切换 smoke test 通过：静态阶段障碍驻车在远处、奖励/终止保持 ~0，自动切换逻辑（窗口成功率 ≥ 0.9 或第 3000 轮）已接入并验证不报错。
 - 待办（未做）：动态场景 eval manifest（统计 success + collision frequency）、MuJoCo 移动 box 扩展、真机侧同步。
+
+## 2026-08-12 动态障碍评估与部署导出
+
+动态障碍课程已完成 `model_5999.pt` 训练。评估结果如下：
+
+| 场景 | 回合数 | 成功率 | 关键终止率 |
+| --- | ---: | ---: | --- |
+| 静态（关闭动态障碍） | 500 | 0.924 | `base_contact=0.038`，`large_pitch_angle=0.048` |
+| 动态（强制开启障碍） | 500 | 0.840 | `obstacle_collision=0.060`，`base_contact=0.098`，`large_pitch_angle=0.064` |
+
+评估文件：
+
+```text
+logs/rsl_rl/g1_instinct_navigation_ppo_vismap/2026-08-09_21-13-05_g1_sru_scene_token_score_vis_dynamic_official_parkour_v2/eval_static_no_dynamic_model_5999_500ep.json
+logs/rsl_rl/g1_instinct_navigation_ppo_vismap/2026-08-09_21-13-05_g1_sru_scene_token_score_vis_dynamic_official_parkour_v2/eval_dynamic_forced_model_5999_500ep.json
+```
+
+### 高层 ONNX 导出
+
+使用最新动态障碍训练 checkpoint 导出，PyTorch/ONNX parity 检查已通过：
+
+```text
+artifacts/high_level/g1_sru_scene_token_score_vis_dynamic_official_parkour_v2_20260812/
+├── sru_high_level_scene_token.onnx
+├── sru_high_level_depth_encoder.onnx
+└── deploy_manifest.json
+```
+
+MuJoCo 部署时必须保持 ScoreVis 的可见性衰减：
+
+```bash
+/workspace/instinctlab51-env/bin/python deploy/mujoco/g1_sru_navigation_sim2sim.py \
+  --low_policy_dir 'data&model/checkpoints/parkour_onboard_preview_stair' \
+  --high_policy artifacts/high_level/g1_sru_scene_token_score_vis_dynamic_official_parkour_v2_20260812/sru_high_level_scene_token.onnx \
+  --high_depth_encoder artifacts/high_level/g1_sru_scene_token_score_vis_dynamic_official_parkour_v2_20260812/sru_high_level_depth_encoder.onnx \
+  --manifest artifacts/high_level/g1_sru_scene_token_score_vis_dynamic_official_parkour_v2_20260812/deploy_manifest.json \
+  --visibility_decay 0.995 --terrain custom \
+  --terrain_file deploy/mujoco/terrains/rich_course.json --viewer
+```
+
+真机 ONNX 部署同样传入 `--visibility_decay 0.995`，不能省略，否则会退回旧的无衰减可见性行为。
+
+### 真机 ROS2 ONNX 命令
+
+在机器人容器内完成 ROS2、相机和 `instinct_venv` 初始化后运行。先不加
+`--nodryrun` 做 dry-run 检查；确认传感器、低层策略和高层策略正常后，再加
+`--nodryrun` 发布真实 `/lowcmd`：
+
+```bash
+cd /workspace/unitree-jetson-container/instinct_nav
+export PYTHONPATH=/workspace/unitree-jetson-container/instinct_nav/deploy:/workspace/unitree-jetson-container/instinct_nav/external/instinct_onboard:$PYTHONPATH
+
+python deploy/scripts/g1_nav_onboard_onnx.py \
+  --standdir /workspace/unitree-jetson-container/data/data/checkpoints/stand_onboard \
+  --logdir /workspace/unitree-jetson-container/data/data/checkpoints/parkour_onboard_preview_stair \
+  --sru_policy_onnx_path artifacts/high_level/g1_sru_scene_token_score_vis_dynamic_official_parkour_v2_20260812/sru_high_level_scene_token.onnx \
+  --sru_depth_encoder_onnx_path artifacts/high_level/g1_sru_scene_token_score_vis_dynamic_official_parkour_v2_20260812/sru_high_level_depth_encoder.onnx \
+  --deploy_manifest_path artifacts/high_level/g1_sru_scene_token_score_vis_dynamic_official_parkour_v2_20260812/deploy_manifest.json \
+  --visibility_decay 0.995 \
+  --camera_frame_timeout_s 0.25 \
+  --goal_pose_topic /instinct_nav/goal_pose \
+  --goal_reached_threshold 0.1 \
+  --odom_topic /dog_odom \
+  --odom_twist_frame body \
+  --odom_timeout_s 0.5 \
+  --command_min -0.3 -0.2 -0.4 \
+  --command_max 0.3 0.2 0.4 \
+  --command_deadband 0.02 0.02 0.02 \
+  --command_slew_rate 0.3 0.2 0.4 \
+  --command_lowpass_alpha 0.4 \
+  --auto_start_parkour \
+  --debug_dump_dir /workspace/instinct_nav_logs/score_vis_dynamic_v2 \
+  --debug_dump_every_steps 5 \
+  --debug_dump_max_steps 100
+```
+
+真实控制前，在上述命令末尾追加：
+
+```bash
+--nodryrun
+```
