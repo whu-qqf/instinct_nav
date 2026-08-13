@@ -204,3 +204,20 @@ _register_navigation_task(
     navigation_env_cfg.G1InstinctNavigationEnvCfg_DYNAMIC_OFFICIAL_PLAY,
     agents.rsl_rl_cfg.G1InstinctNavPPOSceneTokenScoreVisDynamicOfficialRunnerCfg,
 )
+
+# Learned dynamic-map tokens: current frame queries ScoreVis history before SRU query fusion.
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-DynamicMapCross-DynamicObstacle-OfficialParkour-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_OFFICIAL,
+    agents.rsl_rl_cfg.G1InstinctNavPPODynamicMapCrossOfficialRunnerCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-DynamicMapCross-DynamicObstacle-OfficialParkour-Dev-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_OFFICIAL_DEV,
+    agents.rsl_rl_cfg.G1InstinctNavPPODynamicMapCrossOfficialRunnerDevCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-DynamicMapCross-DynamicObstacle-OfficialParkour-Play-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_OFFICIAL_PLAY,
+    agents.rsl_rl_cfg.G1InstinctNavPPODynamicMapCrossOfficialRunnerCfg,
+)

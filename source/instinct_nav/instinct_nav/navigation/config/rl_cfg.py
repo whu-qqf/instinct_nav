@@ -92,6 +92,9 @@ class RslRlPpoActorCriticCfg:
     scene_token_query_num_heads: int = 4
     """Number of attention heads for actor scene-token query fusion."""
 
+    use_dynamic_map_cross_attention: bool = False
+    """Whether raw scene patches are fused by current-to-history cross-attention."""
+
 
 @configclass
 class RslRlPpoAlgorithmCfg:

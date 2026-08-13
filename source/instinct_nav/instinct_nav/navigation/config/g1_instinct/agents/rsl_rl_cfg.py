@@ -247,3 +247,27 @@ class G1InstinctNavPPOSceneTokenScoreVisDynamicOfficialRunnerDevCfg(
         self.max_iterations = 10
         self.experiment_name = "g1_instinct_navigation_score_vis_dynamic_dev"
         self.logger = "tensorboard"
+
+
+@configclass
+class G1InstinctNavPPODynamicMapCrossOfficialRunnerCfg(
+    G1InstinctNavPPOSceneTokenScoreVisDynamicOfficialRunnerCfg
+):
+    """Learned dynamic map tokens from current-to-history cross-attention."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.run_name = "dynamic_map_cross_attention_official_parkour"
+        self.policy.scene_token_dim = 5
+        self.policy.use_dynamic_map_cross_attention = True
+
+
+@configclass
+class G1InstinctNavPPODynamicMapCrossOfficialRunnerDevCfg(
+    G1InstinctNavPPODynamicMapCrossOfficialRunnerCfg
+):
+    def __post_init__(self):
+        super().__post_init__()
+        self.max_iterations = 10
+        self.experiment_name = "g1_instinct_navigation_dynamic_map_cross_dev"
+        self.logger = "tensorboard"

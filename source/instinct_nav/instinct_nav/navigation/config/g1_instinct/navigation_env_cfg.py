@@ -594,7 +594,7 @@ class G1InstinctNavigationEnvCfg_DYNAMIC_OFFICIAL(
     obstacle_collision_radius: float = 0.6
     obstacle_penalty_radius: float = 1.2
     obstacle_auto_switch_success: float = 0.9
-    obstacle_max_switch_iteration: int = 3000
+    obstacle_max_switch_iteration: int = 3003
     obstacle_env_steps_per_iteration: int = 16
     obstacle_switch_check_interval: int = 100
 
@@ -704,6 +704,60 @@ class G1InstinctNavigationEnvCfg_DYNAMIC_OFFICIAL_DEV(
 @configclass
 class G1InstinctNavigationEnvCfg_DYNAMIC_OFFICIAL_PLAY(
     G1InstinctNavigationEnvCfg_DYNAMIC_OFFICIAL
+):
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.num_envs = 20
+        self.observations.policy.enable_corruption = False
+        self.scene.env_spacing = 2.5
+        self.events.base_external_force_torque = None
+        self.events.push_robot = None
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_OFFICIAL(G1InstinctNavigationEnvCfg_DYNAMIC_OFFICIAL):
+    """Dynamic curriculum with learned current-to-history map cross-attention patches."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        map_patch_term = ObsTerm(
+            func=nav_mdp.dynamic_map_patches_from_visibility_map,
+            params={
+                "sensor_cfg": SceneEntityCfg("camera"),
+                "size_m": 6.4,
+                "grid_size": 64,
+                "token_grid_size": 8,
+                "depth_min_m": 0.5,
+                "depth_max_m": 8.0,
+                "pixel_stride": 2,
+                "decay": 0.995,
+            },
+        )
+        self.observations.policy.scene_tokens = map_patch_term
+        self.observations.critic.scene_tokens = map_patch_term
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_OFFICIAL_DEV(
+    G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_OFFICIAL
+):
+    def __post_init__(self):
+        super().__post_init__()
+        # Dev smoke exercises trajectory generation and motion immediately.
+        self.obstacle_max_switch_iteration = 0
+        self.events.dynamic_obstacles_reset.params["max_switch_iteration"] = 0
+        self.events.dynamic_obstacles_update.params["max_switch_iteration"] = 0
+        self.scene.num_envs = 32
+        self.scene.terrain.terrain_generator.num_rows = 2
+        self.scene.terrain.terrain_generator.num_cols = 8
+        self.scene.terrain.max_init_terrain_level = 0
+        self.scene.terrain.terrain_generator.difficulty_range = [0.0, 0.0]
+        self.scene.terrain.terrain_generator.curriculum = False
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_OFFICIAL_PLAY(
+    G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_OFFICIAL
 ):
     def __post_init__(self):
         super().__post_init__()

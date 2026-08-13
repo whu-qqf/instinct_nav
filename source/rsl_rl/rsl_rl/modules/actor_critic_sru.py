@@ -75,6 +75,7 @@ class ActorCriticSRU(nn.Module):
         scene_token_dim: int = 6,
         scene_token_feature_dim: int = 64,
         scene_token_query_num_heads: int = 4,
+        use_dynamic_map_cross_attention: bool = False,
         **kwargs,
     ):
         if kwargs:
@@ -117,6 +118,9 @@ class ActorCriticSRU(nn.Module):
         self.scene_token_dim = int(scene_token_dim)
         self.scene_token_feature_dim = int(scene_token_feature_dim) if (self.use_actor_scene_tokens or self.use_critic_scene_tokens) else 0
         self.scene_token_query_num_heads = int(scene_token_query_num_heads)
+        self.use_dynamic_map_cross_attention = bool(use_dynamic_map_cross_attention)
+        if self.use_dynamic_map_cross_attention and self.scene_token_dim != 5:
+            raise ValueError("dynamic map cross-attention expects scene_token_dim=5")
 
         # Compute the total number of features from image, height, visibility, and scene-token inputs.
         self.num_image_features = image_input_dims[0] * image_input_dims[1] * image_input_dims[2]
@@ -272,10 +276,34 @@ class ActorCriticSRU(nn.Module):
                 torch.zeros(1, self.scene_token_num_tokens, self.scene_token_feature_dim)
             )
             self.scene_token_norm = nn.LayerNorm(self.scene_token_feature_dim)
+            if self.use_dynamic_map_cross_attention:
+                self.history_map_projector = nn.Sequential(
+                    nn.Linear(1, self.scene_token_feature_dim), get_activation(activation),
+                    nn.Linear(self.scene_token_feature_dim, self.scene_token_feature_dim),
+                )
+                self.current_map_projector = nn.Sequential(
+                    nn.Linear(4, self.scene_token_feature_dim), get_activation(activation),
+                    nn.Linear(self.scene_token_feature_dim, self.scene_token_feature_dim),
+                )
+                self.map_cross_attention = nn.MultiheadAttention(
+                    self.scene_token_feature_dim, self.scene_token_query_num_heads, batch_first=True
+                )
+                self.map_cross_norm = nn.LayerNorm(self.scene_token_feature_dim)
+                self.map_cross_ffn = nn.Sequential(
+                    nn.LayerNorm(self.scene_token_feature_dim),
+                    nn.Linear(self.scene_token_feature_dim, self.scene_token_feature_dim * 2),
+                    get_activation(activation),
+                    nn.Linear(self.scene_token_feature_dim * 2, self.scene_token_feature_dim),
+                )
+            else:
+                self.history_map_projector = self.current_map_projector = None
+                self.map_cross_attention = self.map_cross_norm = self.map_cross_ffn = None
         else:
             self.scene_token_projector = None
             self.scene_token_position_embedding = None
             self.scene_token_norm = None
+            self.history_map_projector = self.current_map_projector = None
+            self.map_cross_attention = self.map_cross_norm = self.map_cross_ffn = None
 
         if self.use_actor_scene_tokens:
             self.scene_query_proj = nn.Sequential(
@@ -388,6 +416,8 @@ class ActorCriticSRU(nn.Module):
                 f"tokens={self.scene_token_num_tokens}, token_dim={self.scene_token_dim}, "
                 f"feature_dim={self.scene_token_feature_dim}"
             )
+            if self.use_dynamic_map_cross_attention:
+                print("[ActorCriticSRU] Scene tokens learned by current-to-history map cross-attention")
         # Action noise: using log_std parameter
         self.log_std = nn.Parameter(torch.log(init_noise_std * torch.ones(num_actions)))
         self.distribution = None
@@ -409,6 +439,12 @@ class ActorCriticSRU(nn.Module):
             scene_parameters += list(self.scene_token_projector.parameters())
             scene_parameters += [self.scene_token_position_embedding]
             scene_parameters += list(self.scene_token_norm.parameters())
+            if self.use_dynamic_map_cross_attention:
+                scene_parameters += list(self.history_map_projector.parameters())
+                scene_parameters += list(self.current_map_projector.parameters())
+                scene_parameters += list(self.map_cross_attention.parameters())
+                scene_parameters += list(self.map_cross_norm.parameters())
+                scene_parameters += list(self.map_cross_ffn.parameters())
             if self.use_actor_scene_tokens:
                 scene_parameters += list(self.scene_query_proj.parameters())
                 scene_parameters += list(self.scene_query_norm.parameters())
@@ -548,7 +584,7 @@ class ActorCriticSRU(nn.Module):
             -1, recurrent_features.shape[-1] + proprio_features.shape[-1]
         )
 
-        tokens = self.scene_token_projector(flat_tokens)
+        tokens = self._encode_scene_tokens(flat_tokens)
         tokens = tokens + self.scene_token_position_embedding.to(device=tokens.device, dtype=tokens.dtype)
         query = self.scene_query_proj(flat_context).unsqueeze(1)
         query = self.scene_query_norm(query)
@@ -567,7 +603,7 @@ class ActorCriticSRU(nn.Module):
             -1, recurrent_features.shape[-1] + proprio_features.shape[-1]
         )
 
-        tokens = self.scene_token_projector(flat_tokens)
+        tokens = self._encode_scene_tokens(flat_tokens)
         tokens = tokens + self.scene_token_position_embedding.to(device=tokens.device, dtype=tokens.dtype)
         query = self.critic_scene_query_proj(flat_context).unsqueeze(1)
         query = self.critic_scene_query_norm(query)
@@ -576,6 +612,16 @@ class ActorCriticSRU(nn.Module):
         scene_features = attended.squeeze(1)
         scene_features = scene_features + self.critic_scene_attention_ffn(scene_features)
         return scene_features.reshape(*leading_shape, self.scene_token_feature_dim)
+
+    def _encode_scene_tokens(self, flat_tokens: torch.Tensor) -> torch.Tensor:
+        if not self.use_dynamic_map_cross_attention:
+            return self.scene_token_projector(flat_tokens)
+        position = self.scene_token_position_embedding.to(device=flat_tokens.device, dtype=flat_tokens.dtype)
+        history = self.history_map_projector(flat_tokens[..., :1]) + position
+        current = self.current_map_projector(flat_tokens[..., 1:]) + position
+        attended, _ = self.map_cross_attention(current, history, history, need_weights=False)
+        learned = self.map_cross_norm(current + attended)
+        return learned + self.map_cross_ffn(learned)
 
     def process_actor_input(self, observations: torch.Tensor, masks, hidden_states) -> torch.Tensor:
         """Process actor observations through attention and RNN.

@@ -1478,6 +1478,77 @@ def scene_tokens_risk_no_goal_from_visibility_map(
     return tokens
 
 
+def dynamic_map_patches_from_visibility_map(
+    env,
+    sensor_cfg,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    size_m: float = 6.4,
+    grid_size: int = 64,
+    token_grid_size: int = 8,
+    depth_min_m: float = 0.5,
+    depth_max_m: float = 8.0,
+    pixel_stride: int = 2,
+    decay: float = 0.995,
+) -> torch.Tensor:
+    """Return history/current patches for learned map cross-attention.
+
+    Layout per patch: history score, current hit ratio, current normalized
+    depth, current depth edge, and current-minus-history visibility delta.
+    """
+    cache_key = (
+        "dynamic_map_patches_from_visibility_map",
+        getattr(sensor_cfg, "name", "raycast_camera"),
+        int(getattr(env, "common_step_counter", -1)),
+        int(grid_size),
+        int(token_grid_size),
+        float(decay),
+    )
+    cache = getattr(env, "_instinct_nav_dynamic_map_patch_cache", None)
+    if cache is not None and cache.get("key") == cache_key:
+        return cache["patches"]
+
+    history_flat = local_visibility_map(
+        env, sensor_cfg=sensor_cfg, asset_cfg=asset_cfg, size_m=size_m,
+        grid_size=grid_size, depth_min_m=depth_min_m, depth_max_m=depth_max_m,
+        pixel_stride=pixel_stride, decay=decay,
+    )
+    history = history_flat.view(env.num_envs, 1, grid_size, grid_size)
+    patch_size = grid_size // token_grid_size
+    if patch_size * token_grid_size != grid_size:
+        raise ValueError(f"grid_size={grid_size} must be divisible by token_grid_size={token_grid_size}")
+    history_score = F.avg_pool2d(history, patch_size, patch_size).flatten(start_dim=1)
+
+    depth = _get_noisy_depth_sample(env, sensor_cfg)["depth"]
+    if depth.dim() == 4:
+        depth_image = depth[:, 0]
+    else:
+        height, width = env.scene.sensors[sensor_cfg.name].image_shape
+        depth_image = depth.view(env.num_envs, height, width)
+    valid = torch.isfinite(depth_image) & (depth_image > depth_min_m) & (depth_image < depth_max_m)
+    current_hit = F.adaptive_avg_pool2d(
+        valid.to(history.dtype).unsqueeze(1), (token_grid_size, token_grid_size)
+    ).flatten(start_dim=1)
+    depth_norm = torch.where(
+        valid,
+        ((depth_image - depth_min_m) / max(depth_max_m - depth_min_m, 1.0e-6)).clamp(0.0, 1.0),
+        torch.ones_like(depth_image),
+    )
+    current_depth = F.adaptive_avg_pool2d(
+        depth_norm.unsqueeze(1), (token_grid_size, token_grid_size)
+    ).flatten(start_dim=1)
+    grad_x = F.pad((depth_norm[..., 1:] - depth_norm[..., :-1]).abs(), (0, 1, 0, 0))
+    grad_y = F.pad((depth_norm[..., 1:, :] - depth_norm[..., :-1, :]).abs(), (0, 0, 0, 1))
+    current_edge = F.adaptive_avg_pool2d(
+        (grad_x + grad_y).unsqueeze(1), (token_grid_size, token_grid_size)
+    ).flatten(start_dim=1).clamp(0.0, 1.0)
+    visibility_delta = (current_hit - history_score).clamp(-1.0, 1.0)
+    patches = torch.stack(
+        (history_score, current_hit, current_depth, current_edge, visibility_delta), dim=-1
+    ).reshape(env.num_envs, -1)
+    env._instinct_nav_dynamic_map_patch_cache = {"key": cache_key, "patches": patches}
+    return patches
+
+
 def in_goal(
     env: ManagerBasedRLEnv,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),

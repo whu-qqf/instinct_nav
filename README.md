@@ -2327,3 +2327,187 @@ python deploy/scripts/g1_nav_onboard_onnx.py \
 ```bash
 --nodryrun
 ```
+
+### 最新模型三终端完整流程
+
+以下命令均在机器人 NX 容器中执行，路径使用本次导出的
+`g1_sru_scene_token_score_vis_dynamic_official_parkour_v2_20260812` bundle。
+
+**终端 1：进入容器、准备环境并检查设备**
+
+```bash
+sudo docker exec -it unitree.unitree-jetson-container bash
+source /workspace/unitree-jetson-container/env.sh
+source /workspace/unitree-jetson-container/instinct_onboard/instinct_venv/bin/activate
+cd /workspace/unitree-jetson-container/instinct_nav
+export PYTHONPATH=/workspace/unitree-jetson-container/instinct_nav/deploy:/workspace/unitree-jetson-container/instinct_nav/external/instinct_onboard:$PYTHONPATH
+
+ros2 topic list | grep -Ei "lowstate|secondary_imu|lowcmd|dog_odom"
+python -c "import pyrealsense2 as rs; print(rs.context().query_devices())"
+python -c "import onnxruntime as ort; d='artifacts/high_level/g1_sru_scene_token_score_vis_dynamic_official_parkour_v2_20260812'; print(ort.InferenceSession(d+'/sru_high_level_scene_token.onnx').get_inputs()); print(ort.InferenceSession(d+'/sru_high_level_depth_encoder.onnx').get_inputs())"
+```
+
+**终端 2：启动最新高层 ONNX onboard（先 dry-run）**
+
+```bash
+sudo docker exec -it unitree.unitree-jetson-container bash
+source /workspace/unitree-jetson-container/env.sh
+source /workspace/unitree-jetson-container/instinct_onboard/instinct_venv/bin/activate
+cd /workspace/unitree-jetson-container/instinct_nav
+export PYTHONPATH=/workspace/unitree-jetson-container/instinct_nav/deploy:/workspace/unitree-jetson-container/instinct_nav/external/instinct_onboard:$PYTHONPATH
+mkdir -p /workspace/instinct_nav_logs/score_vis_dynamic_v2_dryrun
+
+python deploy/scripts/g1_nav_onboard_onnx.py \
+  --standdir /workspace/unitree-jetson-container/data/data/checkpoints/stand_onboard \
+  --logdir /workspace/unitree-jetson-container/data/data/checkpoints/parkour_onboard_preview_stair \
+  --sru_policy_onnx_path artifacts/high_level/g1_sru_scene_token_score_vis_dynamic_official_parkour_v2_20260812/sru_high_level_scene_token.onnx \
+  --sru_depth_encoder_onnx_path artifacts/high_level/g1_sru_scene_token_score_vis_dynamic_official_parkour_v2_20260812/sru_high_level_depth_encoder.onnx \
+  --deploy_manifest_path artifacts/high_level/g1_sru_scene_token_score_vis_dynamic_official_parkour_v2_20260812/deploy_manifest.json \
+  --visibility_decay 0.995 \
+  --camera_frame_timeout_s 0.25 \
+  --goal_pose_topic /instinct_nav/goal_pose \
+  --goal_reached_threshold 0.1 \
+  --odom_topic /dog_odom --odom_twist_frame body --odom_timeout_s 0.5 \
+  --command_min -0.3 -0.2 -0.4 --command_max 0.3 0.2 0.4 \
+  --command_deadband 0.02 0.02 0.02 --command_slew_rate 0.3 0.2 0.4 \
+  --command_lowpass_alpha 0.4 --auto_start_parkour \
+  --debug_dump_dir /workspace/instinct_nav_logs/score_vis_dynamic_v2_dryrun \
+  --debug_dump_every_steps 1 --debug_dump_max_steps 100
+```
+
+dry-run 确认正常后，停止终端 2 的进程。首次真实测试必须使用吊架/保护绳和现场急停，
+然后在终端 2 执行下面的真实控制命令。与 dry-run 命令相比，该命令增加了
+`--nodryrun` 和持久化安全日志目录，并且不使用 `--auto_start_parkour`：
+
+```bash
+mkdir -p /workspace/instinct_nav_logs/score_vis_dynamic_v2_safety
+
+python deploy/scripts/g1_nav_onboard_onnx.py \
+  --standdir /workspace/unitree-jetson-container/data/data/checkpoints/stand_onboard \
+  --logdir /workspace/unitree-jetson-container/data/data/checkpoints/parkour_onboard_preview_stair \
+  --sru_policy_onnx_path artifacts/high_level/g1_sru_scene_token_score_vis_dynamic_official_parkour_v2_20260812/sru_high_level_scene_token.onnx \
+  --sru_depth_encoder_onnx_path artifacts/high_level/g1_sru_scene_token_score_vis_dynamic_official_parkour_v2_20260812/sru_high_level_depth_encoder.onnx \
+  --deploy_manifest_path artifacts/high_level/g1_sru_scene_token_score_vis_dynamic_official_parkour_v2_20260812/deploy_manifest.json \
+  --visibility_decay 0.995 \
+  --camera_frame_timeout_s 0.25 \
+  --goal_pose_topic /instinct_nav/goal_pose \
+  --goal_reached_threshold 0.1 \
+  --odom_topic /dog_odom --odom_twist_frame body --odom_timeout_s 0.5 \
+  --command_min -0.3 -0.2 -0.4 --command_max 0.3 0.2 0.4 \
+  --command_deadband 0.02 0.02 0.02 --command_slew_rate 0.3 0.2 0.4 \
+  --command_lowpass_alpha 0.4 \
+  --safety_log_dir /workspace/instinct_nav_logs/score_vis_dynamic_v2_safety \
+  --debug_dump_dir /workspace/instinct_nav_logs/score_vis_dynamic_v2_real \
+  --debug_dump_every_steps 5 --debug_dump_max_steps 100 \
+  --nodryrun
+```
+
+启动后先等待机器人完成 cold-start 并稳定停在 stand，确认站姿和安全日志正常后，
+再由终端 3 发布 `0.5m` 短目标。不要在首次真实测试中加入 `--auto_start_parkour`。
+
+**终端 3：启动目标管理器并发布短目标**
+
+```bash
+sudo docker exec -it unitree.unitree-jetson-container bash
+source /workspace/unitree-jetson-container/env.sh
+source /workspace/unitree-jetson-container/instinct_onboard/instinct_venv/bin/activate
+cd /workspace/unitree-jetson-container/instinct_nav
+export PYTHONPATH=/workspace/unitree-jetson-container/instinct_nav/deploy:/workspace/unitree-jetson-container/instinct_nav/external/instinct_onboard:$PYTHONPATH
+
+python deploy/scripts/goal_manager.py \
+  --odom_topic /dog_odom \
+  --world_goal_topic /instinct_nav/world_goal_point \
+  --body_goal_topic /instinct_nav/goal_pose \
+  --goal_frame odom \
+  --goal_reached_threshold 0.5 \
+  --stop_publish_count 10
+```
+
+目标管理器启动后，在同一终端或另一个 shell 发布短目标：
+
+```bash
+ros2 topic pub --once /instinct_nav/world_goal_point geometry_msgs/msg/PointStamped \
+  "{header: {frame_id: 'odom'}, point: {x: 0.5, y: 0.0, z: 0.0}}"
+```
+
+建议顺序为 `0.5 m` 前进、左右 `0.5 m` 偏移，再进行 `1.0 m` 测试。确认站姿、
+odom、相机和 dump 均正常后才发布目标；按下 `R1` 返回 stand，`R2/L2` 用于急停。
+
+## 2026-08-12 Dynamic Map Cross-Attention Ablation
+
+为增强动态障碍变化的表达，新增独立 ablation，不修改现有 ScoreVis 6D scene-token
+任务。历史 ScoreVis 保持 `decay=0.995`，当前帧从同一 noisy/delayed shared-lowcam
+深度流提取 patch 特征。
+
+每个 `8 x 8` patch 输出 5 个原始量：
+
+```text
+[history_score, current_hit, current_depth, current_edge, visibility_delta]
+```
+
+网络不再把这些量直接当作手工 scene-risk token。当前帧 4D 分支作为 query，历史
+ScoreVis 1D 分支作为 key/value，经过带二维位置 embedding 的 map-to-map cross
+attention 后生成 64 个 learned dynamic tokens。现有 SRU hidden + proprio query
+再对 learned tokens 做第二层 cross attention，得到 actor/critic scene feature。
+
+新增任务：
+
+```text
+Instinct-Nav-G1-SRU-DynamicMapCross-DynamicObstacle-OfficialParkour-v0
+Instinct-Nav-G1-SRU-DynamicMapCross-DynamicObstacle-OfficialParkour-Dev-v0
+Instinct-Nav-G1-SRU-DynamicMapCross-DynamicObstacle-OfficialParkour-Play-v0
+```
+
+正式训练命令：
+
+```bash
+/workspace/instinctlab51-env/bin/python /workspace/instinct_nav/_launcher.py train \
+  --task Instinct-Nav-G1-SRU-DynamicMapCross-DynamicObstacle-OfficialParkour-v0 \
+  --num_envs 4096 --max_iterations 6000 --seed 72 \
+  --run_name g1_sru_dynamic_map_cross_official_parkour_v1 \
+  --wandb --wandb_entity qqfqqf0612-wuhan-university \
+  --wandb_project instinct_nav --headless
+```
+
+验证结果：`py_compile`、纯 PyTorch actor/critic forward/backward 和 32-env PPO smoke
+均通过。smoke observation 为 actor `2896 = 16 + 2560 + 64*5`、critic `6033`，
+并成功产出：
+
+```text
+logs/rsl_rl/g1_instinct_navigation_dynamic_map_cross_dev/2026-08-12_22-23-37_dynamic_map_cross_smoke/model_0.pt
+```
+
+该任务必须从零训练，不能加载旧 ScoreVis `64x6` checkpoint。高层 ONNX exporter
+和真机 observation builder 需在新 checkpoint 训练完成后按 `64x5` 契约同步扩展；
+现有 `64x6` 部署 bundle 保持不变。
+
+### 2026-08-12 动态障碍课程行为升级
+
+本节覆盖上方 2026-08-04 版本的随机 `patrol/random_walk` 行为描述。DynamicMapCross
+正式任务现在采用机器人当前位置到目标点的导航走廊生成障碍交互轨迹：
+
+```text
+横穿 30% / 迎面 25% / 同向 15% / 斜向汇入 20% / 走停 10%
+```
+
+每条轨迹在走廊 `25%~75%` 位置附近采样，最多 rejection sampling 12 次，并约束：
+
+- 障碍起点距机器人至少 `1.5m`；
+- 轨迹起点和终点避开目标至少 `1.0m`；
+- 多障碍起点间距至少 `0.9m`；
+- 采样失败时使用确定性的分隔横穿轨迹，不接受重叠位置；
+- 轨迹到端点后往返，走停行为在运动和 `0.5~1.5s` 暂停之间切换；
+- 每个环境 reset 时根据新的机器人与目标位置重新生成交互轨迹。
+
+课程不再因为窗口成功率提前开启。正式任务固定在第 `3003` 个 PPO iteration 切换：
+
+```text
+3003 iterations * 16 env steps/iteration = 48048 env steps
+```
+
+Dev task 仅为 smoke test 将切换阈值设为 0，以实际覆盖动态轨迹代码；正式/Play task
+仍使用 `3003`。动态路径 smoke 已通过并产出：
+
+```text
+logs/rsl_rl/g1_instinct_navigation_dynamic_map_cross_dev/2026-08-12_22-35-53_dynamic_map_cross_trajectory_smoke/model_0.pt
+```
