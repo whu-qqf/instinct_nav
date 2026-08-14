@@ -2464,7 +2464,7 @@ Instinct-Nav-G1-SRU-DynamicMapCross-DynamicObstacle-OfficialParkour-Play-v0
 /workspace/instinctlab51-env/bin/python /workspace/instinct_nav/_launcher.py train \
   --task Instinct-Nav-G1-SRU-DynamicMapCross-DynamicObstacle-OfficialParkour-v0 \
   --num_envs 4096 --max_iterations 6000 --seed 72 \
-  --run_name g1_sru_dynamic_map_cross_official_parkour_v1 \
+  --run_name g1_sru_dynamic_map_cross_corridor_v1 \
   --wandb --wandb_entity qqfqqf0612-wuhan-university \
   --wandb_project instinct_nav --headless
 ```
@@ -2510,4 +2510,146 @@ Dev task 仅为 smoke test 将切换阈值设为 0，以实际覆盖动态轨迹
 
 ```text
 logs/rsl_rl/g1_instinct_navigation_dynamic_map_cross_dev/2026-08-12_22-35-53_dynamic_map_cross_trajectory_smoke/model_0.pt
+```
+
+### VisScore + 当前帧 Cross-Attention 网络流程
+
+这次改进的核心是保留长期可见性记忆 `VisScore`，同时显式加入当前帧。网络不再只依赖
+经过衰减的历史图判断动态变化，也不再把手工 patch 特征直接作为最终 scene token。
+
+#### 1. VisScore 历史图
+
+深度图使用与高层 policy 相同的 noisy/delayed shared-lowcam 输入。每帧深度投影到机器人
+局部坐标系中的 `8 x 8 = 64` 个 patch，并更新局部可见性记忆：
+
+```text
+history_score[t] = max(current_visibility[t], decay * history_score[t-1])
+decay = 0.995
+```
+
+`history_score` 表示最近一段时间内该局部区域是否被看见，而不是当前帧中是否仍然可见。
+原有 ScoreVis `64 x 6` 任务保持不变；本次新增的是独立 DynamicMapCross ablation。
+
+#### 2. 当前帧可见图
+
+每个 patch 从当前深度帧提取四个量：
+
+```text
+current_hit       当前帧是否有有效投影/占用
+current_depth     当前帧归一化平均深度
+current_edge      patch 内深度边缘强度
+visibility_delta  current_hit 与 history_score 的变化差
+```
+
+因此 observation manager 输出的逻辑 patch 为：
+
+```text
+[history_score, current_hit, current_depth, current_edge, visibility_delta]
+```
+
+总 shape 为 `[num_envs, 64, 5]`，flatten 后为 `320` 维。`visibility_delta` 使刚出现、
+刚消失或发生遮挡变化的区域可以直接进入网络，而不必让 SRU 从单张衰减图中反推。
+
+#### 3. 第一级 Cross-Attention：当前帧查询 VisScore
+
+网络先把历史图和当前帧拆成两个分支：
+
+```text
+history_score [B,64,1] -> history projection -> K/V
+current map   [B,64,4] -> current projection -> Q
+2D patch position      -> learned position embedding
+Q(current) x K/V(history) -> map cross-attention -> 64 learned dynamic tokens
+```
+
+二维 patch position embedding 同时加入 query 和 key/value，使 attention 保留局部空间对应关系。
+输出 token 已经是当前观测相对于历史可见性记忆的学习结果，不再等同于原始 5D 手工特征。
+
+#### 4. 第二级 Cross-Attention：导航状态查询动态 token
+
+随后沿用 query-token 架构，让导航 recurrent state 决定当前应该关注哪些动态区域：
+
+```text
+proprio + encoded depth -> SRU -> hidden state
+hidden state + proprio  -> navigation query
+navigation query x learned dynamic tokens -> scene feature
+scene feature + SRU feature -> actor/critic MLP
+```
+
+目标信息仍只通过普通 `target_position` observation 和 navigation query 影响注意力，
+不会写入每个 patch token。这延续了 v3 no-goal token 的结论，避免在局部场景描述中重复
+混入目标方向和距离。
+
+完整数据流如下：
+
+```text
+shared noisy/delayed depth
+  |-- DepthNoiseEncoder --------------------------> encoded depth (2560)
+  |-- local projection -> VisScore memory --------> history [64,1] -- K/V --+
+  `-- current-frame patch extraction -------------> current [64,4] -- Q ----+--> map cross-attention
+                                                                              |
+                                                                              v
+                                                               learned dynamic tokens [64,D]
+                                                                              |
+proprio + encoded depth -> SRU -> hidden + proprio -> navigation query -------+--> token cross-attention
+                                                                                     |
+                                                                                     v
+                                                                            actor / critic output
+```
+
+对应的最终 observation 维度为：
+
+```text
+actor  = 16 + 2560 + 64*5 = 2896
+critic = 17 + 3136 + 2560 + 64*5 = 6033
+```
+
+#### 5. 动态障碍课程与正式训练
+
+动态障碍轨迹围绕机器人到目标的走廊生成，包括横穿、迎面、同向、斜向汇入和走停。
+正式任务不会根据成功率提前开启动态障碍，日志已确认在 iteration `3003` 精确切换：
+
+```text
+[DynamicObstacleManager] Switching curriculum at env step 48048 (~iteration 3003) (fixed iteration 3003).
+[DynamicObstacleManager] Dynamic obstacles ENABLED (step 48048).
+Learning iteration 3003/6000
+```
+
+后台正式训练命令：
+
+```bash
+setsid /workspace/instinctlab51-env/bin/python /workspace/instinct_nav/_launcher.py train \
+  --task Instinct-Nav-G1-SRU-DynamicMapCross-DynamicObstacle-OfficialParkour-v0 \
+  --num_envs 4096 \
+  --max_iterations 6000 \
+  --seed 72 \
+  --run_name g1_sru_dynamic_map_cross_corridor_v1 \
+  --wandb \
+  --wandb_entity qqfqqf0612-wuhan-university \
+  --wandb_project instinct_nav \
+  --headless \
+  </dev/null > /workspace/instinct_nav/logs/train_dynamic_map_cross_corridor_v1.out 2>&1 &
+```
+
+实际 run 目录：
+
+```text
+logs/rsl_rl/g1_instinct_navigation_ppo_vismap/2026-08-12_22-42-54_g1_sru_dynamic_map_cross_corridor_v1/
+```
+
+截至 2026-08-14，训练已运行到 iteration `4054`，并产出 `model_0.pt` 到
+`model_4000.pt`。iteration 4054 的训练窗口指标为：
+
+| metric | value |
+| --- | ---: |
+| `Train/mean_reward` | `32.8988` |
+| `Metrics/robot_goal/success_rate` | `0.8916` |
+| `Episode_Reward/reach_goal_xy_tight` | `0.7413` |
+| `Episode_Termination/obstacle_collision` | `0.0560` |
+| `Policy/mean_noise_std` | `0.4011` |
+
+这些是训练窗口指标，不替代训练完成后的普通 eval。查看训练状态：
+
+```bash
+ps -ef | grep g1_sru_dynamic_map_cross_corridor_v1
+tail -f /workspace/instinct_nav/logs/train_dynamic_map_cross_corridor_v1.out
 ```
