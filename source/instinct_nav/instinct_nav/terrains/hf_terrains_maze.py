@@ -361,23 +361,25 @@ class StairGenerator:
          "stairs": [(0, 0, "n"), (2, 2, "s"), (0, 2, "s"), (2, 0, "n")]},
     ]
 
-    def __init__(self, wall_height: float, vertical_scale: float):
+    def __init__(self, wall_height: float, vertical_scale: float, cfg, cell_pixels: int, difficulty: float):
         self.wall_height = wall_height
-        self.platform_height = int(wall_height - 0.5 / vertical_scale)
         self.vertical_scale = vertical_scale
-        self._make_stair_templates()
+        self.cfg = cfg
+        self.cell_pixels = cell_pixels
+        self.difficulty = difficulty
 
-    def _make_stair_templates(self):
-        """Create stair templates for each direction."""
-        cell_px = STAIRS.SINGLE_CELL_PIXELS
-        step_res = cell_px // STAIRS.NUM_STEPS
+    def _make_stair_templates(self, num_steps: int, step_height_m: float):
+        """Create direction templates for one randomized staircase."""
+        cell_px = self.cell_pixels
+        # array_split preserves the requested count when cell_px is not divisible by it.
+        step_slices = np.array_split(np.arange(cell_px), num_steps)
 
         east = np.zeros((cell_px, cell_px), dtype=np.float32)
-        for i in range(STAIRS.NUM_STEPS):
-            h = STAIRS.STEP_HEIGHT_METERS * (i + 1) / self.vertical_scale
-            east[i * step_res:(i + 1) * step_res, :] = h
+        for i, indices in enumerate(step_slices):
+            h = step_height_m * (i + 1) / self.vertical_scale
+            east[indices, :] = h
 
-        self.templates = {
+        return {
             "e": east,
             "n": rotate(east, 90),
             "w": rotate(east, 180),
@@ -394,8 +396,19 @@ class StairGenerator:
             Tuple of (heights, valid_mask, platform_mask).
         """
         layout = self.LAYOUTS[rng.integers(len(self.LAYOUTS))]
-        size = STAIRS.STAIR_GRID_SIZE * STAIRS.SINGLE_CELL_PIXELS
-        cell_px = STAIRS.SINGLE_CELL_PIXELS
+        min_steps, max_steps = self.cfg.stair_num_steps_range
+        num_steps = min_steps if min_steps == max_steps else int(rng.integers(min_steps, max_steps + 1))
+        min_height, max_height = self.cfg.stair_step_height_range
+        difficulty_height = min_height + self.difficulty * (max_height - min_height)
+        step_height_m = (
+            min_height
+            if min_height == difficulty_height
+            else float(rng.uniform(min_height, difficulty_height))
+        )
+        templates = self._make_stair_templates(num_steps, step_height_m)
+        platform_height = num_steps * step_height_m / self.vertical_scale
+        size = STAIRS.STAIR_GRID_SIZE * self.cell_pixels
+        cell_px = self.cell_pixels
 
         heights = np.zeros((size, size), dtype=np.float32)
         valid_mask = np.zeros((size, size), dtype=bool)
@@ -404,14 +417,14 @@ class StairGenerator:
         for gx, gy in layout["platforms"]:
             xs, xe = gx * cell_px, (gx + 1) * cell_px
             ys, ye = gy * cell_px, (gy + 1) * cell_px
-            heights[xs:xe, ys:ye] = self.platform_height
+            heights[xs:xe, ys:ye] = platform_height
             valid_mask[xs:xe, ys:ye] = True
             platform_mask[xs:xe, ys:ye] = True
 
         for gx, gy, direction in layout["stairs"]:
             xs, xe = gx * cell_px, (gx + 1) * cell_px
             ys, ye = gy * cell_px, (gy + 1) * cell_px
-            heights[xs:xe, ys:ye] = self.templates[direction]
+            heights[xs:xe, ys:ye] = templates[direction]
 
         return heights, valid_mask, platform_mask
 
@@ -448,7 +461,7 @@ def maze_terrain(difficulty: float, cfg: "hf_terrains_maze_cfg.HfMazeTerrainCfg"
     terrain_h = int(cfg.size[1] / cfg.horizontal_scale)
 
     terrain = TerrainData.create(terrain_w, terrain_h)
-    stair_gen = StairGenerator(wall_height, cfg.vertical_scale)
+    stair_gen = StairGenerator(wall_height, cfg.vertical_scale, cfg, cell_pixels, difficulty)
 
     # Generate base pattern
     if cfg.non_maze_terrain:
@@ -461,17 +474,25 @@ def maze_terrain(difficulty: float, cfg: "hf_terrains_maze_cfg.HfMazeTerrainCfg"
     clear_center(maze, terrain, cell_pixels)
 
     # Generate terrain features based on type
-    if cfg.dynamic_obstacles:
+    if cfg.terrain_feature == "blocks":
+        _add_blocks(rng, terrain, cfg, difficulty, cell_pixels)
+    elif cfg.dynamic_obstacles:
         _add_pits(rng, terrain, cfg, difficulty, wall_height, cell_pixels)
     elif cfg.stairs:
         _add_stairs(rng, terrain, cfg, difficulty, wall_height, cell_pixels, stair_gen)
     else:
         _add_walls(rng, maze, terrain, cfg, wall_height, cell_pixels)
 
+    # Mixed traversable features are added only where the primary terrain is flat.
+    if cfg.add_ramps:
+        _add_ramps(rng, terrain, cfg, difficulty)
+    if cfg.add_raised_bars:
+        _add_raised_bars(rng, terrain, cfg, difficulty)
+
     clear_center(maze, terrain, cell_pixels)
 
     # Apply height transition padding for stair terrain
-    if cfg.stairs:
+    if cfg.stairs or cfg.terrain_feature == "blocks" or cfg.add_raised_bars:
         terrain.apply_height_transition_padding(
             height_threshold=PADDING.HEIGHT_TRANSITION_THRESHOLD,
             padding_cells=PADDING.HEIGHT_TRANSITION_PADDING
@@ -556,7 +577,7 @@ def _add_stairs(
     y_locs = set(np.round(np.linspace(stair_margin, max_y, num_locations)).astype(int)) - excluded
 
     processed = set()
-    stair_size = STAIRS.STAIR_GRID_SIZE * STAIRS.SINGLE_CELL_PIXELS
+    stair_size = STAIRS.STAIR_GRID_SIZE * cell_pixels
     stair_prob = difficulty * OBSTACLES.STAIRS_PLACEMENT_PROB
     obstacle_prob = difficulty * OBSTACLES.STAIRS_OBSTACLE_DENSITY
 
@@ -688,6 +709,138 @@ def _add_middle_obstacles(
                 obs = _generate_pit_obstacle(rng, cell_pixels, wall_height)
                 terrain.heights[xs:xe, ys:ye] = obs[:xe - xs, :ye - ys]
                 terrain.valid_mask[xs:xe, ys:ye] = False
+
+
+def _add_ramps(
+    rng: np.random.Generator,
+    terrain: TerrainData,
+    cfg,
+    difficulty: float,
+):
+    """Add broad up/down ramps inspired by InstinctLab slope terrain."""
+    width, height = terrain.heights.shape
+    ramp_length = max(8, int(rng.uniform(3.0, 5.0) / cfg.horizontal_scale))
+    ramp_width = max(8, int(rng.uniform(2.0, 4.0) / cfg.horizontal_scale))
+    platform_length = max(4, int(rng.uniform(1.0, 2.0) / cfg.horizontal_scale))
+    angle_deg = rng.uniform(4.0, 6.0 + 6.0 * difficulty)
+    peak_height = int(ramp_length * cfg.horizontal_scale * np.tan(np.deg2rad(angle_deg)) / cfg.vertical_scale)
+
+    # Try several locations, but keep the central spawn clearing untouched.
+    total_length = 2 * ramp_length + platform_length
+    placed = 0
+    for _ in range(30):
+        if placed >= 2:
+            break
+        center_x = int(rng.integers(ramp_width, width - ramp_width))
+        center_y = int(rng.integers(total_length // 2, height - total_length // 2))
+        if abs(center_x - width // 2) < int(4.0 / cfg.horizontal_scale):
+            if abs(center_y - height // 2) < int(4.0 / cfg.horizontal_scale):
+                continue
+        x0 = max(0, center_x - ramp_width // 2)
+        x1 = min(width, x0 + ramp_width)
+        y0 = max(0, center_y - total_length // 2)
+        y1 = min(height, y0 + total_length)
+        actual_length = y1 - y0
+        if x1 <= x0 or actual_length < 3:
+            continue
+
+        up_len = min(ramp_length, actual_length // 2)
+        flat_len = min(platform_length, actual_length - 2 * up_len)
+        down_len = actual_length - up_len - flat_len
+        profile = np.concatenate((
+            np.linspace(0, peak_height, up_len, endpoint=False),
+            np.full(flat_len, peak_height),
+            np.linspace(peak_height, 0, down_len),
+        ))
+        patch = np.tile(profile, (x1 - x0, 1))
+        if rng.random() < 0.5:
+            patch = patch.T
+            target_x1 = min(width, x0 + patch.shape[0])
+            target_y1 = min(height, y0 + patch.shape[1])
+            if np.any(terrain.heights[x0:target_x1, y0:target_y1] != 0):
+                continue
+            terrain.heights[x0:target_x1, y0:target_y1] = patch[:target_x1 - x0, :target_y1 - y0]
+            terrain.platform_mask[x0:target_x1, y0:target_y1] = patch[:target_x1 - x0, :target_y1 - y0] > 0
+        else:
+            if np.any(terrain.heights[x0:x1, y0:y1] != 0):
+                continue
+            terrain.heights[x0:x1, y0:y1] = patch
+            terrain.platform_mask[x0:x1, y0:y1] = patch > 0
+        placed += 1
+
+
+def _add_raised_bars(
+    rng: np.random.Generator,
+    terrain: TerrainData,
+    cfg,
+    difficulty: float,
+):
+    """Add long single-step bars that require one step up and one step down."""
+    width, height = terrain.heights.shape
+    xx, yy = np.indices((width, height))
+    center_clearance = int(4.0 / cfg.horizontal_scale)
+    border_clearance = int(1.0 / cfg.horizontal_scale)
+    requested = int(rng.integers(2, 6))
+    placed = 0
+
+    for _ in range(80):
+        if placed >= requested:
+            break
+        length = rng.uniform(2.0, 5.0) / cfg.horizontal_scale
+        thickness = rng.uniform(0.3, 0.6) / cfg.horizontal_scale
+        half_extent = int(np.ceil(length * 0.6))
+        cx = int(rng.integers(border_clearance + half_extent, width - border_clearance - half_extent))
+        cy = int(rng.integers(border_clearance + half_extent, height - border_clearance - half_extent))
+        if abs(cx - width // 2) < center_clearance and abs(cy - height // 2) < center_clearance:
+            continue
+
+        angle = rng.choice((0.0, np.pi / 2.0, np.pi / 4.0, -np.pi / 4.0))
+        local_x = (xx - cx) * np.cos(angle) + (yy - cy) * np.sin(angle)
+        local_y = -(xx - cx) * np.sin(angle) + (yy - cy) * np.cos(angle)
+        bar_mask = (np.abs(local_x) <= length / 2.0) & (np.abs(local_y) <= thickness / 2.0)
+        if not np.any(bar_mask) or np.any(terrain.heights[bar_mask] != 0):
+            continue
+
+        # Keep the familiar 16 cm obstacle while adding small sim-to-real variation.
+        max_height = min(0.18, 0.14 + 0.04 * difficulty)
+        height_m = rng.uniform(0.14, max_height)
+        terrain.heights[bar_mask] = int(round(height_m / cfg.vertical_scale))
+        terrain.valid_mask[bar_mask] = False
+        terrain.platform_mask[bar_mask] = False
+        placed += 1
+
+
+def _add_blocks(
+    rng: np.random.Generator,
+    terrain: TerrainData,
+    cfg,
+    difficulty: float,
+    cell_pixels: int,
+):
+    """Add low discrete blocks while preserving wide navigation corridors."""
+    grid_w, grid_h = cfg.grid_size
+    center_x, center_y = grid_w // 2, grid_h // 2
+    density = 0.08 + 0.12 * difficulty
+
+    for x in range(1, grid_w - 1):
+        for y in range(1, grid_h - 1):
+            if abs(x - center_x) <= 1 and abs(y - center_y) <= 1:
+                continue
+            if rng.random() >= density:
+                continue
+            xs, xe, ys, ye = get_cell_bounds(
+                x, y, cell_pixels, terrain.heights.shape[0], terrain.heights.shape[1]
+            )
+            margin = max(2, int(rng.uniform(0.25, 0.55) / cfg.horizontal_scale))
+            bx0, bx1 = xs + margin, xe - margin
+            by0, by1 = ys + margin, ye - margin
+            if bx1 <= bx0 or by1 <= by0:
+                continue
+            # Keep these as navigation obstacles, within the frozen parkour
+            # controller's familiar low-obstacle distribution.
+            max_height = min(0.45, 0.18 + 0.27 * difficulty)
+            height_m = rng.uniform(0.10, max_height)
+            terrain.set_obstacle(bx0, bx1, by0, by1, int(height_m / cfg.vertical_scale))
 
 
 def _generate_pit_obstacle(

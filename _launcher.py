@@ -95,6 +95,16 @@ def doctor_main(_: list[str]) -> int:
     return 0
 
 
+def visualize_terrain_main(argv: list[str]) -> int:
+    """Launch the RichTerrain top-down preview inside the Isaac Sim runtime."""
+    return run_workspace_script("scripts/visualize_rich_terrain.py", argv)
+
+
+def inspect_terrain_main(argv: list[str]) -> int:
+    """Open RichTerrain in an interactive Isaac Sim viewport."""
+    return run_workspace_script("scripts/inspect_rich_terrain.py", argv)
+
+
 def train_senior_main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description="Launch instinct_nav SRU G1 training path.")
     parser.add_argument("--task", type=str, default="Instinct-Nav-G1-SRU-v0")
@@ -250,6 +260,8 @@ COMMANDS = {
     "play-senior": play_senior_main,
     "train": train_senior_main,
     "train-senior": train_senior_main,
+    "inspect-terrain": inspect_terrain_main,
+    "visualize-terrain": visualize_terrain_main,
 }
 
 

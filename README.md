@@ -2921,3 +2921,87 @@ ros2 topic pub --once /instinct_nav/world_goal_point geometry_msgs/msg/PointStam
 /workspace/instinct_nav_logs/dynamic_map_cross_model5999_safety/
 /workspace/instinct_nav_logs/dynamic_map_cross_model5999_real/
 ```
+
+## 2026-08-15：DynamicMapCross RichTerrain 第一版
+
+在现有导航高度场生成器上增量扩展，不替换原始 `MAZE_TERRAIN_CFG`，因此
+`model_5999.pt` 对应的原任务和地形仍可复现。新增配置为 `RICH_MAZE_TERRAIN_CFG`：
+
+- 单个 tile 从 `30 x 30 m` 扩大到 `40 x 40 m`，网格由 `15 x 15` 扩大到 `20 x 20`，单格仍为 `2 m`。
+- 楼梯从固定 5 阶、固定 0.2 m 阶高，扩展为每个结构独立采样 `3-7` 阶和 `0.10-0.20 m` 阶高；阶高上限随 terrain difficulty 增长。
+- 参考 InstinctLab parkour terrain 的 stairs-up/down、slope 和 discrete-obstacle 思路，在当前生成器中加入宽缓坡、低矮离散障碍和 `14-18 cm` 单级长条凸台，继续复用导航专用 valid/platform/spawn mask。
+- 缓坡不再占用独立 tile，而是混入开放障碍和离散方块地形；单级凸台也混入这两类地形，每块生成 `2-5` 根，长度 `2-5 m`、宽度 `0.3-0.6 m`，方向为横向、纵向或 `±45°`。
+- 地形比例：迷宫 20%、开放混合障碍 20%、随机楼梯 25%、方块混合障碍 20%、坑/沟槽 15%。
+- RichTerrain episode 时长从 60 s 增加到 80 s，以适应扩大后的 start-goal 路径。
+- DynamicMapCross 观测、网络、动态障碍课程和 frozen official parkour 低层策略保持不变。
+
+新增任务：
+
+```text
+Instinct-Nav-G1-SRU-DynamicMapCross-RichTerrain-DynamicObstacle-OfficialParkour-v0
+Instinct-Nav-G1-SRU-DynamicMapCross-RichTerrain-DynamicObstacle-OfficialParkour-Dev-v0
+Instinct-Nav-G1-SRU-DynamicMapCross-RichTerrain-DynamicObstacle-OfficialParkour-Play-v0
+```
+
+dev smoke test：
+
+```bash
+/workspace/instinctlab51-env/bin/python /workspace/instinct_nav/_launcher.py train \
+  --task Instinct-Nav-G1-SRU-DynamicMapCross-RichTerrain-DynamicObstacle-OfficialParkour-Dev-v0 \
+  --num_envs 32 \
+  --max_iterations 1 \
+  --run_name rich_terrain_smoke_test \
+  --headless
+```
+
+可视化检查：
+
+```bash
+/workspace/instinctlab51-env/bin/python /workspace/instinct_nav/_launcher.py play \
+  --task Instinct-Nav-G1-SRU-DynamicMapCross-RichTerrain-DynamicObstacle-OfficialParkour-Play-v0 \
+  --num_envs 20 \
+  --checkpoint /workspace/instinct_nav/logs/rsl_rl/g1_instinct_navigation_ppo_vismap/2026-08-12_22-42-54_g1_sru_dynamic_map_cross_corridor_v1/model_5999.pt
+```
+
+正式训练（新 run，不覆盖原 baseline）：
+
+```bash
+/workspace/instinctlab51-env/bin/python /workspace/instinct_nav/_launcher.py train \
+  --task Instinct-Nav-G1-SRU-DynamicMapCross-RichTerrain-DynamicObstacle-OfficialParkour-v0 \
+  --num_envs 4096 \
+  --max_iterations 6000 \
+  --run_name g1_sru_dynamic_map_cross_rich_terrain_v1 \
+  --headless \
+  --wandb \
+  --wandb_entity qqfqqf0612-wuhan-university \
+  --wandb_project instinct_nav \
+  --seed 72
+```
+
+已完成 32 env / 1 iteration smoke test，policy observation 为 `2896`、critic observation 为
+`6033`，成功产出 `model_0.pt`。首次创建 16 个 40 m dev tile 时，terrain 随机生成耗时约
+`0.91 s`，完整 scene 创建约 `59.25 s`。
+
+### 交互进入 RichTerrain
+
+只加载真实训练地形 mesh，不创建机器人和策略。打开全部六类地形：
+
+```bash
+/workspace/instinctlab51-env/bin/python /workspace/instinct_nav/_launcher.py inspect-terrain \
+  --difficulty 0.8 \
+  --seed 72
+```
+
+单独检查楼梯或混合障碍：
+
+```bash
+/workspace/instinctlab51-env/bin/python /workspace/instinct_nav/_launcher.py inspect-terrain \
+  --terrain variable_stairs --difficulty 0.8 --seed 72
+
+/workspace/instinctlab51-env/bin/python /workspace/instinct_nav/_launcher.py inspect-terrain \
+  --terrain blocks --difficulty 0.8 --seed 72
+```
+
+可选地形名：`maze`、`non_maze`、`variable_stairs`、`blocks`、`pits`。
+在 Isaac Sim viewport 中按住鼠标右键并使用 `W/A/S/D` 移动，滚轮调整速度；关闭窗口退出。
+该命令需要图形桌面，不要追加 `--headless`。

@@ -22,6 +22,7 @@ from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 
 import instinct_nav.navigation.mdp as nav_mdp
 from instinct_nav.navigation.navigation_env_cfg import NavigationEnvCfg
+from instinct_nav.terrains import RICH_MAZE_TERRAIN_CFG
 
 from .g1_asset_cfg import G1_WITH_SHOE_CFG, beyondmimic_action_scale
 from instinctlab.sensors import NoisyGroupedRayCasterCameraCfg
@@ -758,6 +759,49 @@ class G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_OFFICIAL_DEV(
 @configclass
 class G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_OFFICIAL_PLAY(
     G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_OFFICIAL
+):
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.num_envs = 20
+        self.observations.policy.enable_corruption = False
+        self.scene.env_spacing = 2.5
+        self.events.base_external_force_torque = None
+        self.events.push_robot = None
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL(
+    G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_OFFICIAL
+):
+    """DynamicMapCross policy task on the expanded rich navigation terrain."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.terrain.terrain_generator = copy.deepcopy(RICH_MAZE_TERRAIN_CFG)
+        # The 40 m tile permits longer start-goal paths than the 30 m baseline.
+        self.episode_length_s = 80.0
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_DEV(
+    G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL
+):
+    def __post_init__(self):
+        super().__post_init__()
+        self.obstacle_max_switch_iteration = 0
+        self.events.dynamic_obstacles_reset.params["max_switch_iteration"] = 0
+        self.events.dynamic_obstacles_update.params["max_switch_iteration"] = 0
+        self.scene.num_envs = 32
+        self.scene.terrain.terrain_generator.num_rows = 2
+        self.scene.terrain.terrain_generator.num_cols = 8
+        self.scene.terrain.max_init_terrain_level = 0
+        self.scene.terrain.terrain_generator.difficulty_range = [0.0, 0.0]
+        self.scene.terrain.terrain_generator.curriculum = False
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_PLAY(
+    G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL
 ):
     def __post_init__(self):
         super().__post_init__()

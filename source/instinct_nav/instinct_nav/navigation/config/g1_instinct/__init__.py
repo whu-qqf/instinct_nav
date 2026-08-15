@@ -221,3 +221,20 @@ _register_navigation_task(
     navigation_env_cfg.G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_OFFICIAL_PLAY,
     agents.rsl_rl_cfg.G1InstinctNavPPODynamicMapCrossOfficialRunnerCfg,
 )
+
+# DynamicMapCross ablation on the expanded 40 m rich-terrain distribution.
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-DynamicMapCross-RichTerrain-DynamicObstacle-OfficialParkour-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL,
+    agents.rsl_rl_cfg.G1InstinctNavPPODynamicMapCrossOfficialRunnerCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-DynamicMapCross-RichTerrain-DynamicObstacle-OfficialParkour-Dev-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_DEV,
+    agents.rsl_rl_cfg.G1InstinctNavPPODynamicMapCrossOfficialRunnerDevCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-DynamicMapCross-RichTerrain-DynamicObstacle-OfficialParkour-Play-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_PLAY,
+    agents.rsl_rl_cfg.G1InstinctNavPPODynamicMapCrossOfficialRunnerCfg,
+)

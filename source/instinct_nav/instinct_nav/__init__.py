@@ -51,6 +51,7 @@ del _patches_path, _spec, _patches_module
 from .terrains import (
     HfMazeTerrainCfg,
     MAZE_TERRAIN_CFG,
+    RICH_MAZE_TERRAIN_CFG,
 )
 
 ##

@@ -94,8 +94,23 @@ class HfMazeTerrainCfg(HfTerrainBaseCfg):
     add_stairs_to_maze: bool = False
     """Add stairs to the maze. Defaults to False."""
 
+    stair_num_steps_range: tuple[int, int] = (5, 5)
+    """Inclusive range of stair counts sampled independently for each structure."""
+
+    stair_step_height_range: tuple[float, float] = (0.2, 0.2)
+    """Step-height range in meters. The upper end is reached as difficulty increases."""
+
     dynamic_obstacles: bool = False
     """Enable pit/trough obstacles. Defaults to False."""
+
+    terrain_feature: str = "default"
+    """Primary terrain pattern: ``default`` or ``blocks``."""
+
+    add_ramps: bool = False
+    """Mix broad up/down ramps into otherwise flat regions."""
+
+    add_raised_bars: bool = False
+    """Mix single-step, 14-18 cm raised bars into the terrain."""
 
     # =========================================================================
     # Random Number Generator
@@ -107,5 +122,3 @@ class HfMazeTerrainCfg(HfTerrainBaseCfg):
     Set by the terrain generator (patches.py) before calling the terrain function.
     If None, will create a new unseeded generator (non-reproducible).
     """
-
-
