@@ -2636,20 +2636,59 @@ setsid /workspace/instinctlab51-env/bin/python /workspace/instinct_nav/_launcher
 logs/rsl_rl/g1_instinct_navigation_ppo_vismap/2026-08-12_22-42-54_g1_sru_dynamic_map_cross_corridor_v1/
 ```
 
-截至 2026-08-14，训练已运行到 iteration `4054`，并产出 `model_0.pt` 到
-`model_4000.pt`。iteration 4054 的训练窗口指标为：
+截至 2026-08-15，该次 `6000` iteration 训练已经完成。TensorBoard 最后 step 为
+`5999`，最终 checkpoint 为 `model_5999.pt`，checkpoint 内记录的 `iter` 也为 `5999`。
+iteration 5999 的训练窗口指标为：
 
 | metric | value |
 | --- | ---: |
-| `Train/mean_reward` | `32.8988` |
-| `Metrics/robot_goal/success_rate` | `0.8916` |
-| `Episode_Reward/reach_goal_xy_tight` | `0.7413` |
-| `Episode_Termination/obstacle_collision` | `0.0560` |
-| `Policy/mean_noise_std` | `0.4011` |
+| `Train/mean_reward` | `32.1969` |
+| `Metrics/robot_goal/success_rate` | `0.8854` |
+| `Episode_Reward/reach_goal_xy_tight` | `0.7591` |
+| `Episode_Termination/base_contact` | `0.0854` |
+| `Episode_Termination/large_pitch_angle` | `0.0506` |
+| `Episode_Termination/obstacle_collision` | `0.0507` |
+| `Policy/mean_noise_std` | `0.4521` |
+| `Metrics/dynamic_obstacles/enabled` | `1.0000` |
 
-这些是训练窗口指标，不替代训练完成后的普通 eval。查看训练状态：
+训练进程已经退出。退出时 Isaac Sim 在 `simulation_app.close()` 阶段报告 Vulkan
+`ERROR_OUT_OF_HOST_MEMORY` 并发生 segmentation fault；该异常发生在 step 5999 的事件和
+`model_5999.pt` 完整写入之后，不影响最终 checkpoint，但说明仿真清理阶段仍有资源释放
+问题。以上是训练窗口指标，不替代后续普通 eval。
+
+检查最终产物和日志：
 
 ```bash
-ps -ef | grep g1_sru_dynamic_map_cross_corridor_v1
-tail -f /workspace/instinct_nav/logs/train_dynamic_map_cross_corridor_v1.out
+ls -lh logs/rsl_rl/g1_instinct_navigation_ppo_vismap/2026-08-12_22-42-54_g1_sru_dynamic_map_cross_corridor_v1/model_5999.pt
+tail -100 /workspace/instinct_nav/logs/train_dynamic_map_cross_corridor_v1.out
+```
+
+### 2026-08-15 model_5999 静态/动态障碍普通评估
+
+使用相同 checkpoint、Play task、`256` 个环境、`1000` episodes 和 `seed=72` 完成两组
+普通评估。静态组保持课程关闭；动态组使用 `--force_dynamic_obstacles`，日志确认从 step 0
+启用并为全部环境重新采样走廊交互轨迹。
+
+| condition | episodes | success | maze | non-maze | pits | stairs | base contact | large pitch | obstacle collision | time out |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 静态障碍 | 1000 | **0.9260** | 0.9135 | 0.9320 | 0.9216 | 0.9369 | 0.0480 | 0.0510 | 0.0000 | 0.0170 |
+| 动态障碍 | 1000 | **0.7570** | 0.7562 | 0.7663 | 0.7385 | 0.7664 | 0.1410 | 0.0630 | 0.1030 | 0.0100 |
+
+动态障碍使总体成功率下降 `0.169`（16.9 个百分点），显式障碍碰撞率为 `0.103`，
+base contact 也从 `0.048` 上升到 `0.141`。这说明 policy 在静态场景保持较强能力，但动态
+交互仍是主要短板。该结果属于普通 eval；不同 episode 完成顺序会使两组 terrain episode
+数量略有差异，因此不是严格的逐案例配对比较。
+
+评估结果文件：
+
+```text
+logs/rsl_rl/g1_instinct_navigation_ppo_vismap/2026-08-12_22-42-54_g1_sru_dynamic_map_cross_corridor_v1/eval_static_model_5999_1000ep.json
+logs/rsl_rl/g1_instinct_navigation_ppo_vismap/2026-08-12_22-42-54_g1_sru_dynamic_map_cross_corridor_v1/eval_dynamic_model_5999_1000ep.json
+```
+
+动态组的关键启动证据：
+
+```text
+[DynamicObstacleManager] Dynamic obstacles ENABLED (step 0).
+[INFO] Dynamic obstacles forced ENABLED for evaluation.
 ```

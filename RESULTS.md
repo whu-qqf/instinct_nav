@@ -169,3 +169,24 @@ logs/rsl_rl/g1_instinct_navigation_ppo_vismap/2026-07-25_17-29-52_g1_sru_scene_t
 Main conclusion: scene tokens should describe local scene/risk rather than duplicate goal-relative information in every token. The v3 no-goal risk token improves overall success rate and reduces torso contact relative to v1/v2.
 
 Important caveat: fixed-case manifest evaluation is currently not trusted for scene-token policies. A v1 fixed-case run showed an abnormal early success rate, while normal v1 re-evaluation returned to the expected range. Use normal evaluation for the current comparison until `case_manifest_in` reset/cache handling is audited.
+
+## DynamicMapCross Static vs Dynamic Obstacles
+
+The final `g1_sru_dynamic_map_cross_corridor_v1/model_5999.pt` checkpoint was evaluated for
+1000 episodes with 256 environments and seed 72. The dynamic run force-enabled corridor
+obstacles from environment step 0; the static run left the obstacle curriculum disabled.
+
+| Condition | Success | Maze | Non Maze | Pits | Stairs | Base Contact | Large Pitch | Obstacle Collision | Time Out |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Static obstacles | 0.9260 | 0.9135 | 0.9320 | 0.9216 | 0.9369 | 0.0480 | 0.0510 | 0.0000 | 0.0170 |
+| Dynamic obstacles | 0.7570 | 0.7562 | 0.7663 | 0.7385 | 0.7664 | 0.1410 | 0.0630 | 0.1030 | 0.0100 |
+
+Dynamic obstacles reduce success by 16.9 percentage points. Obstacle collision (10.3%) and
+the increase in base contact (4.8% to 14.1%) are the main observed regressions. These are
+normal evaluations rather than paired fixed-case evaluations, so terrain episode counts differ
+slightly between conditions.
+
+```text
+logs/rsl_rl/g1_instinct_navigation_ppo_vismap/2026-08-12_22-42-54_g1_sru_dynamic_map_cross_corridor_v1/eval_static_model_5999_1000ep.json
+logs/rsl_rl/g1_instinct_navigation_ppo_vismap/2026-08-12_22-42-54_g1_sru_dynamic_map_cross_corridor_v1/eval_dynamic_model_5999_1000ep.json
+```
