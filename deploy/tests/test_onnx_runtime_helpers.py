@@ -7,7 +7,7 @@ import torch.nn.functional as F
 
 sys.modules.setdefault("onnxruntime", types.SimpleNamespace(InferenceSession=object))
 
-from instinct_nav_onboard.config import OnboardConfig
+from instinct_nav_onboard.config import ObservationLayout, OnboardConfig
 from instinct_nav_onboard.onnx_high_level_runtime import (
     OnnxHighLevelRuntime,
     _adaptive_avg_pool2d,
@@ -95,3 +95,14 @@ def test_legacy_visibility_remains_binary_and_does_not_decay():
     runtime.build_scene_tokens(np.zeros((36, 64), dtype=np.float32))
 
     np.testing.assert_array_equal(runtime.visibility, first_visibility)
+
+
+def test_dynamic_map_cross_layout_builds_history_and_current_patches():
+    layout = ObservationLayout(scene_token_feature_dim=5, scene_token_dim=64 * 5)
+    runtime = _runtime_without_onnx(OnboardConfig(visibility_decay=0.995, layout=layout))
+    depth = np.full((36, 64), 2.0, dtype=np.float32)
+    patches = runtime.build_scene_tokens(depth).reshape(64, 5)
+    assert patches.shape == (64, 5)
+    assert patches[:, 0].sum() > 0.0
+    assert patches[:, 1].sum() > 0.0
+    np.testing.assert_allclose(patches[:, 4], patches[:, 1] - patches[:, 0], atol=1.0e-6)

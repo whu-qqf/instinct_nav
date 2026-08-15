@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -46,6 +46,23 @@ class OnnxHighLevelRuntime:
         debug_dump_config: OnnxDebugDumpConfig | None = None,
         manifest_path: str | Path | None = None,
     ):
+        manifest = (
+            _read_manifest(manifest_path)
+            if manifest_path is not None
+            else _read_manifest(Path(policy_onnx_path).expanduser().with_name("deploy_manifest.json"))
+        )
+        if manifest is not None and manifest.get("scene_token_dim") is not None:
+            token_num = int(manifest.get("scene_token_num_tokens", cfg.layout.scene_token_num_tokens))
+            token_dim = int(manifest["scene_token_dim"])
+            cfg = replace(
+                cfg,
+                layout=replace(
+                    cfg.layout,
+                    scene_token_num_tokens=token_num,
+                    scene_token_feature_dim=token_dim,
+                    scene_token_dim=token_num * token_dim,
+                ),
+            )
         self.cfg = cfg
         self.command_sink = command_sink
         self.providers = providers or ort.get_available_providers()
@@ -227,6 +244,18 @@ class OnnxHighLevelRuntime:
         grad_x = np.pad(np.abs(depth_norm[:, 1:] - depth_norm[:, :-1]), ((0, 0), (0, 1)))
         grad_y = np.pad(np.abs(depth_norm[1:, :] - depth_norm[:-1, :]), ((0, 1), (0, 0)))
         depth_edge = np.clip(_adaptive_avg_pool2d(grad_x + grad_y, token_grid, token_grid), 0.0, 1.0).reshape(1, -1)
+
+        if self.cfg.layout.scene_token_feature_dim == 5:
+            current_hit = _adaptive_avg_pool2d(
+                valid.astype(np.float32), token_grid, token_grid
+            ).reshape(1, -1)
+            visibility_delta = np.clip(current_hit - vis, -1.0, 1.0)
+            patches = np.stack(
+                [vis, current_hit, depth_mean, depth_edge, visibility_delta], axis=-1
+            )
+            return patches.reshape(1, -1).astype(np.float32)
+        if self.cfg.layout.scene_token_feature_dim != 6:
+            raise ValueError(f"unsupported scene token dim: {self.cfg.layout.scene_token_feature_dim}")
 
         frontier_source = self.visibility[0, 0] if self.cfg.visibility_decay < 1.0 else (self.visibility[0, 0] > 0.5).astype(np.float32)
         frontier_x = np.pad(np.abs(frontier_source[:, 1:] - frontier_source[:, :-1]), ((0, 0), (0, 1)))

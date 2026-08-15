@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import torch
@@ -44,6 +44,7 @@ class SceneTokenSruPolicyConfig:
     scene_token_dim: int = 6
     scene_token_feature_dim: int = 64
     scene_token_query_num_heads: int = 4
+    use_dynamic_map_cross_attention: bool = False
 
 
 class SceneTokenSruCheckpointPolicy(torch.nn.Module):
@@ -60,7 +61,20 @@ class SceneTokenSruCheckpointPolicy(torch.nn.Module):
         _ensure_local_rsl_rl_on_path()
         from rsl_rl.modules.actor_critic_sru import ActorCriticSRU
 
-        self.cfg = cfg or SceneTokenSruPolicyConfig()
+        checkpoint_path = Path(checkpoint_path).expanduser()
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        state_dict = checkpoint.get("model_state_dict", checkpoint)
+        if cfg is None:
+            cfg = SceneTokenSruPolicyConfig()
+            if any("history_map_projector" in key for key in state_dict):
+                cfg = replace(
+                    cfg,
+                    num_actor_obs=16 + 64 * 5 * 8 + 64 * 5,
+                    num_critic_obs=16 + 64 * 7 * 7 + 64 * 5 * 8 + 64 * 5 + 1,
+                    scene_token_dim=5,
+                    use_dynamic_map_cross_attention=True,
+                )
+        self.cfg = cfg
         self.device = torch.device(device)
         self.actor_critic = ActorCriticSRU(
             num_actor_obs=self.cfg.num_actor_obs,
@@ -87,10 +101,8 @@ class SceneTokenSruCheckpointPolicy(torch.nn.Module):
             scene_token_dim=self.cfg.scene_token_dim,
             scene_token_feature_dim=self.cfg.scene_token_feature_dim,
             scene_token_query_num_heads=self.cfg.scene_token_query_num_heads,
+            use_dynamic_map_cross_attention=self.cfg.use_dynamic_map_cross_attention,
         )
-        checkpoint_path = Path(checkpoint_path).expanduser()
-        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-        state_dict = checkpoint.get("model_state_dict", checkpoint)
         missing, unexpected = self.actor_critic.load_state_dict(state_dict, strict=False)
         if missing or unexpected:
             raise RuntimeError(

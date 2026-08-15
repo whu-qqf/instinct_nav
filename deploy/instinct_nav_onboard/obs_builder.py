@@ -32,7 +32,7 @@ class HighLevelObsBuilder:
         self.depth_history.clear()
 
     def build_actor_obs(self, packet: SensorPacket, encoded_depth: torch.Tensor, scene_tokens: torch.Tensor) -> torch.Tensor:
-        """Return flat actor obs: proprio(16) + encoded_depth(2560) + scene_tokens(384)."""
+        """Return flat actor obs using the scene-token layout selected by config."""
         if packet.reset:
             self.reset()
 
@@ -127,6 +127,18 @@ class HighLevelObsBuilder:
         grad_y = F.pad((depth_norm[..., 1:, :] - depth_norm[..., :-1, :]).abs(), (0, 0, 0, 1))
         depth_edge = F.adaptive_avg_pool2d((grad_x + grad_y).unsqueeze(1), (token_grid, token_grid)).flatten(start_dim=1)
         depth_edge = depth_edge.clamp(0.0, 1.0)
+
+        if self.cfg.layout.scene_token_feature_dim == 5:
+            current_hit = F.adaptive_avg_pool2d(
+                valid.to(dtype=torch.float32).unsqueeze(1), (token_grid, token_grid)
+            ).flatten(start_dim=1)
+            visibility_delta = (current_hit - visible_ratio).clamp(-1.0, 1.0)
+            patches = torch.stack(
+                (visible_ratio, current_hit, depth_mean, depth_edge, visibility_delta), dim=-1
+            )
+            return patches.reshape(1, -1)
+        if self.cfg.layout.scene_token_feature_dim != 6:
+            raise ValueError(f"unsupported scene token dim: {self.cfg.layout.scene_token_feature_dim}")
 
         frontier_source = (
             self.visibility

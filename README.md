@@ -2692,3 +2692,232 @@ logs/rsl_rl/g1_instinct_navigation_ppo_vismap/2026-08-12_22-42-54_g1_sru_dynamic
 [DynamicObstacleManager] Dynamic obstacles ENABLED (step 0).
 [INFO] Dynamic obstacles forced ENABLED for evaluation.
 ```
+
+
+### 2026-08-15 DynamicMapCross model_5999 ONNX 部署 bundle
+
+最终 checkpoint 已转换为包含两级 cross-attention 的高层 ONNX。该 exporter 会自动从
+checkpoint 识别 `scene_token_dim=5` 和 `use_dynamic_map_cross_attention=true`，不会再按
+旧 ScoreVis `64x6` 网络错误导出。
+
+```text
+artifacts/high_level/g1_sru_dynamic_map_cross_corridor_model5999_20260815/
+├── deploy_manifest.json
+├── sru_high_level_depth_encoder.onnx
+└── sru_high_level_scene_token.onnx
+```
+
+导出命令：
+
+```bash
+cd /workspace/instinct_nav
+
+/workspace/instinctlab51-env/bin/python deploy/scripts/export_high_level_sru_onnx.py   --checkpoint_path logs/rsl_rl/g1_instinct_navigation_ppo_vismap/2026-08-12_22-42-54_g1_sru_dynamic_map_cross_corridor_v1/model_5999.pt   --output_dir artifacts/high_level/g1_sru_dynamic_map_cross_corridor_model5999_20260815   --require_onnx_parity
+
+/workspace/instinctlab51-env/bin/python deploy/scripts/export_high_level_depth_encoder_onnx.py   --weights_path source/instinct_nav/instinct_nav/navigation/assets/data/Policies/depth_encoder/vae_pretrain_new.pth   --output_dir artifacts/high_level/g1_sru_dynamic_map_cross_corridor_model5999_20260815
+```
+
+部署契约：
+
+```text
+policy input obs:          [B, 2896]
+policy input h/c:          [1, B, 512]
+policy output actions:     [B, 3]
+encoded depth:             2560 = 64*5*8
+dynamic map patches:       320 = 64*5
+patch layout:              [history_score, current_hit, current_depth, current_edge, visibility_delta]
+visibility_decay:          0.995
+checkpoint iteration:      5999
+ONNX opset:                17
+```
+
+文件哈希：
+
+```text
+1b9d0dcb1b0a9b6cd64cd9bff3f199116cfce1044f19798ad84082b79a2e2fae  sru_high_level_depth_encoder.onnx
+79d4879bd14c08bb791abe11dca7db801e173b8ae9f0ffdc2bc0edd556152cfb  sru_high_level_scene_token.onnx
+```
+
+验证结果：PyTorch/ONNX zero、random 和连续四步 recurrent parity 均通过；ONNX-only
+runtime 也完成一帧 `depth -> encoder -> 64x5 patches -> SRU policy -> command` 端到端
+测试，command、hidden 和 cell 均为有限值。
+
+真机部署时必须使用包含本节修改的最新项目代码。旧版 onboard runtime 固定生成
+ScoreVis `64x6` observation，不能与该 bundle 混用。真机命令中的三个路径应改为：
+
+```bash
+--sru_policy_onnx_path artifacts/high_level/g1_sru_dynamic_map_cross_corridor_model5999_20260815/sru_high_level_scene_token.onnx --sru_depth_encoder_onnx_path artifacts/high_level/g1_sru_dynamic_map_cross_corridor_model5999_20260815/sru_high_level_depth_encoder.onnx --deploy_manifest_path artifacts/high_level/g1_sru_dynamic_map_cross_corridor_model5999_20260815/deploy_manifest.json --visibility_decay 0.995
+```
+
+
+### DynamicMapCross 真机部署：三个终端完整命令与遥操作
+
+使用最新 bundle：`artifacts/high_level/g1_sru_dynamic_map_cross_corridor_model5999_20260815/`。
+机器人端必须使用包含 DynamicMapCross `64x5` onboard runtime 的最新代码。首次真实控制
+必须使用吊架/保护绳、现场监护人员和物理急停。
+
+#### 终端 1：环境准备和设备检查
+
+```bash
+sudo docker exec -it unitree.unitree-jetson-container bash
+source /workspace/unitree-jetson-container/env.sh
+source /workspace/unitree-jetson-container/instinct_onboard/instinct_venv/bin/activate
+cd /workspace/unitree-jetson-container/instinct_nav
+export PYTHONPATH=/workspace/unitree-jetson-container/instinct_nav/deploy:/workspace/unitree-jetson-container/instinct_nav/external/instinct_onboard:$PYTHONPATH
+
+ARTIFACT_DIR=artifacts/high_level/g1_sru_dynamic_map_cross_corridor_model5999_20260815
+ls -lh "$ARTIFACT_DIR"
+sha256sum "$ARTIFACT_DIR"/sru_high_level_scene_token.onnx
+sha256sum "$ARTIFACT_DIR"/sru_high_level_depth_encoder.onnx
+python -c "import json; d=json.load(open('$ARTIFACT_DIR/deploy_manifest.json')); print(json.dumps(d,indent=2))"
+python -c "import onnxruntime as ort; d='$ARTIFACT_DIR'; p=ort.InferenceSession(d+'/sru_high_level_scene_token.onnx'); e=ort.InferenceSession(d+'/sru_high_level_depth_encoder.onnx'); print([(x.name,x.shape) for x in p.get_inputs()]); print([(x.name,x.shape) for x in p.get_outputs()]); print([(x.name,x.shape) for x in e.get_inputs()]); print([(x.name,x.shape) for x in e.get_outputs()])"
+
+ros2 topic list | grep -Ei "lowstate|secondary_imu|lowcmd|dog_odom|wirelesscontroller"
+ros2 topic hz /dog_odom
+```
+
+`/dog_odom` 有稳定频率后按 `Ctrl-C`，继续检查：
+
+```bash
+ros2 topic echo /dog_odom --once
+ros2 topic echo /wirelesscontroller --once
+python -c "import pyrealsense2 as rs; print(rs.context().query_devices())"
+```
+
+期望 policy 输入为 `obs [batch,2896]`、`h/c [1,batch,512]`，depth encoder 输出
+`[batch,64,5,8]`。正确哈希：
+
+```text
+79d4879bd14c08bb791abe11dca7db801e173b8ae9f0ffdc2bc0edd556152cfb  sru_high_level_scene_token.onnx
+1b9d0dcb1b0a9b6cd64cd9bff3f199116cfce1044f19798ad84082b79a2e2fae  sru_high_level_depth_encoder.onnx
+```
+
+#### 终端 2：先运行 dry-run
+
+```bash
+sudo docker exec -it unitree.unitree-jetson-container bash
+source /workspace/unitree-jetson-container/env.sh
+source /workspace/unitree-jetson-container/instinct_onboard/instinct_venv/bin/activate
+cd /workspace/unitree-jetson-container/instinct_nav
+export PYTHONPATH=/workspace/unitree-jetson-container/instinct_nav/deploy:/workspace/unitree-jetson-container/instinct_nav/external/instinct_onboard:$PYTHONPATH
+mkdir -p /workspace/instinct_nav_logs/dynamic_map_cross_model5999_dryrun
+
+python deploy/scripts/g1_nav_onboard_onnx.py \
+  --standdir /workspace/unitree-jetson-container/data/data/checkpoints/stand_onboard \
+  --logdir /workspace/unitree-jetson-container/data/data/checkpoints/parkour_onboard_preview_stair \
+  --sru_policy_onnx_path artifacts/high_level/g1_sru_dynamic_map_cross_corridor_model5999_20260815/sru_high_level_scene_token.onnx \
+  --sru_depth_encoder_onnx_path artifacts/high_level/g1_sru_dynamic_map_cross_corridor_model5999_20260815/sru_high_level_depth_encoder.onnx \
+  --deploy_manifest_path artifacts/high_level/g1_sru_dynamic_map_cross_corridor_model5999_20260815/deploy_manifest.json \
+  --visibility_decay 0.995 --sru_high_level_hz 5.0 \
+  --camera_frame_timeout_s 0.25 --joystick_topic /wirelesscontroller \
+  --goal_pose_topic /instinct_nav/goal_pose --goal_reached_threshold 0.1 \
+  --odom_topic /dog_odom --odom_twist_frame body --odom_timeout_s 0.5 \
+  --command_min -0.3 -0.2 -0.4 --command_max 0.3 0.2 0.4 \
+  --command_deadband 0.02 0.02 0.02 --command_slew_rate 0.3 0.2 0.4 \
+  --command_lowpass_alpha 0.4 \
+  --fall_tilt_threshold_deg 55 --fall_tilt_duration_s 0.15 \
+  --auto_start_parkour \
+  --debug_dump_dir /workspace/instinct_nav_logs/dynamic_map_cross_model5999_dryrun \
+  --debug_dump_every_steps 1 --debug_dump_max_steps 100
+```
+
+dry-run 默认不发布真实 `/lowcmd`。确认没有 contract mismatch/watchdog timeout，且
+`actor_obs=2896`、scene patch 为 320 维、action/command 均为有限值。然后在终端 2
+按 `Ctrl-C` 停止；不要同时运行 dry-run 和真实节点。
+
+#### 终端 2：确认 dry-run 后运行真实控制
+
+真实命令不使用 `--auto_start_parkour`。节点自动执行 `cold_start -> stand`，收到目标后
+才进入 parkour。真实模式必须有 `--nodryrun` 和 `--safety_log_dir`。
+
+```bash
+mkdir -p /workspace/instinct_nav_logs/dynamic_map_cross_model5999_safety
+mkdir -p /workspace/instinct_nav_logs/dynamic_map_cross_model5999_real
+
+python deploy/scripts/g1_nav_onboard_onnx.py \
+  --standdir /workspace/unitree-jetson-container/data/data/checkpoints/stand_onboard \
+  --logdir /workspace/unitree-jetson-container/data/data/checkpoints/parkour_onboard_preview_stair \
+  --sru_policy_onnx_path artifacts/high_level/g1_sru_dynamic_map_cross_corridor_model5999_20260815/sru_high_level_scene_token.onnx \
+  --sru_depth_encoder_onnx_path artifacts/high_level/g1_sru_dynamic_map_cross_corridor_model5999_20260815/sru_high_level_depth_encoder.onnx \
+  --deploy_manifest_path artifacts/high_level/g1_sru_dynamic_map_cross_corridor_model5999_20260815/deploy_manifest.json \
+  --visibility_decay 0.995 --sru_high_level_hz 5.0 \
+  --camera_frame_timeout_s 0.25 --joystick_topic /wirelesscontroller \
+  --goal_pose_topic /instinct_nav/goal_pose --goal_reached_threshold 0.1 \
+  --odom_topic /dog_odom --odom_twist_frame body --odom_timeout_s 0.5 \
+  --command_min -0.3 -0.2 -0.4 --command_max 0.3 0.2 0.4 \
+  --command_deadband 0.02 0.02 0.02 --command_slew_rate 0.3 0.2 0.4 \
+  --command_lowpass_alpha 0.4 \
+  --fall_tilt_threshold_deg 55 --fall_tilt_duration_s 0.15 \
+  --safety_log_dir /workspace/instinct_nav_logs/dynamic_map_cross_model5999_safety \
+  --safety_telemetry_hz 10 \
+  --debug_dump_dir /workspace/instinct_nav_logs/dynamic_map_cross_model5999_real \
+  --debug_dump_every_steps 5 --debug_dump_max_steps 100 \
+  --nodryrun
+```
+
+等待终端 2 打印 cold-start 完成并进入 stand，确认站姿稳定和 safety log 正常，再发布目标。
+
+#### 终端 3：目标管理器
+
+```bash
+sudo docker exec -it unitree.unitree-jetson-container bash
+source /workspace/unitree-jetson-container/env.sh
+source /workspace/unitree-jetson-container/instinct_onboard/instinct_venv/bin/activate
+cd /workspace/unitree-jetson-container/instinct_nav
+export PYTHONPATH=/workspace/unitree-jetson-container/instinct_nav/deploy:/workspace/unitree-jetson-container/instinct_nav/external/instinct_onboard:$PYTHONPATH
+
+python deploy/scripts/goal_manager.py \
+  --odom_topic /dog_odom \
+  --world_goal_topic /instinct_nav/world_goal_point \
+  --body_goal_topic /instinct_nav/goal_pose \
+  --goal_frame odom \
+  --goal_reached_threshold 0.5 \
+  --stop_publish_count 10 \
+  --publish_hz 10
+```
+
+该进程保持运行，持续把世界坐标目标转换为 body-frame 目标。
+
+#### 遥操作：复用终端 1 查看坐标并发布目标
+
+先查看机器人绝对坐标：
+
+```bash
+ros2 topic echo /dog_odom --once
+```
+
+读取 `pose.pose.position.x/y`。下面的目标是 `odom` 下的绝对坐标，不是相对位移。
+若当前位置接近 `x=0,y=0`，首次发布前方 0.5m 目标：
+
+```bash
+ros2 topic pub --once /instinct_nav/world_goal_point geometry_msgs/msg/PointStamped \
+  "{header: {frame_id: 'odom'}, point: {x: 0.5, y: 0.0, z: 0.0}}"
+```
+
+左右目标示例：
+
+```bash
+ros2 topic pub --once /instinct_nav/world_goal_point geometry_msgs/msg/PointStamped \
+  "{header: {frame_id: 'odom'}, point: {x: 0.0, y: 0.5, z: 0.0}}"
+
+ros2 topic pub --once /instinct_nav/world_goal_point geometry_msgs/msg/PointStamped \
+  "{header: {frame_id: 'odom'}, point: {x: 0.0, y: -0.5, z: 0.0}}"
+```
+
+每次只发布一个目标，顺序建议为前进 0.5m、横向 0.5m、1.0m，再测试动态障碍。
+
+#### 手柄和停止方式
+
+- 不需要按 `L1`；收到目标后自动从 stand 切换到 parkour。
+- `R1`：清零自主命令并返回 stand；该停止会锁存，必须重启终端 2 才能重新接受目标。
+- `R2` 或 `L2`：电机断电急停并退出，机器人会变软，必须有吊架。
+- `Ctrl-C`：正常停止进程，不代替物理急停。
+- 到达目标后自动停止并返回 stand。
+- watchdog/姿态保护触发后会锁存 fault，排除原因后必须重启节点。
+
+测试后保留：
+
+```text
+/workspace/instinct_nav_logs/dynamic_map_cross_model5999_safety/
+/workspace/instinct_nav_logs/dynamic_map_cross_model5999_real/
+```

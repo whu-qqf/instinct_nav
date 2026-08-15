@@ -44,6 +44,13 @@ class SceneTokenSruOnnxActor(nn.Module):
         self.scene_token_projector = copy.deepcopy(ac.scene_token_projector)
         self.scene_token_position_embedding = nn.Parameter(ac.scene_token_position_embedding.detach().clone())
         self.scene_token_norm = copy.deepcopy(ac.scene_token_norm)
+        self.use_dynamic_map_cross_attention = bool(ac.use_dynamic_map_cross_attention)
+        if self.use_dynamic_map_cross_attention:
+            self.history_map_projector = copy.deepcopy(ac.history_map_projector)
+            self.current_map_projector = copy.deepcopy(ac.current_map_projector)
+            self.map_cross_attention = copy.deepcopy(ac.map_cross_attention)
+            self.map_cross_norm = copy.deepcopy(ac.map_cross_norm)
+            self.map_cross_ffn = copy.deepcopy(ac.map_cross_ffn)
         self.scene_query_proj = copy.deepcopy(ac.scene_query_proj)
         self.scene_query_norm = copy.deepcopy(ac.scene_query_norm)
         self.scene_cross_attention = copy.deepcopy(ac.scene_cross_attention)
@@ -77,7 +84,15 @@ class SceneTokenSruOnnxActor(nn.Module):
         recurrent_features, (h_out, c_out) = self.rnn(recurrent_input.unsqueeze(0), (h_in, c_in))
         recurrent_features = recurrent_features.squeeze(0)
 
-        tokens = self.scene_token_projector(scene_tokens)
+        if self.use_dynamic_map_cross_attention:
+            position = self.scene_token_position_embedding.to(device=scene_tokens.device, dtype=scene_tokens.dtype)
+            history = self.history_map_projector(scene_tokens[..., :1]) + position
+            current = self.current_map_projector(scene_tokens[..., 1:]) + position
+            attended, _ = self.map_cross_attention(current, history, history, need_weights=False)
+            tokens = self.map_cross_norm(current + attended)
+            tokens = tokens + self.map_cross_ffn(tokens)
+        else:
+            tokens = self.scene_token_projector(scene_tokens)
         tokens = tokens + self.scene_token_position_embedding.to(device=tokens.device, dtype=tokens.dtype)
         query_context = torch.cat([recurrent_features, proprio], dim=-1)
         query = self.scene_query_proj(query_context).unsqueeze(1)
@@ -242,6 +257,10 @@ def main() -> None:
             "scene_token_num_tokens": int(getattr(actor_critic, "scene_token_num_tokens", 0)),
             "scene_token_dim": int(getattr(actor_critic, "scene_token_dim", 0)),
             "scene_token_features_total": int(getattr(actor_critic, "num_actor_scene_token_features", 0)),
+            "use_dynamic_map_cross_attention": bool(
+                getattr(actor_critic, "use_dynamic_map_cross_attention", False)
+            ),
+            "visibility_decay": 0.995,
             "encoded_depth_dim": int(getattr(actor_critic, "num_image_features", 0)),
             "proprio_dim": int(getattr(actor_critic, "actor_proprioceptive_input_dim", 0)),
             "image_input_dims": [int(v) for v in getattr(actor_critic, "image_input_dims", [])],
