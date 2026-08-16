@@ -35,6 +35,10 @@ class InstinctFrozenNavigationSE2Action(ActionTerm):
         self._scale = torch.tensor(self.cfg.scale, device=self.device)
         self._offset = torch.tensor(self.cfg.offset, device=self.device)
         self._policy_scaling = torch.tensor(self.cfg.policy_scaling, device=self.device).repeat(self.num_envs, 1)
+        self._command_min = torch.tensor(self.cfg.command_min, device=self.device)
+        self._command_max = torch.tensor(self.cfg.command_max, device=self.device)
+        if torch.any(self._command_min > self._command_max):
+            raise ValueError("command_min must be less than or equal to command_max")
         self._policy_bias = torch.zeros(self.num_envs, self._action_dim, device=self.device)
         self._counter = 0
         if self.cfg.backend_type == "checkpoint":
@@ -92,6 +96,9 @@ class InstinctFrozenNavigationSE2Action(ActionTerm):
             self._processed_navigation_velocity_actions[:] = (self._processed_navigation_velocity_actions - 0.5) * 2.0
         else:
             raise ValueError(f"Unknown policy distribution type: {self.cfg.policy_distr_type}")
+        self._processed_navigation_velocity_actions[:] = self._command_min + 0.5 * (
+            self._processed_navigation_velocity_actions + 1.0
+        ) * (self._command_max - self._command_min)
         observations = self._env.observation_manager.compute_group(group_name=self.cfg.observation_group)
         if isinstance(observations, dict):
             base_ang_vel = observations["base_ang_vel"][:, -3:] if observations["base_ang_vel"].shape[1] >= 3 else observations["base_ang_vel"]

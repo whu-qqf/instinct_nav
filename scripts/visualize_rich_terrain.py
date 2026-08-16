@@ -29,6 +29,7 @@ def main() -> None:
         from instinct_nav.terrains import RICH_MAZE_TERRAIN_CFG
 
         names = list(RICH_MAZE_TERRAIN_CFG.sub_terrains)
+        terrain_size_x, terrain_size_y = RICH_MAZE_TERRAIN_CFG.size
         fields: list[np.ndarray] = []
         for index, name in enumerate(names):
             cfg = copy.deepcopy(RICH_MAZE_TERRAIN_CFG.sub_terrains[name])
@@ -51,7 +52,7 @@ def main() -> None:
             image = axis.imshow(
                 field.T,
                 origin="lower",
-                extent=(0.0, 40.0, 0.0, 40.0),
+                extent=(0.0, terrain_size_x, 0.0, terrain_size_y),
                 cmap="terrain",
                 vmin=global_min,
                 vmax=global_max,

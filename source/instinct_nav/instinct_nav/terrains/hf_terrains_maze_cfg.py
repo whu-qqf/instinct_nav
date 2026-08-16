@@ -112,6 +112,9 @@ class HfMazeTerrainCfg(HfTerrainBaseCfg):
     add_raised_bars: bool = False
     """Mix single-step, 14-18 cm raised bars into the terrain."""
 
+    add_sunken_bars: bool = False
+    """Mix shallow bar-shaped depressions into the terrain."""
+
     # =========================================================================
     # Random Number Generator
     # =========================================================================

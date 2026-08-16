@@ -49,8 +49,8 @@ class OnboardConfig:
     repo_root: Path = Path(__file__).resolve().parents[2]
     high_level_hz: float = 5.0
     low_level_hz: float = 50.0
-    command_min: tuple[float, float, float] = (-1.0, -0.6, -1.0)
-    command_max: tuple[float, float, float] = (1.0, 0.6, 1.0)
+    command_min: tuple[float, float, float] = (0.0, 0.0, -1.0)
+    command_max: tuple[float, float, float] = (1.0, 0.0, 1.0)
     visibility_decay: float = 1.0
     visibility_score_alpha_up: float = 0.15
     camera: CameraConfig = CameraConfig()

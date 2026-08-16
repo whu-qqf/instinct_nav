@@ -358,7 +358,8 @@ class OnnxHighLevelRuntime:
         # Training uses a Gaussian policy and applies tanh in the navigation
         # action term before writing the low-level velocity command. Keep the
         # raw action in last_action, but mirror that command transform here.
-        command = np.clip(np.tanh(action.astype(np.float32)), mins, maxs)
+        normalized = np.tanh(action.astype(np.float32))
+        command = mins + 0.5 * (normalized + 1.0) * (maxs - mins)
         return VelocityCommand(float(command[0]), float(command[1]), float(command[2]), timestamp_s=timestamp_s)
 
     def _maybe_dump(self, packet, encoded_depth, filtered_depth, scene_tokens, actor_obs, raw_action, command) -> None:

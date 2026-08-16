@@ -140,6 +140,8 @@ class G1InstinctNavigationEnvCfg(NavigationEnvCfg):
             ),
             low_level_decimation=4,
             policy_scaling=[1.0, 1.0, 1.0],
+            command_min=[0.0, 0.0, -1.0],
+            command_max=[1.0, 0.0, 1.0],
             use_raw_actions=True,
             policy_distr_type="gaussian",
             enable_low_pass_filter=True,
@@ -778,8 +780,6 @@ class G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL(
     def __post_init__(self):
         super().__post_init__()
         self.scene.terrain.terrain_generator = copy.deepcopy(RICH_MAZE_TERRAIN_CFG)
-        # The 40 m tile permits longer start-goal paths than the 30 m baseline.
-        self.episode_length_s = 80.0
 
 
 @configclass

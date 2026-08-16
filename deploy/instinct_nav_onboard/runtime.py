@@ -102,5 +102,6 @@ class InstinctNavOnboardRuntime:
     def _action_to_command(self, action: torch.Tensor, timestamp_s: float) -> VelocityCommand:
         mins = torch.as_tensor(self.cfg.command_min, device=action.device)
         maxs = torch.as_tensor(self.cfg.command_max, device=action.device)
-        command = torch.max(torch.min(action, maxs), mins).detach().cpu().numpy()
+        normalized = torch.tanh(action)
+        command = (mins + 0.5 * (normalized + 1.0) * (maxs - mins)).detach().cpu().numpy()
         return VelocityCommand(float(command[0]), float(command[1]), float(command[2]), timestamp_s=timestamp_s)

@@ -25,10 +25,10 @@
 | `external/instinct_rl/` | frozen policy runtime 相关外部代码 |
 | `artifacts/low_level/g1_parkour/model_30000.pt` | frozen G1 parkour 低层 checkpoint |
 | `logs/` | 训练/评估输出，通常不要提交 |
-| `README.md` | 时间顺序修改记录和常用命令 |
-| `RESULTS.md` | 评估结果和对比 |
-| `CodeReading.md` | 代码阅读说明 |
-| `docs/scene_token_design.md` | scene token 思路与实验记录 |
+| `README.md` | 项目概况、网络结构、运行命令 |
+| `LOG.md` | 时间顺序的训练/对齐/部署进展记录 |
+| `docs/advices.md` | 真机部署修复清单 |
+| `docs/paper_inspiration_design.md` | 论文启发与设计备忘 |
 
 ## 2. 主要任务 ID
 

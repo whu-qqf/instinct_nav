@@ -476,6 +476,11 @@ def maze_terrain(difficulty: float, cfg: "hf_terrains_maze_cfg.HfMazeTerrainCfg"
     # Generate terrain features based on type
     if cfg.terrain_feature == "blocks":
         _add_blocks(rng, terrain, cfg, difficulty, cell_pixels)
+    elif cfg.terrain_feature == "traversal_mix":
+        _add_stairs(
+            rng, terrain, cfg, difficulty, wall_height, cell_pixels, stair_gen,
+            add_random_obstacles=False,
+        )
     elif cfg.dynamic_obstacles:
         _add_pits(rng, terrain, cfg, difficulty, wall_height, cell_pixels)
     elif cfg.stairs:
@@ -488,11 +493,13 @@ def maze_terrain(difficulty: float, cfg: "hf_terrains_maze_cfg.HfMazeTerrainCfg"
         _add_ramps(rng, terrain, cfg, difficulty)
     if cfg.add_raised_bars:
         _add_raised_bars(rng, terrain, cfg, difficulty)
+    if cfg.add_sunken_bars:
+        _add_sunken_bars(rng, terrain, cfg, difficulty)
 
     clear_center(maze, terrain, cell_pixels)
 
     # Apply height transition padding for stair terrain
-    if cfg.stairs or cfg.terrain_feature == "blocks" or cfg.add_raised_bars:
+    if cfg.stairs or cfg.terrain_feature in ("blocks", "traversal_mix") or cfg.add_raised_bars or cfg.add_sunken_bars:
         terrain.apply_height_transition_padding(
             height_threshold=PADDING.HEIGHT_TRANSITION_THRESHOLD,
             padding_cells=PADDING.HEIGHT_TRANSITION_PADDING
@@ -560,7 +567,8 @@ def _add_stairs(
     difficulty: float,
     wall_height: int,
     cell_pixels: int,
-    stair_gen: StairGenerator
+    stair_gen: StairGenerator,
+    add_random_obstacles: bool = True,
 ):
     """Add stair/platform structures to terrain."""
     grid_w, grid_h = cfg.grid_size
@@ -605,7 +613,7 @@ def _add_stairs(
                     for dy in range(3):
                         processed.add((x + dx, y + dy))
 
-            elif rng.random() < obstacle_prob:
+            elif add_random_obstacles and rng.random() < obstacle_prob:
                 xs, xe, ys, ye = get_cell_bounds(
                     x, y, cell_pixels, terrain.heights.shape[0], terrain.heights.shape[1]
                 )
@@ -780,10 +788,10 @@ def _add_raised_bars(
     xx, yy = np.indices((width, height))
     center_clearance = int(4.0 / cfg.horizontal_scale)
     border_clearance = int(1.0 / cfg.horizontal_scale)
-    requested = int(rng.integers(2, 6))
+    requested = int(rng.integers(6, 11))
     placed = 0
 
-    for _ in range(80):
+    for _ in range(200):
         if placed >= requested:
             break
         length = rng.uniform(2.0, 5.0) / cfg.horizontal_scale
@@ -805,6 +813,46 @@ def _add_raised_bars(
         max_height = min(0.18, 0.14 + 0.04 * difficulty)
         height_m = rng.uniform(0.14, max_height)
         terrain.heights[bar_mask] = int(round(height_m / cfg.vertical_scale))
+        terrain.valid_mask[bar_mask] = False
+        terrain.platform_mask[bar_mask] = False
+        placed += 1
+
+
+def _add_sunken_bars(
+    rng: np.random.Generator,
+    terrain: TerrainData,
+    cfg,
+    difficulty: float,
+):
+    """Add shallow bar-shaped depressions that require stepping down and up."""
+    width, height = terrain.heights.shape
+    xx, yy = np.indices((width, height))
+    center_clearance = int(4.0 / cfg.horizontal_scale)
+    border_clearance = int(1.0 / cfg.horizontal_scale)
+    requested = int(rng.integers(4, 8))
+    placed = 0
+
+    for _ in range(160):
+        if placed >= requested:
+            break
+        length = rng.uniform(2.0, 5.0) / cfg.horizontal_scale
+        thickness = rng.uniform(0.4, 0.8) / cfg.horizontal_scale
+        half_extent = int(np.ceil(length * 0.6))
+        cx = int(rng.integers(border_clearance + half_extent, width - border_clearance - half_extent))
+        cy = int(rng.integers(border_clearance + half_extent, height - border_clearance - half_extent))
+        if abs(cx - width // 2) < center_clearance and abs(cy - height // 2) < center_clearance:
+            continue
+
+        angle = rng.choice((0.0, np.pi / 2.0, np.pi / 4.0, -np.pi / 4.0))
+        local_x = (xx - cx) * np.cos(angle) + (yy - cy) * np.sin(angle)
+        local_y = -(xx - cx) * np.sin(angle) + (yy - cy) * np.cos(angle)
+        bar_mask = (np.abs(local_x) <= length / 2.0) & (np.abs(local_y) <= thickness / 2.0)
+        if not np.any(bar_mask) or np.any(terrain.heights[bar_mask] != 0):
+            continue
+
+        max_depth = min(0.18, 0.10 + 0.08 * difficulty)
+        depth_m = rng.uniform(0.08, max_depth)
+        terrain.heights[bar_mask] = -int(round(depth_m / cfg.vertical_scale))
         terrain.valid_mask[bar_mask] = False
         terrain.platform_mask[bar_mask] = False
         placed += 1

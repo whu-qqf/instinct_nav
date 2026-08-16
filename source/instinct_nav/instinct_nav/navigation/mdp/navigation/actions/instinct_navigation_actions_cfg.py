@@ -20,6 +20,8 @@ class InstinctFrozenNavigationSE2ActionCfg(ActionTermCfg):
     scale: list[float] = [1.0, 1.0, 1.0]
     offset: list[float] = [0.0, 0.0, 0.0]
     policy_scaling: list[float] = [1.0, 1.0, 1.0]
+    command_min: list[float] = [0.0, 0.0, -1.0]
+    command_max: list[float] = [1.0, 0.0, 1.0]
     observation_group: str = "instinct_low_level_policy"
     command_name: str = "base_velocity"
     low_level_position_action: ActionTermCfg = MISSING

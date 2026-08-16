@@ -68,7 +68,10 @@ def test_action_transform_matches_training_tanh_before_safety_clip():
     runtime = _runtime_without_onnx()
     raw = np.asarray([3.0, -3.0, 0.25], dtype=np.float32)
     command = runtime._action_to_command(raw, timestamp_s=1.0).as_array()
-    expected = np.clip(np.tanh(raw), runtime.cfg.command_min, runtime.cfg.command_max)
+    normalized = np.tanh(raw)
+    mins = np.asarray(runtime.cfg.command_min, dtype=np.float32)
+    maxs = np.asarray(runtime.cfg.command_max, dtype=np.float32)
+    expected = mins + 0.5 * (normalized + 1.0) * (maxs - mins)
     np.testing.assert_allclose(command, expected, rtol=0.0, atol=1.0e-7)
 
 def test_score_visibility_accumulates_repeated_hits_and_decays_when_stale():
