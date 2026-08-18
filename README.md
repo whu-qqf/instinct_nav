@@ -204,3 +204,36 @@ ps -ef | grep _launcher.py | grep -v grep
 > ```bash
 > /workspace/instinctlab51-env/bin/python -c 'from tensorboard.backend.event_processing.event_accumulator import EventAccumulator; p="PATH_TO_EVENTS"; ea=EventAccumulator(p); ea.Reload(); print(ea.Tags()["scalars"])'
 > ```
+
+## 2026-08-17：统一视觉延迟与 BEV DynamicMapCross
+
+本次只修改 DynamicMapCross 的 observation/geometry 链路，不修改 SRU、Depth
+Self/Cross-Attention、Actor/Critic、速度映射或课程。当前 v4 进程继续使用启动时加载的旧代码；
+以下改动用于后续从零训练的 v5。
+
+- 每个相机每个高层 step 只生成一个 `VisualPacket`：encoded depth、noisy raw depth、拍摄时刻
+  camera position/quaternion 和 intrinsics。
+- actor depth、critic depth、Current BEV 和 History BEV 共用一个 visual packet delay buffer
+  和同一个 per-environment lag（当前为 `0-2` 个高层 step）。
+- packet 按 `(camera_name, common_step_counter)` 缓存，同一步重复计算 observation 不会推进
+  delay buffer 两次；reset 时清空 packet cache、delay buffer 和 visibility map。
+- 当前 robot pose 保持准确；随 packet 延迟的 camera pose 只用于深度帧的正确反投影。
+- DynamicMapCross 当前帧不再直接池化相机图像，而是投影为与 History 对齐的 robot-local
+  `64x64` Current BEV，再池化为 `8x8`、共 64 个 patch。
+
+每个 patch 仍为 5 维，总 observation 仍为 `320` 维：
+
+```text
+[history_before_update,
+ current_bev_hit_ratio,
+ current_bev_depth,
+ current_bev_depth_edge,
+ current_bev_hit_ratio - history_before_update]
+```
+
+History K/V 使用融合当前帧之前的状态；本步 patch 构造后才 decay/融合 Current BEV。网络侧
+current-to-history Cross-Attention 和 SRU scene query 均保持不变。
+
+验证：`py_compile` 与 `git diff --check` 已通过。普通 pytest 环境没有初始化 Isaac Sim `pxr`，
+新增 geometry test 会显式跳过；32-env smoke 因 v4 正在占用唯一 CUDA context 无法并发启动，
+需在 v4 结束后补跑。

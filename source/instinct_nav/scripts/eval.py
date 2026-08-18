@@ -896,6 +896,42 @@ def summarize_rates(successes: int, total: int) -> float:
     return float(successes) / float(total) if total > 0 else 0.0
 
 
+def classify_episode_outcomes(
+    done_term_values: dict[str, list[bool]],
+) -> tuple[torch.Tensor, dict[str, int]]:
+    """Classify each finished episode exactly once from termination terms.
+
+    Termination trigger rates remain independently countable and may overlap. For
+    headline evaluation, physical failures take precedence over goal completion
+    when multiple terms fire on the same simulation step.
+    """
+    if not done_term_values:
+        return torch.zeros(0, dtype=torch.bool), {}
+    num_episodes = len(next(iter(done_term_values.values())))
+    masks = {
+        name: torch.tensor(values, dtype=torch.bool)
+        for name, values in done_term_values.items()
+    }
+    priority = (
+        ("obstacle_collision", "obstacle_collision_failure"),
+        ("base_contact", "base_contact_failure"),
+        ("large_pitch_angle", "orientation_failure"),
+        ("terrain_fall", "terrain_fall_failure"),
+        ("early_termination", "success"),
+        ("time_out", "timeout_failure"),
+    )
+    assigned = torch.zeros(num_episodes, dtype=torch.bool)
+    success_mask = torch.zeros(num_episodes, dtype=torch.bool)
+    counts: dict[str, int] = {}
+    for term_name, label in priority:
+        mask = masks.get(term_name, torch.zeros(num_episodes, dtype=torch.bool)) & ~assigned
+        counts[label] = int(mask.sum().item())
+        assigned |= mask
+        success_mask |= mask & (label == "success")
+    counts["other_failure"] = int((~assigned).sum().item())
+    return success_mask, counts
+
+
 def _tensor_to_list(tensor: torch.Tensor) -> list[float]:
     return [float(value) for value in tensor.detach().cpu().tolist()]
 
@@ -3685,6 +3721,15 @@ def _run_eval_pass(
     total_episodes = 0
     total_successes = 0
     termination_counts = {name: 0 for name in termination_terms}
+    outcome_counts = {
+        "success": 0,
+        "obstacle_collision_failure": 0,
+        "base_contact_failure": 0,
+        "orientation_failure": 0,
+        "terrain_fall_failure": 0,
+        "timeout_failure": 0,
+        "other_failure": 0,
+    }
     base_contact_failure_count = 0
     base_contact_failure_records: list[dict[str, object]] = []
     base_contact_body_stats: dict[str, dict[str, float]] = defaultdict(
@@ -3763,19 +3808,20 @@ def _run_eval_pass(
         if initial_case_done_mask is not None:
             initial_case_done_mask[done_ids] = True
 
-        latest_indices = (success_tracker.write_index[done_ids] - 1) % success_tracker.buffer_size
-        latest_results = success_tracker.buffer[done_ids, latest_indices]
-        successes = latest_results > 0.0
         episode_start_index = total_episodes
 
         total_episodes += int(done_ids.numel())
-        total_successes += int(successes.sum().item())
 
         done_term_values = {}
         for term_name in termination_terms:
             term_values = termination_manager.get_term(term_name)[done_ids]
             done_term_values[term_name] = term_values.detach().cpu().tolist()
             termination_counts[term_name] += int(term_values.sum().item())
+
+        successes, outcome_batch = classify_episode_outcomes(done_term_values)
+        for outcome_name, count in outcome_batch.items():
+            outcome_counts[outcome_name] += count
+        total_successes += int(successes.sum().item())
 
         if base_contact_context is not None and "base_contact" in done_term_values:
             base_contact_mask = termination_manager.get_term("base_contact")[done_ids] > 0
@@ -3886,6 +3932,10 @@ def _run_eval_pass(
         "termination_rates": {
             term_name: {"count": count, "rate": summarize_rates(count, total_episodes)}
             for term_name, count in termination_counts.items()
+        },
+        "episode_outcomes": {
+            name: {"count": count, "rate": summarize_rates(count, total_episodes)}
+            for name, count in outcome_counts.items()
         },
         "terrain_geometry": terrain_geometry_signature(env),
         "terrain_type_success": {
@@ -4213,6 +4263,15 @@ def main():
     total_episodes = 0
     total_successes = 0
     termination_counts = {name: 0 for name in termination_terms}
+    outcome_counts = {
+        "success": 0,
+        "obstacle_collision_failure": 0,
+        "base_contact_failure": 0,
+        "orientation_failure": 0,
+        "terrain_fall_failure": 0,
+        "timeout_failure": 0,
+        "other_failure": 0,
+    }
     base_contact_failure_count = 0
     base_contact_failure_records: list[dict[str, object]] = []
     base_contact_body_stats: dict[str, dict[str, float]] = defaultdict(
@@ -4302,19 +4361,20 @@ def main():
         if initial_case_done_mask is not None:
             initial_case_done_mask[done_ids] = True
 
-        latest_indices = (success_tracker.write_index[done_ids] - 1) % success_tracker.buffer_size
-        latest_results = success_tracker.buffer[done_ids, latest_indices]
-        successes = latest_results > 0.0
         episode_start_index = total_episodes
 
         total_episodes += int(done_ids.numel())
-        total_successes += int(successes.sum().item())
 
         done_term_values = {}
         for term_name in termination_terms:
             term_values = termination_manager.get_term(term_name)[done_ids]
             done_term_values[term_name] = term_values.detach().cpu().tolist()
             termination_counts[term_name] += int(term_values.sum().item())
+
+        successes, outcome_batch = classify_episode_outcomes(done_term_values)
+        for outcome_name, count in outcome_batch.items():
+            outcome_counts[outcome_name] += count
+        total_successes += int(successes.sum().item())
 
         if base_contact_context is not None and "base_contact" in done_term_values:
             base_contact_mask = termination_manager.get_term("base_contact")[done_ids] > 0
@@ -4468,6 +4528,10 @@ def main():
                 "rate": summarize_rates(count, total_episodes),
             }
             for term_name, count in termination_counts.items()
+        },
+        "episode_outcomes": {
+            name: {"count": count, "rate": summarize_rates(count, total_episodes)}
+            for name, count in outcome_counts.items()
         },
         "terrain_type_success": {
             name: {

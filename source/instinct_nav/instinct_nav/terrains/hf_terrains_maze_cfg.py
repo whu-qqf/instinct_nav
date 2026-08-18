@@ -50,6 +50,9 @@ class HfMazeTerrainCfg(HfTerrainBaseCfg):
     height_field_spawn_mask: torch.Tensor = None
     """Boolean mask of valid spawn positions (larger padding for robot body)."""
 
+    height_field_stair_centerline: torch.Tensor = None
+    """Per-cell stair centerline guidance field in [0, 1] (0 off stairs)."""
+
     # =========================================================================
     # Maze Generation Parameters
     # =========================================================================

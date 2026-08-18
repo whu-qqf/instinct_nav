@@ -2353,6 +2353,70 @@ logs/rsl_rl/g1_instinct_navigation_ppo_vismap/2026-08-12_22-42-54_g1_sru_dynamic
 logs/rsl_rl/g1_instinct_navigation_ppo_vismap/2026-08-12_22-42-54_g1_sru_dynamic_map_cross_corridor_v1/eval_dynamic_model_5999_1000ep.json
 ```
 
+## 2026-08-17: Remove Unused Sonic Integration
+
+- Removed the unused `g1_sonic` task registrations and configuration.
+- Removed the Sonic action, backend, command adapter, and their tests.
+- Removed the stale Instinct contract test that loaded the legacy `InstinctFrozenG1Backend`
+  embedded in `sonic_backend.py`; current training uses the independent
+  `instinct_frozen_backend.py` implementation.
+- The active `g1_instinct` tasks and frozen official G1 parkour low-level policy are unchanged.
+
+## 2026-08-17: Fix Evaluation Episode Outcome Accounting
+
+- Evaluation no longer reads the rolling success tracker as the result of a
+  finished episode; that tracker could be stale for `bad_orientation` and dynamic
+  obstacle terminations, and multiple termination terms could write it in one step.
+- Both evaluation passes now derive success from the current episode's
+  `early_termination` term and classify each episode exactly once in
+  `episode_outcomes`.
+- Physical failures take precedence when multiple terms fire together. The
+  existing `termination_rates` remain available as overlapping trigger diagnostics.
+- `py_compile` and `git diff --check` pass. A real evaluation should be rerun after
+  the current GPU/Isaac process is available.
+
+## 2026-08-18: v4 Model 3000 Evaluation With Correct Episode Outcomes
+
+Checkpoint:
+
+```text
+logs/rsl_rl/g1_instinct_navigation_ppo_vismap/2026-08-16_16-28-39_g1_sru_dynamic_map_cross_rich_terrain_v4/model_3000.pt
+```
+
+Both passes used 256 environments, 1000 episodes, seed 72, and the corrected
+`episode_outcomes` accounting. The static pass left dynamic obstacles disabled;
+the dynamic pass used `--force_dynamic_obstacles` and confirmed obstacles enabled
+from step 0.
+
+| Condition | Success | Base contact | Orientation | Obstacle collision | Timeout | Outcome total |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Static | 0.802 | 0.071 | 0.114 | 0.000 | 0.013 | 1000 |
+| Dynamic | 0.703 | 0.098 | 0.071 | 0.123 | 0.005 | 1000 |
+
+Dynamic obstacles reduce success by 9.9 percentage points. The main new failure
+mode is obstacle collision (12.3%), followed by base contact (9.8%). The exact
+JSON outputs are:
+
+```text
+logs/rsl_rl/g1_instinct_navigation_ppo_vismap/2026-08-16_16-28-39_g1_sru_dynamic_map_cross_rich_terrain_v4/eval_static_model_3000_1000ep_fixed.json
+logs/rsl_rl/g1_instinct_navigation_ppo_vismap/2026-08-16_16-28-39_g1_sru_dynamic_map_cross_rich_terrain_v4/eval_dynamic_model_3000_1000ep_fixed.json
+```
+
+## 2026-08-17：统一视觉延迟与 Current-BEV DynamicMapCross
+
+本轮只修改 observation/geometry，不修改 SRU 网络或课程：
+
+- encoded depth、noisy raw depth、capture-time camera pose/quaternion 和 intrinsics 统一进入
+  `camera_visual_packet` delay buffer，同一步 actor/critic/map 复用同一个 packet 与 lag。
+- 当前 robot pose 不延迟；capture-time camera pose 仅用于将延迟深度正确投影到当前机器人局部坐标。
+- DynamicMapCross 当前帧由 delayed raw depth 投影为 robot-local `64x64` Current BEV，不再从
+  相机图像坐标直接池化。
+- 5 维 patch 保持 `64x5=320`，使用更新前 History、Current BEV hit/depth/edge 和 signed delta。
+- reset 同步清空 packet cache、delay buffer 和 visibility map。
+
+当前 v4 进程使用修改前代码，未停止或覆盖；新链路属于后续 v5。`py_compile`、
+`git diff --check` 已通过。32-env Isaac smoke 因 v4 占用唯一 CUDA context 暂未执行。
+
 动态组的关键启动证据：
 
 ```text

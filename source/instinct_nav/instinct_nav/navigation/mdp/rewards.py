@@ -132,3 +132,67 @@ def backward_movement_penalty(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg 
     # Only penalize negative forward velocity (backward movement)
     backward_velocity = torch.clamp(-forward_velocity, min=0.0, max=1.0)
     return backward_velocity
+
+
+def stair_centerline_alignment(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Reward the robot for approaching/ascending stairs along their center-line.
+
+    Uses privileged geometry baked at terrain generation: the per-cell centerline
+    field ``env.scene.terrain._height_field_stair_centerline`` (shape
+    ``(num_terrains, W, H)``, values in ``[0, 1]``). The reward is the field value
+    at the robot's current cell — high on the lateral mid-line of a staircase,
+    decaying to its exposed lateral edges. The field is 0 everywhere off stairs, so
+    flat ground and platforms yield exactly 0 (no false-positive shaping). Purely
+    positive; use with a positive weight.
+
+    Args:
+        env: The learning environment.
+        command_name: Name of the navigation goal command (reused for the terrain
+            index/coordinate convention).
+        asset_cfg: The robot asset.
+
+    Returns:
+        Dense reward in ``[0, 1]``.
+    """
+    terrain = env.scene.terrain
+    reward = torch.zeros(env.num_envs, device=env.device)
+
+    # Cache the field on GPU once (raw storage from patches lives on CPU).
+    field = getattr(terrain, "_height_field_stair_centerline_gpu", None)
+    if field is None:
+        raw = getattr(terrain, "_height_field_stair_centerline", None)
+        if raw is None:
+            return reward
+        field = raw.to(env.device)
+        terrain._height_field_stair_centerline_gpu = field
+
+    num_terrains, W, H = field.shape
+
+    cmd: RobotNavigationGoalCommand = env.command_manager._terms[command_name]
+    cmd._initialize_position_sampling()
+    sampler = cmd._position_sampler
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    env_ids = torch.arange(env.num_envs, device=env.device)
+
+    # Per-env terrain index into the (num_terrains, W, H) field, and world origin.
+    terrain_idx = cmd._get_terrain_indices(env_ids).clamp(0, num_terrains - 1)
+    levels = terrain.terrain_levels[env_ids]
+    types = terrain.terrain_types[env_ids]
+    origin_xy = terrain.terrain_origins[levels, types][:, :2]
+
+    # World -> cell, inverting the PositionSampler convention (goal_commands.py:283-284):
+    #   local = (idx + border_pixels) * cell_size - mesh_center
+    local_xy = asset.data.root_pos_w[:, :2] - origin_xy
+    i = torch.round((local_xy[:, 0] + sampler.mesh_center) / sampler.cell_size - sampler.border_pixels).long()
+    j = torch.round((local_xy[:, 1] + sampler.mesh_center) / sampler.cell_size - sampler.border_pixels).long()
+    in_bounds = (i >= 0) & (i < W) & (j >= 0) & (j < H)
+    i = i.clamp(0, W - 1)
+    j = j.clamp(0, H - 1)
+
+    values = field[terrain_idx, i, j]
+    return torch.where(in_bounds, values, reward)

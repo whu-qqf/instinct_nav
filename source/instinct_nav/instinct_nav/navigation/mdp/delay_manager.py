@@ -270,3 +270,14 @@ class ObservationDelayManager:
             return depth_features
         delay_buffer = self.get_or_create_depth_delay_buffer(camera_name)
         return delay_buffer.compute(depth_features)
+
+    def compute_delayed_visual_packet(self, packet: torch.Tensor, camera_name: str) -> torch.Tensor:
+        """Delay one synchronized visual packet for a camera.
+
+        The packet may contain encoded depth, noisy raw depth, and capture-time
+        camera geometry.  A dedicated key ensures every visual consumer shares
+        one per-environment lag instead of creating independent depth/map lags.
+        Callers must cache the returned packet so this buffer advances only once
+        per environment step.
+        """
+        return self.compute_delayed_depth(packet, f"{camera_name}_visual_packet")

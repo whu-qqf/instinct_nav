@@ -52,6 +52,10 @@ class TerrainData:
     heights: np.ndarray
     valid_mask: np.ndarray
     platform_mask: np.ndarray = field(default_factory=lambda: np.array([]))
+    # Privileged geometry: per-cell stair centerline guidance field in [0, 1].
+    # High on the lateral center-line of each staircase, decaying to the exposed
+    # lateral edges; 0 everywhere off stairs (no signal on flat ground/platforms).
+    centerline_field: np.ndarray = field(default_factory=lambda: np.array([]))
 
     @classmethod
     def create(cls, width: int, height: int) -> "TerrainData":
@@ -60,6 +64,7 @@ class TerrainData:
             heights=np.zeros((width, height), dtype=np.int16),
             valid_mask=np.ones((width, height), dtype=bool),  # Start all valid
             platform_mask=np.zeros((width, height), dtype=bool),
+            centerline_field=np.zeros((width, height), dtype=np.float32),
         )
 
     def set_obstacle(
@@ -386,14 +391,17 @@ class StairGenerator:
             "s": rotate(east, 270),
         }
 
-    def generate(self, rng: np.random.Generator) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def generate(self, rng: np.random.Generator) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Generate a 3x3 stair/platform structure.
 
         Args:
             rng: Random number generator.
 
         Returns:
-            Tuple of (heights, valid_mask, platform_mask).
+            Tuple of (heights, valid_mask, platform_mask, centerline).
+            ``centerline`` is a float32 field in [0, 1]: high on the lateral
+            center-line of each staircase (along the ascent direction), decaying
+            to the exposed lateral edges; 0 everywhere else.
         """
         layout = self.LAYOUTS[rng.integers(len(self.LAYOUTS))]
         min_steps, max_steps = self.cfg.stair_num_steps_range
@@ -413,6 +421,13 @@ class StairGenerator:
         heights = np.zeros((size, size), dtype=np.float32)
         valid_mask = np.zeros((size, size), dtype=bool)
         platform_mask = np.zeros((size, size), dtype=bool)
+        centerline = np.zeros((size, size), dtype=np.float32)
+
+        # Lateral centering profile: 1.0 on the mid-line, decaying linearly to 0
+        # at the two lateral edges of a stair cell. Uniform along the ascent axis.
+        idx = np.arange(cell_px, dtype=np.float32)
+        center = (cell_px - 1) / 2.0
+        lateral_profile = 1.0 - np.abs(idx - center) / max(center, 1.0)  # (cell_px,) in [0, 1]
 
         for gx, gy in layout["platforms"]:
             xs, xe = gx * cell_px, (gx + 1) * cell_px
@@ -425,8 +440,17 @@ class StairGenerator:
             xs, xe = gx * cell_px, (gx + 1) * cell_px
             ys, ye = gy * cell_px, (gy + 1) * cell_px
             heights[xs:xe, ys:ye] = templates[direction]
+            # The stair template ascends along x for "e"/"w" (uniform across y) and
+            # along y for "n"/"s" (uniform across x). The exposed lateral edges are
+            # the two edges perpendicular to the ascent axis, so the centering
+            # profile varies along the lateral axis and is broadcast along ascent.
+            if direction in ("e", "w"):
+                # ascent along x (rows) -> lateral is y (cols)
+                centerline[xs:xe, ys:ye] = lateral_profile[None, :]
+            else:  # "n" / "s": ascent along y (cols) -> lateral is x (rows)
+                centerline[xs:xe, ys:ye] = lateral_profile[:, None]
 
-        return heights, valid_mask, platform_mask
+        return heights, valid_mask, platform_mask, centerline
 
 
 # =============================================================================
@@ -522,6 +546,7 @@ def maze_terrain(difficulty: float, cfg: "hf_terrains_maze_cfg.HfMazeTerrainCfg"
         cfg.height_field_valid_mask = torch.from_numpy(terrain.valid_mask.copy()).unsqueeze(0)
         cfg.height_field_platform_mask = torch.from_numpy(terrain.platform_mask.copy()).unsqueeze(0)
         cfg.height_field_spawn_mask = torch.from_numpy(spawn_mask.copy()).unsqueeze(0)
+        cfg.height_field_stair_centerline = torch.from_numpy(terrain.centerline_field.copy()).unsqueeze(0)
 
     return terrain.heights
 
@@ -596,7 +621,7 @@ def _add_stairs(
 
             # Try placing stair structure at valid locations
             if x in x_locs and y in y_locs and rng.random() < stair_prob:
-                heights, valid, platform = stair_gen.generate(rng)
+                heights, valid, platform, centerline = stair_gen.generate(rng)
 
                 xs = x * cell_pixels
                 xe = min(terrain.heights.shape[0], xs + stair_size)
@@ -607,6 +632,7 @@ def _add_stairs(
                 terrain.heights[xs:xe, ys:ye] = heights[:sx, :sy]
                 terrain.valid_mask[xs:xe, ys:ye] = valid[:sx, :sy]
                 terrain.platform_mask[xs:xe, ys:ye] = platform[:sx, :sy]
+                terrain.centerline_field[xs:xe, ys:ye] = centerline[:sx, :sy]
 
                 # Mark 3x3 area as processed
                 for dx in range(3):

@@ -367,6 +367,14 @@ class RewardsCfg:
     # Backward movement penalty (disabled by default, can be enabled via curriculum)
     backward_movement_penalty = RewTerm(func=mdp.backward_movement_penalty, weight=-0.0)
 
+    # Stair centerline guidance (disabled by default; enabled in the Centerline ablation).
+    # Privileged geometry: 0 off stairs -> no shaping on flat ground / platforms.
+    stair_centerline = RewTerm(
+        func=mdp.stair_centerline_alignment,
+        weight=0.0,
+        params={"command_name": "robot_goal"},
+    )
+
 
 @configclass
 class TerminationsCfg:

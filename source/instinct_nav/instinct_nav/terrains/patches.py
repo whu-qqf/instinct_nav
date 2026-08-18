@@ -39,6 +39,7 @@ _height_field_storage = {
     "height_field_valid_mask": None,
     "height_field_platform_mask": None,
     "height_field_spawn_mask": None,
+    "height_field_stair_centerline": None,
 }
 
 
@@ -249,6 +250,7 @@ def _patch_terrain_generator():
         "height_field_valid_mask",
         "height_field_platform_mask",
         "height_field_spawn_mask",
+        "height_field_stair_centerline",
     ]
 
     def _patched_init(self, cfg, device: str = "cpu"):
@@ -406,6 +408,7 @@ def _patch_terrain_importer():
         "height_field_valid_mask",
         "height_field_platform_mask",
         "height_field_spawn_mask",
+        "height_field_stair_centerline",
     ]
 
     def _patched_importer_init(self, cfg):

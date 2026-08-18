@@ -810,3 +810,139 @@ class G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_PLAY(
         self.scene.env_spacing = 2.5
         self.events.base_external_force_torque = None
         self.events.push_robot = None
+
+
+def _apply_speed_clip_mapping(cfg) -> None:
+    """Align the high-level velocity command with the frozen low-level's trained envelope.
+
+    Two changes vs the v4 default:
+    - command_max[0] (vx) 1.0 -> 0.8: never command a forward speed the InstinctLab parkour
+      low-level was never trained for on stairs/gaps/boxes/slopes (it only saw vx in [0.45, 0.8]),
+      which is a leading cause of out-of-distribution overspeed -> forward lurch -> large pitch.
+    - policy_distr_type "gaussian" -> "gaussian_clip": drop the tanh squash for a linear+clamp
+      map so a full stop (vx=0, the low-level's stand mode) and the speed ceiling are reachable
+      with a finite policy mean, with uniform resolution across the walking band.
+    command_min is unchanged ([0, 0, -1]); vy stays locked to 0 and wz stays [-1, 1].
+    """
+    cfg.actions.velocity_command.command_max = [0.8, 0.0, 1.0]
+    cfg.actions.velocity_command.policy_distr_type = "gaussian_clip"
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_SPEEDCLIP(
+    G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL
+):
+    """rich_terrain_v4 with the velocity command clipped to the low-level's trained envelope."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_speed_clip_mapping(self)
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_SPEEDCLIP_DEV(
+    G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_SPEEDCLIP
+):
+    def __post_init__(self):
+        super().__post_init__()
+        self.obstacle_max_switch_iteration = 0
+        self.events.dynamic_obstacles_reset.params["max_switch_iteration"] = 0
+        self.events.dynamic_obstacles_update.params["max_switch_iteration"] = 0
+        self.scene.num_envs = 32
+        self.scene.terrain.terrain_generator.num_rows = 2
+        self.scene.terrain.terrain_generator.num_cols = 8
+        self.scene.terrain.max_init_terrain_level = 0
+        self.scene.terrain.terrain_generator.difficulty_range = [0.0, 0.0]
+        self.scene.terrain.terrain_generator.curriculum = False
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_SPEEDCLIP_PLAY(
+    G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_SPEEDCLIP
+):
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.num_envs = 20
+        self.observations.policy.enable_corruption = False
+        self.scene.env_spacing = 2.5
+        self.events.base_external_force_torque = None
+        self.events.push_robot = None
+
+
+# =============================================================================
+# SpeedClip + stair centerline guidance reward.
+# On top of SpeedClip, enable the privileged stair-centerline shaping reward so the
+# robot learns to approach a staircase front-and-centered and ascend up the middle
+# instead of mounting from an exposed lateral edge (half-supported foot -> large pitch).
+# The reward is 0 off stairs, so flat ground / platforms are unaffected (no false
+# positives). Base RewardsCfg keeps weight 0.0, so v4 and every other task are untouched.
+# =============================================================================
+
+_STAIR_CENTERLINE_WEIGHT = 0.5
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_SPEEDCLIP_CENTERLINE(
+    G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_SPEEDCLIP
+):
+    """SpeedClip + stair centerline guidance reward."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.rewards.stair_centerline.weight = _STAIR_CENTERLINE_WEIGHT
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_SPEEDCLIP_CENTERLINE_DEV(
+    G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_SPEEDCLIP_DEV
+):
+    def __post_init__(self):
+        super().__post_init__()
+        self.rewards.stair_centerline.weight = _STAIR_CENTERLINE_WEIGHT
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_SPEEDCLIP_CENTERLINE_PLAY(
+    G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_SPEEDCLIP_PLAY
+):
+    def __post_init__(self):
+        super().__post_init__()
+        self.rewards.stair_centerline.weight = _STAIR_CENTERLINE_WEIGHT
+
+
+# =============================================================================
+# Original v4 tanh velocity mapping (command_max vx=1.0, policy_distr_type="gaussian")
+# + stair centerline reward, WITHOUT SpeedClip. Ablation to isolate whether the
+# large_pitch rate is driven by the SpeedClip mapping change or by the speed range
+# itself: this run differs from SpeedClip-Centerline ONLY in the velocity mapping,
+# so comparing large_pitch between the two answers "is it the speed mapping?".
+# =============================================================================
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE(
+    G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL
+):
+    """v4 original tanh velocity mapping + stair centerline reward (no SpeedClip)."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.rewards.stair_centerline.weight = _STAIR_CENTERLINE_WEIGHT
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_DEV(
+    G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_DEV
+):
+    def __post_init__(self):
+        super().__post_init__()
+        self.rewards.stair_centerline.weight = _STAIR_CENTERLINE_WEIGHT
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_PLAY(
+    G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_PLAY
+):
+    def __post_init__(self):
+        super().__post_init__()
+        self.rewards.stair_centerline.weight = _STAIR_CENTERLINE_WEIGHT

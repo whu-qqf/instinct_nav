@@ -158,6 +158,16 @@ def reset_and_randomize_delay_buffer(
     """
     env.delay_manager.reset(env_ids)
     env.delay_manager.randomize_lags(env_ids)
+    # A reset can occur before another observation at the same global step.
+    # Drop the step cache so reset environments cannot reuse a pre-reset packet.
+    for cache_name in (
+        "_nav_delayed_visual_packet_cache",
+        "_instinct_nav_dynamic_map_patch_cache",
+        "_instinct_nav_scene_token_cache",
+    ):
+        cache = getattr(env, cache_name, None)
+        if cache is not None:
+            cache.clear()
     visibility_manager = getattr(env, "local_visibility_map_manager", None)
     if visibility_manager is not None:
         visibility_manager.reset(env_ids)
@@ -171,6 +181,10 @@ def reset_visibility_map(
     visibility_manager = getattr(env, "local_visibility_map_manager", None)
     if visibility_manager is not None:
         visibility_manager.reset(env_ids)
+    for cache_name in ("_instinct_nav_dynamic_map_patch_cache", "_instinct_nav_scene_token_cache"):
+        cache = getattr(env, cache_name, None)
+        if cache is not None:
+            cache.clear()
 
 
 def randomize_low_pass_filter_alpha(

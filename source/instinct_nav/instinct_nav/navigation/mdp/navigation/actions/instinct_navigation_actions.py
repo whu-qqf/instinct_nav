@@ -92,6 +92,12 @@ class InstinctFrozenNavigationSE2Action(ActionTerm):
             self._processed_navigation_velocity_actions[:] = self._raw_navigation_velocity_actions * self._scale + self._offset
         if self.cfg.policy_distr_type == "gaussian":
             self._processed_navigation_velocity_actions[:] = torch.tanh(self._processed_navigation_velocity_actions)
+        elif self.cfg.policy_distr_type == "gaussian_clip":
+            # Clipped-Gaussian mapping: no tanh squash, just clamp the raw sample to [-1, 1].
+            # The affine step below then maps linearly onto [command_min, command_max], so the
+            # command extremes (e.g. vx=0 stand / vx=command_max) are reachable with a finite policy
+            # mean and the walking band keeps uniform resolution. Avoids tanh boundary saturation.
+            self._processed_navigation_velocity_actions[:] = self._processed_navigation_velocity_actions.clamp(-1.0, 1.0)
         elif self.cfg.policy_distr_type == "beta":
             self._processed_navigation_velocity_actions[:] = (self._processed_navigation_velocity_actions - 0.5) * 2.0
         else:
