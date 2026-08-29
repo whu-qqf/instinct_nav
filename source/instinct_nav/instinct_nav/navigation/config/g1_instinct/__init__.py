@@ -294,3 +294,58 @@ _register_navigation_task(
     navigation_env_cfg.G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_PLAY,
     agents.rsl_rl_cfg.G1InstinctNavPPODynamicMapCrossOfficialRunnerCfg,
 )
+
+# Ablation: tanh centerline + penalty for driving toward not-yet-observed ("black")
+# cells of the vis_score visibility map (discourages blind/occluded-direction motion).
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-DynamicMapCross-RichTerrain-Centerline-Unobserved-OfficialParkour-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED,
+    agents.rsl_rl_cfg.G1InstinctNavPPODynamicMapCrossOfficialRunnerCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-DynamicMapCross-RichTerrain-Centerline-Unobserved-OfficialParkour-Dev-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_DEV,
+    agents.rsl_rl_cfg.G1InstinctNavPPODynamicMapCrossOfficialRunnerDevCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-DynamicMapCross-RichTerrain-Centerline-Unobserved-OfficialParkour-Play-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_PLAY,
+    agents.rsl_rl_cfg.G1InstinctNavPPODynamicMapCrossOfficialRunnerCfg,
+)
+
+# Ablation: Centerline-Unobserved + rebalanced avoidance reward (P0) + capability-driven
+# graded obstacle curriculum (P1). Isolated via graded_curriculum flag; all other tasks
+# keep the legacy binary iteration switch and inert (weight-0) TTC term.
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-DynamicMapCross-RichTerrain-Centerline-Unobserved-Avoid-OfficialParkour-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID,
+    agents.rsl_rl_cfg.G1InstinctNavPPODynamicMapCrossOfficialRunnerCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-DynamicMapCross-RichTerrain-Centerline-Unobserved-Avoid-OfficialParkour-Dev-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_DEV,
+    agents.rsl_rl_cfg.G1InstinctNavPPODynamicMapCrossOfficialRunnerDevCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-DynamicMapCross-RichTerrain-Centerline-Unobserved-Avoid-OfficialParkour-Play-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_PLAY,
+    agents.rsl_rl_cfg.G1InstinctNavPPODynamicMapCrossOfficialRunnerCfg,
+)
+
+# Same network/rewards as Centerline-Unobserved, with four pre-generated terrain
+# banks switched every 1000 PPO iterations at episode-reset boundaries.
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-DynamicMapCross-RichTerrain-Centerline-Unobserved-Banks-OfficialParkour-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_BANKS,
+    agents.rsl_rl_cfg.G1InstinctNavPPODynamicMapCrossBanksOfficialRunnerCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-DynamicMapCross-RichTerrain-Centerline-Unobserved-Banks-OfficialParkour-Dev-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_BANKS_DEV,
+    agents.rsl_rl_cfg.G1InstinctNavPPODynamicMapCrossBanksOfficialRunnerDevCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-DynamicMapCross-RichTerrain-Centerline-Unobserved-Banks-OfficialParkour-Play-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_BANKS_PLAY,
+    agents.rsl_rl_cfg.G1InstinctNavPPODynamicMapCrossBanksOfficialRunnerCfg,
+)

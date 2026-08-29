@@ -375,6 +375,15 @@ class RewardsCfg:
         params={"command_name": "robot_goal"},
     )
 
+    # Penalize moving toward not-yet-observed ("black") cells of the vis_score map
+    # (disabled by default; enabled in the Unobserved ablation). Purely positive
+    # penalty -> negative weight. Returns 0 when no visibility manager exists, so
+    # non-ScoreVis tasks are unaffected.
+    velocity_into_unobserved = RewTerm(
+        func=mdp.velocity_into_unobserved_penalty,
+        weight=0.0,
+    )
+
 
 @configclass
 class TerminationsCfg:

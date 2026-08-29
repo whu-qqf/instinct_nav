@@ -361,6 +361,8 @@ class RobotNavigationGoalCommand(CommandTerm):
         self._sampling_initialized = False
         self._position_sampler: Optional[PositionSampler] = None
         self._showcase_case_cursor = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
+        self._terrain_bank_ids = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
+        self._last_reported_terrain_bank = -1
 
     def _init_command_buffers(self):
         """Initialize command state buffers."""
@@ -400,6 +402,7 @@ class RobotNavigationGoalCommand(CommandTerm):
         self.metrics["velocity_toward_goal"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["velocity_magnitude"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["success_rate"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["terrain_bank_id"] = torch.zeros(self.num_envs, device=self.device)
 
     # =========================================================================
     # Command Interface
@@ -499,6 +502,56 @@ class RobotNavigationGoalCommand(CommandTerm):
             # Row-major order (random mode uses np.unravel_index with (num_rows, num_cols))
             return levels * self.num_terrain_cols + types
 
+    def _apply_terrain_bank_for_reset(self, env_ids: torch.Tensor) -> None:
+        """Move resetting environments to the bank scheduled for this PPO iteration.
+
+        All bank meshes are generated at startup. Only the terrain column/type is
+        changed here, immediately before a new spawn and goal are sampled, so an
+        active episode is never moved between terrain tiles.
+        """
+        bank_count = int(self.cfg.terrain_bank_count)
+        if bank_count <= 1 or env_ids.numel() == 0:
+            return
+
+        base_cols = int(self.cfg.terrain_bank_base_num_cols)
+        interval = int(self.cfg.terrain_bank_switch_interval)
+        steps_per_iteration = int(self.cfg.terrain_bank_env_steps_per_iteration)
+        if base_cols <= 0 or interval <= 0 or steps_per_iteration <= 0:
+            raise ValueError(
+                "Terrain banks require positive base_num_cols, switch_interval, "
+                "and env_steps_per_iteration."
+            )
+        expected_cols = base_cols * bank_count
+        if self.num_terrain_cols != expected_cols:
+            raise ValueError(
+                f"Terrain bank layout expects {expected_cols} columns "
+                f"({bank_count} x {base_cols}), got {self.num_terrain_cols}."
+            )
+
+        iteration = int(self.env.common_step_counter) // steps_per_iteration
+        target_bank = (iteration // interval) % bank_count
+        terrain = self.env.scene.terrain
+        local_types = terrain.terrain_types[env_ids] % base_cols
+        terrain.terrain_types[env_ids] = local_types + target_bank * base_cols
+
+        # InteractiveScene exposes terrain.env_origins directly. Keep the reset
+        # origin synchronized with the newly selected bank before spawn/goal
+        # sampling; otherwise the robot is reset at the previous bank world tile
+        # while height/mask lookup uses the new bank.
+        if terrain.terrain_origins is None:
+            raise RuntimeError("Terrain banks require terrain_origins to be configured.")
+        terrain.env_origins[env_ids] = terrain.terrain_origins[
+            terrain.terrain_levels[env_ids], terrain.terrain_types[env_ids]
+        ]
+        self._terrain_bank_ids[env_ids] = target_bank
+
+        if target_bank != self._last_reported_terrain_bank:
+            print(
+                f"[TerrainBank] Scheduling bank {target_bank}/{bank_count - 1} "
+                f"at iteration {iteration}; environments switch on their next reset."
+            )
+            self._last_reported_terrain_bank = target_bank
+
     # =========================================================================
     # Command Sampling and Update
     # =========================================================================
@@ -519,6 +572,10 @@ class RobotNavigationGoalCommand(CommandTerm):
             self._resample_showcase_fixed_cases(env_ids_tensor, fixed_cases)
             return
 
+        # Preserve the pre-reset origin so a bank switch translates the robot root.
+        terrain = self.env.scene.terrain
+        old_env_origins = terrain.env_origins[env_ids_tensor].clone()
+        self._apply_terrain_bank_for_reset(env_ids_tensor)
         self._initialize_position_sampling()
 
         # Reset tracking
@@ -549,7 +606,6 @@ class RobotNavigationGoalCommand(CommandTerm):
         spawn_offset = 0.05
 
         # Update spawn/env origin
-        old_env_origins = terrain.env_origins[env_ids].clone()
         terrain.env_origins[env_ids, 0] = terrain_origins[:, 0] + spawn_x
         terrain.env_origins[env_ids, 1] = terrain_origins[:, 1] + spawn_y
         terrain.env_origins[env_ids, 2] = spawn_z + spawn_offset
@@ -670,6 +726,7 @@ class RobotNavigationGoalCommand(CommandTerm):
         direction_to_goal = position_error_2d / torch.clamp(torch.norm(position_error_2d, dim=1, keepdim=True), min=1e-6)
         self.metrics["velocity_toward_goal"] = (velocity_2d * direction_to_goal).sum(dim=1)
         self.metrics["success_rate"] = self.success_tracker.get_success_rate()
+        self.metrics["terrain_bank_id"] = self._terrain_bank_ids.float()
 
     def reset(self, env_ids: Sequence[int] | None = None) -> dict[str, float]:
         """Reset command generator and compute episode metrics."""

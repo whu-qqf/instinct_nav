@@ -39,7 +39,7 @@ Frozen InstinctLab G1 Parkour low-level policy @ 50 Hz  (官方 ONNX，requires_
 | 冻结低层 | `backend_type="official_onnx"`，官方 Parkour ONNX 权重对 |
 | 速度契约 | `vx∈[0,1]`、`vy≡0`、`wz∈[-1,1]`（tanh→仿射，对齐低层训练分布） |
 | 地形 | RichTerrain v4：`30 x 30 m` tile、`15 x 15` 网格、6 类子地形 |
-| 动态障碍 | 走廊导航轨迹障碍，课程固定在 iteration `3003` 开启 |
+| 动态障碍 | 走廊导航轨迹障碍，课程固定在 iteration `4504` 开启 |
 
 > v4 与旧 checkpoint 的动作语义/网络维度不同，**必须从零训练**，不能续接 RichTerrain v1–v3、ScoreVis 或 scene-token checkpoint。历史演化见 [LOG.md](./LOG.md)。
 
@@ -132,6 +132,18 @@ wz: -1.0 → 1.0 rad/s
 
 统一入口：`/workspace/instinctlab51-env/bin/python /workspace/instinct_nav/_launcher.py <子命令>`。
 
+### Terrain bank 实验任务
+
+在不改变网络、观测维度和官方低层 ONNX 的前提下，bank 任务启动时预生成 4 组
+RichTerrain，并每 1000 个 PPO iteration 切换一组。环境只在 episode reset 时进入
+新 bank，不会在 episode 中途移动。完整任务 ID：
+
+    Instinct-Nav-G1-SRU-DynamicMapCross-RichTerrain-Centerline-Unobserved-Banks-OfficialParkour-v0
+
+默认时间线为 0-999: bank 0、1000-1999: bank 1、2000-2999: bank 2、
+3000-3999: bank 3，之后循环。TensorBoard 指标
+Metrics/robot_goal/terrain_bank_id 用于确认当前 reset episode 所在 bank。
+
 ### 正式训练（当前 v4 主线）
 
 ```bash
@@ -147,7 +159,7 @@ wz: -1.0 → 1.0 rad/s
   --seed 72
 ```
 
-动态障碍课程固定在第 `3003` 个 PPO iteration 开启（`3003 * 16 steps = 48048 env steps`）。
+动态障碍课程固定在第 `4504` 个 PPO iteration 开启（`4504 * 16 steps = 72064 env steps`）。
 
 ### Smoke test（Dev 任务，跑通即可）
 

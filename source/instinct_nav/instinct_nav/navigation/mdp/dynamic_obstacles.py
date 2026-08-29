@@ -4,7 +4,7 @@ Stage-3 obstacle-avoidance training adds per-env scripted rigid obstacles that:
 
 - are ray-castable by the shared depth camera (tracked mesh transforms),
 - move through path interactions (cross, head-on, follow, merge, stop-and-go),
-- reset along the robot-to-goal corridor with clearance constraints,
+- reset ahead of the robot's facing with clearance constraints,
 - drive an obstacle-proximity reward and an obstacle-collision termination.
 
 The low-level parkour policy stays frozen; obstacles only add scene dynamics.
@@ -90,6 +90,16 @@ class DynamicObstacleManager:
         max_start_dist: float = 3.2,
         goal_clearance_m: float = 1.0,
         obstacle_half_height: float = 0.4,
+        body_half_extent: float = 0.25,
+        spawn_delay_range: tuple[float, float] = (2.0, 8.0),
+        curriculum_env_fraction: float = 0.5,
+        graded_curriculum: bool = False,
+        difficulty_step: float = 0.2,
+        advance_success: float = 0.75,
+        easy_speed_range: tuple[float, float] = (0.1, 0.2),
+        easy_min_start_dist: float = 3.5,
+        easy_max_start_dist: float = 6.0,
+        fraction_range: tuple[float, float] = (0.25, 0.9),
     ):
         self.env = env
         self.num_envs = int(env.num_envs)
@@ -107,6 +117,29 @@ class DynamicObstacleManager:
         self.max_start_dist = float(max_start_dist)
         self.goal_clearance_m = float(goal_clearance_m)
         self.obstacle_half_height = float(obstacle_half_height)
+        self.body_half_extent = float(body_half_extent)
+        self.spawn_delay_range = (float(spawn_delay_range[0]), float(spawn_delay_range[1]))
+        self.curriculum_env_fraction = min(max(float(curriculum_env_fraction), 0.0), 1.0)
+        # --- Graded (capability-driven) curriculum knobs. When disabled (default) the
+        # manager behaves exactly like the legacy binary iteration switch. ---
+        self.graded_curriculum = bool(graded_curriculum)
+        self.difficulty_step = float(difficulty_step)
+        self.advance_success = float(advance_success)
+        self.easy_speed_range = (float(easy_speed_range[0]), float(easy_speed_range[1]))
+        self.easy_min_start_dist = float(easy_min_start_dist)
+        self.easy_max_start_dist = float(easy_max_start_dist)
+        self.fraction_range = (float(fraction_range[0]), float(fraction_range[1]))
+        # Difficulty in [0, 1]; 0 == easiest tier (slow, far, single obstacle, gentle
+        # behaviors), 1 == full configured difficulty. Only moves when graded.
+        self.difficulty = 0.0
+        self._last_advance_check = -1
+        # Fixed per-env random draw. The curriculum-env mask is derived from it against
+        # the current fraction, so annealing the fraction upward monotonically ADDS envs
+        # (a fixed draw < a growing threshold) instead of reshuffling the subset.
+        self._env_rand = torch.rand(self.num_envs, device=self.device)
+        # Fixed random subset of envs that join the dynamic-obstacle curriculum (sampled once
+        # at startup, not per episode), so the rest keep training plain static navigation.
+        self.curriculum_envs = self._env_rand < self._current_fraction()
         self.terrain_lookup = _build_terrain_lookup(env)
 
         # In-run curriculum state: obstacles stay parked until the fixed PPO
@@ -114,7 +147,7 @@ class DynamicObstacleManager:
         self.enabled = False
         self.park_offset_m = 40.0
         self.auto_switch_success = 0.9
-        self.max_switch_iteration = 3003
+        self.max_switch_iteration = 4504
         self.env_steps_per_iteration = 16
         self.switch_check_interval = 100
         self._last_switch_check = -1
@@ -129,42 +162,112 @@ class DynamicObstacleManager:
         self.ends = torch.zeros(self.num_envs, self.num_obstacles, 2, device=self.device)
         self.behaviors = torch.zeros(self.num_envs, self.num_obstacles, device=self.device, dtype=torch.long)
         self.paused = torch.zeros(self.num_envs, self.num_obstacles, device=self.device, dtype=torch.bool)
+        # Sudden-spawn state: per-env flag + delay before obstacles pop in mid-travel.
+        self.spawned = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
+        self.spawn_timers = torch.zeros(self.num_envs, device=self.device)
+
+    # ------------------------------------------------------------------
+    # graded-curriculum difficulty schedule
+    # ------------------------------------------------------------------
+
+    def _current_fraction(self) -> float:
+        """Fraction of envs that carry obstacles at the current difficulty."""
+        if not self.graded_curriculum:
+            return self.curriculum_env_fraction
+        lo, hi = self.fraction_range
+        return lo + (hi - lo) * self.difficulty
+
+    def _refresh_curriculum_envs(self) -> None:
+        """Recompute the obstacle-env mask from the fixed per-env draw and current fraction."""
+        self.curriculum_envs = self._env_rand < self._current_fraction()
+
+    def _effective_speed_range(self) -> tuple[float, float]:
+        if not self.graded_curriculum:
+            return self.speed_range
+        d = self.difficulty
+        lo = self.easy_speed_range[0] + (self.speed_range[0] - self.easy_speed_range[0]) * d
+        hi = self.easy_speed_range[1] + (self.speed_range[1] - self.easy_speed_range[1]) * d
+        return (lo, hi)
+
+    def _effective_start_band(self) -> tuple[float, float]:
+        if not self.graded_curriculum:
+            return self.min_start_dist, self.max_start_dist
+        d = self.difficulty
+        mn = self.easy_min_start_dist + (self.min_start_dist - self.easy_min_start_dist) * d
+        mx = self.easy_max_start_dist + (self.max_start_dist - self.easy_max_start_dist) * d
+        return mn, mx
+
+    def _effective_active_k(self) -> int:
+        """Number of obstacles that actually spawn per env (rest stay parked)."""
+        if not self.graded_curriculum:
+            return self.num_obstacles
+        k = math.ceil(1 + self.difficulty * (self.num_obstacles - 1))
+        return max(1, min(self.num_obstacles, int(k)))
+
+    def _behavior_weights(self) -> torch.Tensor:
+        """Sampling weights for [cross, head-on, same-dir, merge, stop-and-go].
+
+        Easy tiers use only gentle interactions (cross / same-direction); head-on and
+        stop-and-go ramp in with difficulty so the hardest, least-avoidable encounters
+        appear only once the policy can already handle the mild ones.
+        """
+        if not self.graded_curriculum:
+            return torch.tensor([0.30, 0.25, 0.15, 0.20, 0.10], device=self.device)
+        d = self.difficulty
+        return torch.tensor(
+            [0.30, 0.25 * d, 0.15 + 0.15 * (1.0 - d), 0.20, 0.10 * d], device=self.device
+        )
 
     # ------------------------------------------------------------------
     # helpers
     # ------------------------------------------------------------------
 
     def _sample_trajectories(self, env_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Sample interaction trajectories around the robot-to-goal corridor.
+        """Sample interaction trajectories ahead of the robot's facing.
+
+        Obstacles are placed in front of the robot (along its current heading, so
+        they land inside the forward depth FOV), never beside or behind it.
 
         Behaviors: 0 cross, 1 head-on, 2 same-direction, 3 diagonal merge,
         4 stop-and-go. Rejection sampling enforces robot/goal clearance and
-        obstacle separation; unresolved candidates fall back to spaced corridor
-        crossings instead of accepting overlaps.
+        obstacle separation; unresolved candidates fall back to spaced crossings.
         """
         n = env_ids.numel()
-        robot_xy = self.env.scene["robot"].data.root_pos_w[env_ids, :2]
+        robot = self.env.scene["robot"]
+        robot_xy = robot.data.root_pos_w[env_ids, :2]
         goal_cmd = getattr(getattr(self.env, "command_manager", None), "_terms", {}).get("robot_goal", None)
         if goal_cmd is not None and hasattr(goal_cmd, "goal_position_world"):
             goal_xy = goal_cmd.goal_position_world[env_ids, :2]
         else:
             goal_xy = robot_xy + torch.tensor([4.0, 0.0], device=self.device)
-        corridor = goal_xy - robot_xy
-        corridor_len = torch.norm(corridor, dim=-1, keepdim=True).clamp_min(2.0)
-        forward = corridor / corridor_len
+
+        # Forward = robot heading (base +x axis), NOT the goal direction, so
+        # obstacles only ever appear ahead of where the robot is facing.
+        quat = robot.data.root_quat_w[env_ids]  # [n, 4] wxyz
+        qw, qx, qy, qz = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
+        fx = 1.0 - 2.0 * (qy * qy + qz * qz)
+        fy = 2.0 * (qx * qy + qw * qz)
+        forward = torch.stack([fx, fy], dim=-1)
+        forward = forward / torch.norm(forward, dim=-1, keepdim=True).clamp_min(1.0e-6)
         lateral = torch.stack([-forward[:, 1], forward[:, 0]], dim=-1)
 
+        # Graded curriculum shrinks the start band (closer/harder as difficulty rises)
+        # and ramps the hardest behaviors in; both fall back to fixed legacy values.
+        min_start, max_start = self._effective_start_band()
         starts = torch.zeros(n, self.num_obstacles, 2, device=self.device)
         ends = torch.zeros_like(starts)
         behaviors = torch.multinomial(
-            torch.tensor([0.30, 0.25, 0.15, 0.20, 0.10], device=self.device),
+            self._behavior_weights(),
             n * self.num_obstacles, replacement=True,
         ).view(n, self.num_obstacles)
         for k in range(self.num_obstacles):
             accepted = torch.zeros(n, device=self.device, dtype=torch.bool)
             for attempt in range(12):
-                t = torch.rand(n, 1, device=self.device) * 0.50 + 0.25
-                anchor = robot_xy + corridor * t
+                # Anchor strictly ahead of the robot, in the [min_start, max_start] band.
+                d_anchor = min_start + torch.rand(n, 1, device=self.device) * (
+                    max_start - min_start
+                )
+                anchor = robot_xy + forward * d_anchor
                 side = torch.where(torch.rand(n, 1, device=self.device) < 0.5, -1.0, 1.0)
                 span = torch.rand(n, 1, device=self.device) * 1.0 + 1.2
                 mode = behaviors[:, k]
@@ -182,7 +285,7 @@ class DynamicObstacleManager:
                 candidate_end = torch.where((mode == 2).unsqueeze(-1), same_end, candidate_end)
                 candidate_start = torch.where((mode == 3).unsqueeze(-1), merge_start, candidate_start)
                 candidate_end = torch.where((mode == 3).unsqueeze(-1), merge_end, candidate_end)
-                clear = (torch.norm(candidate_start - robot_xy, dim=-1) >= self.min_start_dist)
+                clear = (torch.norm(candidate_start - robot_xy, dim=-1) >= min_start)
                 clear &= (torch.norm(candidate_start - goal_xy, dim=-1) >= self.goal_clearance_m)
                 clear &= (torch.norm(candidate_end - goal_xy, dim=-1) >= self.goal_clearance_m)
                 if k > 0:
@@ -226,58 +329,63 @@ class DynamicObstacleManager:
             env_ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
         n = env_ids.numel()
 
-        if not self.enabled:
-            # Static phase: park obstacles far from the robot so depth/visibility
-            # never sees them and proximity/collision terms stay ~zero.
-            center = (
-                self.env.scene.env_origins[env_ids][:, :2].unsqueeze(1)
-                + torch.tensor([[-self.park_offset_m, 0.0]], device=self.device)
-            ).expand(n, self.num_obstacles, 2)
-            speeds = torch.zeros(n, self.num_obstacles, device=self.device)
-            dirs = torch.zeros(n, self.num_obstacles, 2, device=self.device)
-        else:
-            starts, ends, behaviors = self._sample_trajectories(env_ids)
-            center = (starts + ends) * 0.5
-            speeds = (
-                torch.rand(n, self.num_obstacles, device=self.device) * (self.speed_range[1] - self.speed_range[0])
-                + self.speed_range[0]
+        # Obstacles always start hidden, parked far from the robot so depth/visibility
+        # never sees them and proximity/collision terms stay ~zero. In the dynamic phase
+        # they pop in ahead of the robot mid-travel once their spawn delay elapses, rather
+        # than existing at episode reset.
+        center = (
+            self.env.scene.env_origins[env_ids][:, :2].unsqueeze(1)
+            + torch.tensor([[-self.park_offset_m, 0.0]], device=self.device)
+        ).expand(n, self.num_obstacles, 2)
+
+        if self.enabled:
+            self.spawned[env_ids] = False
+            self.spawn_timers[env_ids] = (
+                torch.rand(n, device=self.device) * (self.spawn_delay_range[1] - self.spawn_delay_range[0])
+                + self.spawn_delay_range[0]
             )
-            dirs = torch.nn.functional.normalize(ends - starts, dim=-1)
-            self.starts[env_ids] = starts
-            self.ends[env_ids] = ends
-            self.behaviors[env_ids] = behaviors
-            self.paused[env_ids] = False
 
         positions = torch.zeros(n, self.num_obstacles, 3, device=self.device)
-        positions[:, :, :2] = self.starts[env_ids] if self.enabled else center
-        if self.enabled:
-            flat_pos = positions.reshape(-1, 3)
-            flat_ids = env_ids.repeat_interleave(self.num_obstacles)
-            z = _terrain_z_at(self.env, self.terrain_lookup, flat_pos, flat_ids).reshape(n, self.num_obstacles)
-            positions[:, :, 2] = z + self.obstacle_half_height
-        else:
-            # Parked far outside the terrain tile; gravity is disabled so the
-            # obstacles float in place and can never interact with the robot.
-            positions[:, :, 2] = 0.5
+        positions[:, :, :2] = center
+        # Parked far outside the terrain tile; gravity is disabled so the obstacles
+        # float inert in place and can never interact with the robot.
+        positions[:, :, 2] = 0.5
 
         self.centers[env_ids] = center
-        self.speeds[env_ids] = speeds
-        self.dirs[env_ids] = dirs
-        self.timers[env_ids] = torch.rand(n, self.num_obstacles, device=self.device) * 3.0 + 1.0
+        self.speeds[env_ids] = 0.0
+        self.dirs[env_ids] = 0.0
+        self.timers[env_ids] = 0.0
         self.positions_w[env_ids] = positions
         self._set_pose_and_velocity(env_ids, positions)
 
     def update(self, dt: float):
-        """Advance scripted motion for every env and write poses to the simulator."""
+        """Advance scripted motion and pop obstacles in ahead of the robot mid-travel."""
         dt = float(dt)
         self._log_metrics()
         if not self.enabled:
             # Static-phase obstacles stay parked until the fixed iteration threshold.
             self._maybe_switch_curriculum()
             return
+
+        # Graded curriculum: ratchet difficulty up as the policy proves competent.
+        self._maybe_advance_difficulty()
+
+        # --- Sudden spawn: obstacles pop in ahead of the robot once their per-env
+        #     delay elapses (mid-travel), not at episode reset. Only curriculum envs
+        #     ever spawn; the rest stay parked (plain static navigation). ---
+        unspawned = (~self.spawned) & self.curriculum_envs
+        if bool(unspawned.any().item()):
+            self.spawn_timers = torch.where(unspawned, self.spawn_timers - dt, self.spawn_timers)
+            due = unspawned & (self.spawn_timers <= 0.0)
+            if bool(due.any().item()):
+                self._spawn_envs(torch.nonzero(due, as_tuple=False).reshape(-1))
+
+        # --- Only spawned obstacles move; the rest stay parked. ---
+        spawned_mask = self.spawned.unsqueeze(1).expand(self.num_envs, self.num_obstacles)
+
         # Stop-and-go trajectories pause for 0.5--1.5 s, then resume.
-        stop_go = self.behaviors == 4
-        self.timers -= dt
+        stop_go = (self.behaviors == 4) & spawned_mask
+        self.timers = torch.where(spawned_mask, self.timers - dt, self.timers)
         expire = stop_go & (self.timers <= 0.0)
         if bool(expire.any().item()):
             self.paused = torch.where(expire, ~self.paused, self.paused)
@@ -285,33 +393,85 @@ class DynamicObstacleManager:
             pause_time = torch.rand_like(self.timers) + 0.5
             self.timers = torch.where(expire, torch.where(self.paused, pause_time, moving_time), self.timers)
 
-        # Integrate motion.
-        active_speed = self.speeds * (~self.paused).to(self.speeds.dtype)
+        # Integrate motion (unspawned obstacles have zero speed, so they stay parked).
+        active_speed = self.speeds * (~self.paused).to(self.speeds.dtype) * spawned_mask.to(self.speeds.dtype)
         self.positions_w[:, :, :2] += self.dirs * active_speed.unsqueeze(-1) * dt
         target = torch.where(
             (torch.sum(self.dirs * (self.ends - self.starts), dim=-1) >= 0.0).unsqueeze(-1),
             self.ends, self.starts,
         )
-        reached = torch.sum((target - self.positions_w[:, :, :2]) * self.dirs, dim=-1) <= 0.0
+        reached = (
+            torch.sum((target - self.positions_w[:, :, :2]) * self.dirs, dim=-1) <= 0.0
+        ) & spawned_mask
         self.positions_w[:, :, :2] = torch.where(reached.unsqueeze(-1), target, self.positions_w[:, :, :2])
         self.dirs = torch.where(reached.unsqueeze(-1), -self.dirs, self.dirs)
 
-        # Refresh z so obstacles track terrain height as they move.
+        # Refresh z so spawned obstacles track terrain height; parked ones keep their z.
         all_ids = torch.arange(self.num_envs, device=self.device, dtype=torch.long)
         flat_pos = self.positions_w.reshape(-1, 3)
         flat_ids = all_ids.repeat_interleave(self.num_obstacles)
         z = _terrain_z_at(self.env, self.terrain_lookup, flat_pos, flat_ids).reshape(
             self.num_envs, self.num_obstacles
         )
-        self.positions_w[:, :, 2] = z + self.obstacle_half_height
+        new_z = z + self.obstacle_half_height
+        self.positions_w[:, :, 2] = torch.where(spawned_mask, new_z, self.positions_w[:, :, 2])
 
         self._set_pose_and_velocity(all_ids, self.positions_w)
+
+    def _spawn_envs(self, env_ids: torch.Tensor):
+        """Pop obstacles in ahead of the robot for the given envs (sudden appearance).
+
+        Samples trajectories against the robot's *current* pose/heading, so obstacles
+        materialize in front of where the robot is now, mid-travel.
+        """
+        n = env_ids.numel()
+        starts, ends, behaviors = self._sample_trajectories(env_ids)
+        speed_lo, speed_hi = self._effective_speed_range()
+        speeds = (
+            torch.rand(n, self.num_obstacles, device=self.device) * (speed_hi - speed_lo)
+            + speed_lo
+        )
+        dirs = torch.nn.functional.normalize(ends - starts, dim=-1)
+
+        # Graded curriculum only activates the first ``active_k`` obstacles; the rest are
+        # parked far away (zero speed, no trajectory) so easy tiers face fewer obstacles.
+        active_k = self._effective_active_k()
+        if active_k < self.num_obstacles:
+            park_xy = (
+                self.env.scene.env_origins[env_ids][:, :2].unsqueeze(1)
+                + torch.tensor([[-self.park_offset_m, 0.0]], device=self.device)
+            )  # [n, 1, 2]
+            starts[:, active_k:] = park_xy
+            ends[:, active_k:] = park_xy
+            speeds[:, active_k:] = 0.0
+            dirs[:, active_k:] = 0.0
+
+        self.starts[env_ids] = starts
+        self.ends[env_ids] = ends
+        self.behaviors[env_ids] = behaviors
+        self.speeds[env_ids] = speeds
+        self.dirs[env_ids] = dirs
+        self.paused[env_ids] = False
+        self.timers[env_ids] = torch.rand(n, self.num_obstacles, device=self.device) * 3.0 + 1.0
+
+        positions = torch.zeros(n, self.num_obstacles, 3, device=self.device)
+        positions[:, :, :2] = starts
+        flat_pos = positions.reshape(-1, 3)
+        flat_ids = env_ids.repeat_interleave(self.num_obstacles)
+        z = _terrain_z_at(self.env, self.terrain_lookup, flat_pos, flat_ids).reshape(n, self.num_obstacles)
+        positions[:, :, 2] = z + self.obstacle_half_height
+
+        self.positions_w[env_ids] = positions
+        self.spawned[env_ids] = True
+        self._set_pose_and_velocity(env_ids, positions)
 
     def enable(self, env_ids: Sequence[int] | torch.Tensor | slice | None = None):
         """Switch the curriculum on: place obstacles into the action ring and start motion."""
         if self.enabled:
             return
         self.enabled = True
+        if self.graded_curriculum:
+            self._refresh_curriculum_envs()
         self.reset(env_ids)
         print(f"[DynamicObstacleManager] Dynamic obstacles ENABLED (step {self.env.common_step_counter}).")
         self._log_metrics()
@@ -323,14 +483,17 @@ class DynamicObstacleManager:
             return
         log = extras.setdefault("log", {})
         log["Metrics/dynamic_obstacles/enabled"] = float(self.enabled)
-        if self.enabled:
+        log["Metrics/dynamic_obstacles/difficulty"] = float(self.difficulty)
+        log["Metrics/dynamic_obstacles/curriculum_env_frac"] = float(
+            self.curriculum_envs.float().mean().item()
+        )
+        spawned = self.spawned
+        if bool(spawned.any().item()):
             log["Metrics/dynamic_obstacles/min_dist_mean"] = float(
-                self.min_dist_to_robot().mean().item()
+                self.min_dist_to_robot()[spawned].mean().item()
             )
         else:
-            log["Metrics/dynamic_obstacles/min_dist_mean"] = float(
-                self.park_offset_m
-            )
+            log["Metrics/dynamic_obstacles/min_dist_mean"] = float(self.park_offset_m)
 
     def _mean_success_rate(self) -> float:
         """Windowed mean success rate from the robot-goal command tracker."""
@@ -345,13 +508,29 @@ class DynamicObstacleManager:
     def _maybe_switch_curriculum(self):
         """One-way switch from the static phase to the dynamic phase.
 
-        Triggered only at the configured fixed PPO iteration threshold.
+        Legacy (non-graded) path: triggered only at the configured fixed PPO
+        iteration threshold. Graded path: enabled as soon as the policy clears
+        ``auto_switch_success`` (navigation is ready), with the iteration threshold
+        kept as a hard fallback so obstacles always turn on eventually.
         """
         step = int(self.env.common_step_counter)
         if step < 2:
             return
         steps_per_iter = max(1, int(self.env_steps_per_iteration))
         cap_env_steps = int(self.max_switch_iteration) * steps_per_iter
+
+        if self.graded_curriculum:
+            interval = max(1, int(self.switch_check_interval))
+            if step - self._last_switch_check >= interval:
+                self._last_switch_check = step
+                if self._mean_success_rate() >= self.auto_switch_success:
+                    print(
+                        f"[DynamicObstacleManager] Capability-triggered curriculum enable at "
+                        f"env step {step} (success >= {self.auto_switch_success:.2f})."
+                    )
+                    self.enable()
+                    return
+
         if step >= cap_env_steps:
             approx_iteration = step // steps_per_iter
             print(
@@ -359,6 +538,28 @@ class DynamicObstacleManager:
                 f"(~iteration {approx_iteration}) (fixed iteration {self.max_switch_iteration})."
             )
             self.enable()
+
+    def _maybe_advance_difficulty(self):
+        """Ratchet graded difficulty up when the policy clears ``advance_success``.
+
+        Checked at most once per ``switch_check_interval`` env steps. Monotonic:
+        difficulty only rises, and each bump widens the obstacle-env fraction, speed,
+        proximity, obstacle count, and behavior mix via the derived getters.
+        """
+        if not self.graded_curriculum or self.difficulty >= 1.0:
+            return
+        step = int(self.env.common_step_counter)
+        interval = max(1, int(self.switch_check_interval))
+        if step - self._last_advance_check < interval:
+            return
+        self._last_advance_check = step
+        if self._mean_success_rate() >= self.advance_success:
+            self.difficulty = min(1.0, self.difficulty + self.difficulty_step)
+            self._refresh_curriculum_envs()
+            print(
+                f"[DynamicObstacleManager] Difficulty advanced to {self.difficulty:.2f} "
+                f"at env step {step} (success >= {self.advance_success:.2f})."
+            )
 
     def min_dist_to_robot(self) -> torch.Tensor:
         """Minimum XY distance from the robot root to any obstacle: [num_envs]."""
@@ -379,7 +580,12 @@ class DynamicObstacleManager:
         dist = torch.norm(to_obs, dim=-1).clamp_min(1.0e-3)  # [num_envs, K]
         unit = to_obs / dist.unsqueeze(-1)
 
-        obs_vel = self.dirs * self.speeds.unsqueeze(-1)  # [num_envs, K, 2] world XY
+        # Use the *effective* speed actually written to the sim: a paused stop-and-go
+        # obstacle has zero velocity, so it must not report its scripted speed here
+        # (otherwise the robot is penalized for a phantom "approach" by a stationary
+        # obstacle). Mirrors the (~paused) masking in _set_pose_and_velocity/update.
+        active_speed = self.speeds * (~self.paused).to(self.speeds.dtype)
+        obs_vel = self.dirs * active_speed.unsqueeze(-1)  # [num_envs, K, 2] world XY
         robot_vel = robot.data.root_lin_vel_w[:, :2].unsqueeze(1)  # [num_envs, 1, 2]
         # closing speed = -d(dist)/dt = dot(robot_vel - obs_vel, unit); positive
         # when the obstacle is approaching (distance shrinking).
@@ -397,10 +603,20 @@ def _get_or_create_dynamic_obstacle_manager(
     max_start_dist: float = 3.2,
     goal_clearance_m: float = 1.0,
     obstacle_half_height: float = 0.4,
+    body_half_extent: float = 0.25,
+    spawn_delay_range: tuple[float, float] = (2.0, 8.0),
+    curriculum_env_fraction: float = 0.5,
     auto_switch_success: float = 0.9,
-    max_switch_iteration: int = 3003,
+    max_switch_iteration: int = 4504,
     env_steps_per_iteration: int = 16,
     switch_check_interval: int = 100,
+    graded_curriculum: bool = False,
+    difficulty_step: float = 0.2,
+    advance_success: float = 0.75,
+    easy_speed_range: tuple[float, float] = (0.1, 0.2),
+    easy_min_start_dist: float = 3.5,
+    easy_max_start_dist: float = 6.0,
+    fraction_range: tuple[float, float] = (0.25, 0.9),
 ) -> DynamicObstacleManager:
     manager = getattr(env, "_dynamic_obstacle_manager", None)
     if manager is None:
@@ -414,6 +630,16 @@ def _get_or_create_dynamic_obstacle_manager(
             max_start_dist=max_start_dist,
             goal_clearance_m=goal_clearance_m,
             obstacle_half_height=obstacle_half_height,
+            body_half_extent=body_half_extent,
+            spawn_delay_range=spawn_delay_range,
+            curriculum_env_fraction=curriculum_env_fraction,
+            graded_curriculum=graded_curriculum,
+            difficulty_step=difficulty_step,
+            advance_success=advance_success,
+            easy_speed_range=easy_speed_range,
+            easy_min_start_dist=easy_min_start_dist,
+            easy_max_start_dist=easy_max_start_dist,
+            fraction_range=fraction_range,
         )
         manager.auto_switch_success = float(auto_switch_success)
         manager.max_switch_iteration = int(max_switch_iteration)
@@ -439,10 +665,20 @@ def reset_dynamic_obstacles(
     max_start_dist: float = 3.2,
     goal_clearance_m: float = 1.0,
     obstacle_half_height: float = 0.4,
+    body_half_extent: float = 0.25,
+    spawn_delay_range: tuple[float, float] = (2.0, 8.0),
+    curriculum_env_fraction: float = 0.5,
     auto_switch_success: float = 0.9,
-    max_switch_iteration: int = 3003,
+    max_switch_iteration: int = 4504,
     env_steps_per_iteration: int = 16,
     switch_check_interval: int = 100,
+    graded_curriculum: bool = False,
+    difficulty_step: float = 0.2,
+    advance_success: float = 0.75,
+    easy_speed_range: tuple[float, float] = (0.1, 0.2),
+    easy_min_start_dist: float = 3.5,
+    easy_max_start_dist: float = 6.0,
+    fraction_range: tuple[float, float] = (0.25, 0.9),
 ):
     """Reset event: place obstacles away from spawn/goal and randomize motion."""
     if not obstacle_names:
@@ -457,10 +693,20 @@ def reset_dynamic_obstacles(
         max_start_dist=max_start_dist,
         goal_clearance_m=goal_clearance_m,
         obstacle_half_height=obstacle_half_height,
+        body_half_extent=body_half_extent,
+        spawn_delay_range=spawn_delay_range,
+        curriculum_env_fraction=curriculum_env_fraction,
         auto_switch_success=auto_switch_success,
         max_switch_iteration=max_switch_iteration,
         env_steps_per_iteration=env_steps_per_iteration,
         switch_check_interval=switch_check_interval,
+        graded_curriculum=graded_curriculum,
+        difficulty_step=difficulty_step,
+        advance_success=advance_success,
+        easy_speed_range=easy_speed_range,
+        easy_min_start_dist=easy_min_start_dist,
+        easy_max_start_dist=easy_max_start_dist,
+        fraction_range=fraction_range,
     )
     manager.reset(env_ids)
 
@@ -476,10 +722,20 @@ def update_dynamic_obstacles(
     max_start_dist: float = 3.2,
     goal_clearance_m: float = 1.0,
     obstacle_half_height: float = 0.4,
+    body_half_extent: float = 0.25,
+    spawn_delay_range: tuple[float, float] = (2.0, 8.0),
+    curriculum_env_fraction: float = 0.5,
     auto_switch_success: float = 0.9,
-    max_switch_iteration: int = 3003,
+    max_switch_iteration: int = 4504,
     env_steps_per_iteration: int = 16,
     switch_check_interval: int = 100,
+    graded_curriculum: bool = False,
+    difficulty_step: float = 0.2,
+    advance_success: float = 0.75,
+    easy_speed_range: tuple[float, float] = (0.1, 0.2),
+    easy_min_start_dist: float = 3.5,
+    easy_max_start_dist: float = 6.0,
+    fraction_range: tuple[float, float] = (0.25, 0.9),
 ):
     """Interval event: advance scripted obstacle motion every environment step."""
     if not obstacle_names:
@@ -494,10 +750,20 @@ def update_dynamic_obstacles(
         max_start_dist=max_start_dist,
         goal_clearance_m=goal_clearance_m,
         obstacle_half_height=obstacle_half_height,
+        body_half_extent=body_half_extent,
+        spawn_delay_range=spawn_delay_range,
+        curriculum_env_fraction=curriculum_env_fraction,
         auto_switch_success=auto_switch_success,
         max_switch_iteration=max_switch_iteration,
         env_steps_per_iteration=env_steps_per_iteration,
         switch_check_interval=switch_check_interval,
+        graded_curriculum=graded_curriculum,
+        difficulty_step=difficulty_step,
+        advance_success=advance_success,
+        easy_speed_range=easy_speed_range,
+        easy_min_start_dist=easy_min_start_dist,
+        easy_max_start_dist=easy_max_start_dist,
+        fraction_range=fraction_range,
     )
     manager.update(env.step_dt)
 
@@ -515,9 +781,10 @@ def obstacle_proximity(
 ) -> torch.Tensor:
     """Return an exponential proximity penalty that grows as the robot nears an obstacle.
 
-    ``exp(-(d - penalty_radius) / falloff)`` peaks at 1.0 when the robot is at the
-    penalty radius and decays smoothly beyond it, giving a strong, smooth gradient
-    for close-range avoidance.
+    ``exp(-(d - penalty_radius) / falloff)`` reaches 1.0 at the penalty radius and
+    decays smoothly beyond it. Inside the radius it is clamped to 2.0 so a single
+    close-pass frame cannot produce an outsized spike relative to the other reward
+    terms (matching the 2.0 cap used by ``obstacle_approach_penalty``).
     """
     if not obstacle_names:
         return torch.zeros(env.num_envs, device=env.device)
@@ -526,7 +793,8 @@ def obstacle_proximity(
         return torch.zeros(env.num_envs, device=env.device)
     dist = manager.min_dist_to_robot()
     falloff = max(float(falloff), 1.0e-3)
-    return torch.exp(-(dist - penalty_radius) / falloff)
+    proximity = torch.exp(-(dist - penalty_radius) / falloff).clamp(max=2.0)
+    return proximity * manager.spawned.float()
 
 
 def obstacle_approach_penalty(
@@ -546,18 +814,57 @@ def obstacle_approach_penalty(
         return torch.zeros(env.num_envs, device=env.device)
     closing = manager.closing_speed_to_robot()
     speed_scale = max(float(speed_scale), 1.0e-3)
-    return (closing / speed_scale).clamp(max=2.0)
+    return (closing / speed_scale).clamp(max=2.0) * manager.spawned.float()
 
 
 def obstacle_collision(
     env: "ManagerBasedRLEnv",
     obstacle_names: list[str] | None = None,
-    collision_radius: float = 0.5,
+    collision_radius: float = 0.3,
+    body_half_extent: float | None = None,
 ) -> torch.Tensor:
-    """Terminate when the robot root comes within the collision radius of an obstacle."""
+    """Terminate when the robot root nears an obstacle *surface*.
+
+    The distance is measured from the obstacle surface (robot-to-obstacle-center
+    minus the obstacle's XY half-extent), so ``collision_radius`` is the robot body
+    radius at which physical contact is declared — matching the visual size of the
+    obstacle cube rather than a generous center-to-center margin.
+    """
     if not obstacle_names:
         return torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)
     manager = _get_or_create_dynamic_obstacle_manager(env, obstacle_names=obstacle_names)
     if not manager.enabled:
         return torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)
-    return manager.min_dist_to_robot() < collision_radius
+    half_extent = manager.body_half_extent if body_half_extent is None else float(body_half_extent)
+    surface_dist = manager.min_dist_to_robot() - half_extent
+    return (surface_dist < collision_radius) & manager.spawned
+
+
+def obstacle_time_to_collision(
+    env: "ManagerBasedRLEnv",
+    obstacle_names: list[str] | None = None,
+    ttc_horizon: float = 2.0,
+    body_half_extent: float | None = None,
+) -> torch.Tensor:
+    """Return a look-ahead penalty that grows as time-to-collision drops below ``ttc_horizon``.
+
+    ``ttc = surface_distance / closing_speed`` estimates seconds until contact using the
+    obstacle's approach speed. The penalty ``((horizon - ttc) / horizon)`` is 0 when the
+    robot is not closing (or the obstacle is farther than ``horizon`` seconds away) and
+    ramps to 1 as contact becomes imminent — rewarding the policy for slowing/turning
+    *before* it enters the proximity radius, unlike the distance-only proximity term.
+    """
+    if not obstacle_names:
+        return torch.zeros(env.num_envs, device=env.device)
+    manager = _get_or_create_dynamic_obstacle_manager(env, obstacle_names=obstacle_names)
+    if not manager.enabled:
+        return torch.zeros(env.num_envs, device=env.device)
+    half_extent = manager.body_half_extent if body_half_extent is None else float(body_half_extent)
+    surface = (manager.min_dist_to_robot() - half_extent).clamp_min(0.0)
+    closing = manager.closing_speed_to_robot()  # >= 0, already clamped
+    horizon = max(float(ttc_horizon), 1.0e-3)
+    ttc = surface / closing.clamp_min(1.0e-3)
+    penalty = ((horizon - ttc) / horizon).clamp(0.0, 1.0)
+    # Only count when actually approaching; a zero closing speed yields a huge ttc -> 0.
+    penalty = torch.where(closing > 1.0e-3, penalty, torch.zeros_like(penalty))
+    return penalty * manager.spawned.float()

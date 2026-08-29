@@ -373,11 +373,21 @@ class StairGenerator:
         self.cell_pixels = cell_pixels
         self.difficulty = difficulty
 
-    def _make_stair_templates(self, num_steps: int, step_height_m: float):
+    def _make_stair_templates(self, num_steps: int, step_height_m: float, step_depth_m: float | None):
         """Create direction templates for one randomized staircase."""
         cell_px = self.cell_pixels
-        # array_split preserves the requested count when cell_px is not divisible by it.
-        step_slices = np.array_split(np.arange(cell_px), num_steps)
+
+        if step_depth_m is None:
+            # Legacy behavior: divide the complete cell between all steps.
+            step_slices = np.array_split(np.arange(cell_px), num_steps)
+        else:
+            horizontal_scale = self.cfg.cell_size / cell_px
+            stair_px = int(round(step_depth_m * num_steps / horizontal_scale))
+            stair_px = min(cell_px, max(num_steps, stair_px))
+            # Keep the highest step against the platform-facing edge. Any unused
+            # length remains level ground before the first riser.
+            start_px = cell_px - stair_px
+            step_slices = np.array_split(np.arange(start_px, cell_px), num_steps)
 
         east = np.zeros((cell_px, cell_px), dtype=np.float32)
         for i, indices in enumerate(step_slices):
@@ -408,12 +418,27 @@ class StairGenerator:
         num_steps = min_steps if min_steps == max_steps else int(rng.integers(min_steps, max_steps + 1))
         min_height, max_height = self.cfg.stair_step_height_range
         difficulty_height = min_height + self.difficulty * (max_height - min_height)
+        if self.cfg.stair_max_total_height is not None:
+            difficulty_height = min(difficulty_height, self.cfg.stair_max_total_height / num_steps)
+        difficulty_height = max(min_height, difficulty_height)
         step_height_m = (
             min_height
             if min_height == difficulty_height
             else float(rng.uniform(min_height, difficulty_height))
         )
-        templates = self._make_stair_templates(num_steps, step_height_m)
+
+        step_depth_m = None
+        if self.cfg.stair_step_depth_range is not None:
+            min_depth, max_depth = self.cfg.stair_step_depth_range
+            max_depth = min(max_depth, self.cfg.cell_size / num_steps)
+            if max_depth < min_depth:
+                raise ValueError(
+                    f"Stair depth range {self.cfg.stair_step_depth_range} cannot fit "
+                    f"{num_steps} steps in a {self.cfg.cell_size} m cell."
+                )
+            step_depth_m = min_depth if min_depth == max_depth else float(rng.uniform(min_depth, max_depth))
+
+        templates = self._make_stair_templates(num_steps, step_height_m, step_depth_m)
         platform_height = num_steps * step_height_m / self.vertical_scale
         size = STAIRS.STAIR_GRID_SIZE * self.cell_pixels
         cell_px = self.cell_pixels

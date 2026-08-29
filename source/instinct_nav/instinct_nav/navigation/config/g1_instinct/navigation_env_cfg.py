@@ -120,10 +120,23 @@ class G1InstinctNavigationEnvCfg(NavigationEnvCfg):
         )
 
         self.scene.raycast_camera.prim_path = "{ENV_REGEX_NS}/Robot/torso_link"
-        self.scene.height_scanner_critic.prim_path = "{ENV_REGEX_NS}/Robot/torso_link"
-        self.scene.height_scanner = RayCasterCfg(
+        # Multi-bank terrain is imported as N per-slab sub-prims under /World/ground
+        # (see terrains/patches.py:_create_terrain_prims_split). A base RayCaster only
+        # binds the FIRST Mesh child it finds, so it would scan a single slab and
+        # return bogus heights for robots on other slabs. MultiMeshRayCaster gathers
+        # every child mesh under /World/ground and merges them, so it covers all slabs
+        # (and is identical to a base RayCaster when the terrain is a single mesh).
+        self.scene.height_scanner_critic = MultiMeshRayCasterCfg(
             prim_path="{ENV_REGEX_NS}/Robot/torso_link",
-            offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 20.0)),
+            offset=MultiMeshRayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 20.0)),
+            ray_alignment="yaw",
+            pattern_cfg=patterns.GridPatternCfg(resolution=0.2, size=[10.0, 10.0]),
+            debug_vis=False,
+            mesh_prim_paths=["/World/ground"],
+        )
+        self.scene.height_scanner = MultiMeshRayCasterCfg(
+            prim_path="{ENV_REGEX_NS}/Robot/torso_link",
+            offset=MultiMeshRayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 20.0)),
             ray_alignment="yaw",
             pattern_cfg=patterns.GridPatternCfg(resolution=0.1, size=[1.6, 1.0]),
             debug_vis=False,
@@ -593,13 +606,41 @@ class G1InstinctNavigationEnvCfg_DYNAMIC_OFFICIAL(
     obstacle_min_start_dist: float = 1.5
     obstacle_max_start_dist: float = 3.2
     obstacle_goal_clearance_m: float = 1.0
+    # Delay (seconds) after episode start before obstacles suddenly pop in ahead of the
+    # robot. Obstacles are hidden (parked out of view) until this timer elapses, so they
+    # appear mid-travel rather than existing at episode reset.
+    obstacle_spawn_delay_range: tuple[float, float] = (2.0, 8.0)
     obstacle_half_height: float = 0.4
-    obstacle_collision_radius: float = 0.6
-    obstacle_penalty_radius: float = 1.2
+    # Physical XY half-extent of the obstacle cube (size 0.5 -> half 0.25). Collision is
+    # measured from the obstacle *surface*, i.e. robot-to-obstacle-center minus this half-extent.
+    obstacle_body_half_extent: float = 0.25
+    # Robot body radius used for the geometric collision termination (distance from obstacle
+    # surface to the robot root at which we declare a collision).
+    obstacle_collision_radius: float = 0.3
+    obstacle_penalty_radius: float = 0.8
     obstacle_auto_switch_success: float = 0.9
-    obstacle_max_switch_iteration: int = 3003
+    obstacle_max_switch_iteration: int = 4504
     obstacle_env_steps_per_iteration: int = 16
     obstacle_switch_check_interval: int = 100
+    # Fraction of environments that join the dynamic-obstacle curriculum once the switch
+    # iteration is reached. A fixed random subset is chosen at startup (not per episode), so
+    # ~half the envs keep training plain static navigation while the rest learn obstacle
+    # avoidance -> prevents catastrophic forgetting and stabilizes the shared policy.
+    obstacle_curriculum_env_fraction: float = 0.5
+    # --- Graded (capability-driven) curriculum. Default off => legacy binary iteration
+    # switch. When on, obstacles enable once nav clears obstacle_auto_switch_success and
+    # difficulty ratchets up (speed/distance/count/behavior/fraction) as the policy clears
+    # obstacle_advance_success. Only the *-Avoid- ablation turns this on. ---
+    obstacle_graded_curriculum: bool = False
+    obstacle_difficulty_step: float = 0.2
+    obstacle_advance_success: float = 0.75
+    obstacle_easy_speed_range: tuple[float, float] = (0.1, 0.2)
+    obstacle_easy_min_start_dist: float = 3.5
+    obstacle_easy_max_start_dist: float = 6.0
+    obstacle_fraction_range: tuple[float, float] = (0.25, 0.9)
+    # Look-ahead time-to-collision penalty horizon (seconds). Reward term weight defaults
+    # to 0 on the base class (inert); the *-Avoid- ablation gives it a negative weight.
+    obstacle_ttc_horizon: float = 2.0
 
     def __post_init__(self):
         super().__post_init__()
@@ -607,7 +648,10 @@ class G1InstinctNavigationEnvCfg_DYNAMIC_OFFICIAL(
         # 4 obstacles per env across many envs increases the GPU narrowphase
         # contact load; enlarge the PhysX rigid patch buffer so contact reports
         # (base_contact / obstacle_collision) stay accurate.
-        self.sim.physx.gpu_max_rigid_patch_count = 2**18
+        # RichTerrain + 4096 envs + tracked dynamic obstacle meshes can exceed the
+        # default contact-patch pool during scene startup. Keep headroom for the
+        # observed ~770k peak instead of allowing PhysX patch-buffer overflow.
+        self.sim.physx.gpu_max_rigid_patch_count = 2**20
 
         obstacle_names = []
         for index in range(self.num_obstacles):
@@ -625,7 +669,11 @@ class G1InstinctNavigationEnvCfg_DYNAMIC_OFFICIAL(
                             disable_gravity=True,
                         ),
                         mass_props=sim_utils.MassPropertiesCfg(mass=8.0),
-                        collision_props=sim_utils.CollisionPropertiesCfg(),
+                        # Keep the USD mesh visible to the ray caster, but disable
+                        # physical contacts so scripted obstacles cannot shove the
+                        # frozen parkour controller. Collision termination remains
+                        # the explicit geometric check in dynamic_obstacles.py.
+                        collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=False),
                         physics_material=sim_utils.RigidBodyMaterialCfg(),
                         visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.9, 0.35, 0.1)),
                     ),
@@ -653,10 +701,20 @@ class G1InstinctNavigationEnvCfg_DYNAMIC_OFFICIAL(
             "max_start_dist": self.obstacle_max_start_dist,
             "goal_clearance_m": self.obstacle_goal_clearance_m,
             "obstacle_half_height": self.obstacle_half_height,
+            "body_half_extent": self.obstacle_body_half_extent,
+            "spawn_delay_range": self.obstacle_spawn_delay_range,
+            "curriculum_env_fraction": self.obstacle_curriculum_env_fraction,
             "auto_switch_success": self.obstacle_auto_switch_success,
             "max_switch_iteration": self.obstacle_max_switch_iteration,
             "env_steps_per_iteration": self.obstacle_env_steps_per_iteration,
             "switch_check_interval": self.obstacle_switch_check_interval,
+            "graded_curriculum": self.obstacle_graded_curriculum,
+            "difficulty_step": self.obstacle_difficulty_step,
+            "advance_success": self.obstacle_advance_success,
+            "easy_speed_range": self.obstacle_easy_speed_range,
+            "easy_min_start_dist": self.obstacle_easy_min_start_dist,
+            "easy_max_start_dist": self.obstacle_easy_max_start_dist,
+            "fraction_range": self.obstacle_fraction_range,
         }
         self.events.dynamic_obstacles_reset = EventTerm(
             func=nav_mdp.reset_dynamic_obstacles,
@@ -672,21 +730,32 @@ class G1InstinctNavigationEnvCfg_DYNAMIC_OFFICIAL(
 
         self.rewards.obstacle_proximity = RewTerm(
             func=nav_mdp.obstacle_proximity,
-            weight=-0.5,
+            weight=-0.2,
             params={
                 "obstacle_names": obstacle_names,
                 "penalty_radius": self.obstacle_penalty_radius,
-                "falloff": 0.3,
+                "falloff": 0.25,
             },
         )
         self.rewards.obstacle_approach_penalty = RewTerm(
             func=nav_mdp.obstacle_approach_penalty,
-            weight=-0.3,
+            weight=-0.1,
             params={"obstacle_names": obstacle_names, "speed_scale": 1.0},
+        )
+        # Look-ahead TTC penalty. Weight 0 => inert on every existing task; the *-Avoid-
+        # ablation raises the magnitude to teach anticipatory slowing/turning.
+        self.rewards.obstacle_time_to_collision = RewTerm(
+            func=nav_mdp.obstacle_time_to_collision,
+            weight=0.0,
+            params={"obstacle_names": obstacle_names, "ttc_horizon": self.obstacle_ttc_horizon},
         )
         self.terminations.obstacle_collision = DoneTerm(
             func=nav_mdp.obstacle_collision,
-            params={"obstacle_names": obstacle_names, "collision_radius": self.obstacle_collision_radius},
+            params={
+                "obstacle_names": obstacle_names,
+                "collision_radius": self.obstacle_collision_radius,
+                "body_half_extent": self.obstacle_body_half_extent,
+            },
         )
 
 
@@ -946,3 +1015,152 @@ class G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERL
     def __post_init__(self):
         super().__post_init__()
         self.rewards.stair_centerline.weight = _STAIR_CENTERLINE_WEIGHT
+
+
+# =============================================================================
+# tanh-base centerline + "velocity into unobserved" penalty. Adds a penalty that
+# discourages driving the base toward not-yet-observed ("black") cells of the
+# vis_score map (occluded / outside FOV / beyond range), on top of the centerline
+# guidance. Only meaningful on ScoreVis-family tasks that maintain the local
+# visibility map (this DynamicMapCross base does). Weight starts modest.
+# =============================================================================
+_UNOBSERVED_PENALTY_WEIGHT = 0.2
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED(
+    G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE
+):
+    """tanh centerline + penalize velocity pointing at unobserved vis_score cells."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.rewards.velocity_into_unobserved.weight = -_UNOBSERVED_PENALTY_WEIGHT
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_DEV(
+    G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_DEV
+):
+    def __post_init__(self):
+        super().__post_init__()
+        self.rewards.velocity_into_unobserved.weight = -_UNOBSERVED_PENALTY_WEIGHT
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_PLAY(
+    G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_PLAY
+):
+    def __post_init__(self):
+        super().__post_init__()
+        self.rewards.velocity_into_unobserved.weight = -_UNOBSERVED_PENALTY_WEIGHT
+
+
+# =============================================================================
+# tanh centerline + unobserved penalty + FAST dynamic-obstacle avoidance. Two
+# changes on top of CENTERLINE_UNOBSERVED, both isolated to this ablation:
+#   (P0) rebalance the avoidance reward so it is no longer ~1/180 of the goal
+#        reward: raise obstacle_proximity/approach magnitudes and add a
+#        look-ahead time-to-collision penalty (anticipatory slow/turn).
+#   (P1) capability-driven graded curriculum: obstacles enable once nav is ready
+#        and difficulty (speed/distance/count/behavior/env-fraction) ratchets up
+#        as the policy clears advance_success, instead of a binary iteration switch.
+# graded_curriculum defaults False on every other task, so this is fully isolated.
+# =============================================================================
+_AVOID_PROXIMITY_WEIGHT = 2.0
+_AVOID_APPROACH_WEIGHT = 1.0
+_AVOID_TTC_WEIGHT = 0.5
+
+
+def _apply_avoid_rewards(cfg) -> None:
+    cfg.rewards.obstacle_proximity.weight = -_AVOID_PROXIMITY_WEIGHT
+    cfg.rewards.obstacle_approach_penalty.weight = -_AVOID_APPROACH_WEIGHT
+    cfg.rewards.obstacle_time_to_collision.weight = -_AVOID_TTC_WEIGHT
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID(
+    G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED
+):
+    """CENTERLINE_UNOBSERVED + rebalanced avoidance reward + graded obstacle curriculum."""
+
+    obstacle_graded_curriculum: bool = True
+
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_avoid_rewards(self)
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_DEV(
+    G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_DEV
+):
+    # The DEV chain already patches max_switch_iteration=0, so obstacles enable
+    # immediately at difficulty 0 (single slow far obstacle) for smoke testing.
+    obstacle_graded_curriculum: bool = True
+
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_avoid_rewards(self)
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_PLAY(
+    G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_PLAY
+):
+    obstacle_graded_curriculum: bool = True
+
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_avoid_rewards(self)
+
+
+# =============================================================================
+# Pre-generated terrain banks. The network and observation shapes are unchanged:
+# four independent RichTerrain column groups are cooked once at startup, then
+# environments move to the scheduled group only when their episode resets.
+# =============================================================================
+_TERRAIN_BANK_COUNT = 4
+_TERRAIN_BANK_SWITCH_INTERVAL = 1000
+
+
+def _apply_terrain_banks(cfg, bank_count: int = _TERRAIN_BANK_COUNT) -> None:
+    terrain_cfg = cfg.scene.terrain.terrain_generator
+    base_cols = int(terrain_cfg.num_cols)
+    terrain_cfg.num_cols = base_cols * bank_count
+    goal_cfg = cfg.commands.robot_goal
+    goal_cfg.terrain_bank_count = bank_count
+    goal_cfg.terrain_bank_base_num_cols = base_cols
+    goal_cfg.terrain_bank_switch_interval = _TERRAIN_BANK_SWITCH_INTERVAL
+    goal_cfg.terrain_bank_env_steps_per_iteration = cfg.obstacle_env_steps_per_iteration
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_BANKS(
+    G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED
+):
+    """Centerline + unobserved penalty with four pre-generated terrain banks."""
+
+    obstacle_max_switch_iteration: int = 4000
+
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_terrain_banks(self)
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_BANKS_DEV(
+    G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_DEV
+):
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_terrain_banks(self)
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_BANKS_PLAY(
+    G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_PLAY
+):
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_terrain_banks(self)

@@ -35,3 +35,15 @@ class RobotNavigationGoalCommandCfg(CommandTermCfg):
     sync_robot_root_to_spawn_origin: bool = False
     """If true, translate the robot root by the same delta when reset resamples env origins."""
 
+    terrain_bank_count: int = 1
+    """Number of pre-generated terrain banks. One disables bank switching."""
+
+    terrain_bank_base_num_cols: int = 0
+    """Number of terrain columns in one bank. Required when terrain banks are enabled."""
+
+    terrain_bank_switch_interval: int = 1000
+    """PPO iterations between terrain-bank switches."""
+
+    terrain_bank_env_steps_per_iteration: int = 16
+    """Environment steps collected by one PPO iteration."""
+

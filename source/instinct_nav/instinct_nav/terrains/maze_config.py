@@ -117,6 +117,8 @@ RICH_MAZE_TERRAIN_CFG = TerrainGeneratorCfg(
             stairs=True,
             stair_num_steps_range=(3, 7),
             stair_step_height_range=(0.10, 0.20),
+            stair_step_depth_range=(0.28, 0.40),
+            stair_max_total_height=1.0,
         ),
         "blocks": HfMazeTerrainCfg(
             proportion=0.16,
@@ -153,6 +155,8 @@ RICH_MAZE_TERRAIN_CFG = TerrainGeneratorCfg(
             terrain_feature="traversal_mix",
             stair_num_steps_range=(3, 7),
             stair_step_height_range=(0.10, 0.20),
+            stair_step_depth_range=(0.28, 0.40),
+            stair_max_total_height=1.0,
             add_ramps=True,
             add_raised_bars=True,
             add_sunken_bars=True,

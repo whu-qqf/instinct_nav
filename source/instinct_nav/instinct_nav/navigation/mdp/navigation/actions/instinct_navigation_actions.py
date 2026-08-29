@@ -100,6 +100,17 @@ class InstinctFrozenNavigationSE2Action(ActionTerm):
             self._processed_navigation_velocity_actions[:] = self._processed_navigation_velocity_actions.clamp(-1.0, 1.0)
         elif self.cfg.policy_distr_type == "beta":
             self._processed_navigation_velocity_actions[:] = (self._processed_navigation_velocity_actions - 0.5) * 2.0
+        elif self.cfg.policy_distr_type == "relu_tanh":
+            # Half-rectified tanh for the forward channel (vx, dim 0): x <= 0 -> vx = 0
+            # (a real stand, reachable with a finite action), x > 0 -> vx = tanh(x)
+            # (forward, saturating toward command_max). Signed channels (vy/wz) keep the
+            # plain tanh squash. The shared affine below maps [-1, 1] onto
+            # [command_min, command_max], so we express it as 2*relu(tanh(x))-1, which
+            # makes the affine yield exactly relu(tanh(x)) for vx.
+            x = self._processed_navigation_velocity_actions
+            squashed = torch.tanh(x)
+            squashed[:, 0] = 2.0 * torch.relu(squashed[:, 0]) - 1.0
+            self._processed_navigation_velocity_actions[:] = squashed
         else:
             raise ValueError(f"Unknown policy distribution type: {self.cfg.policy_distr_type}")
         self._processed_navigation_velocity_actions[:] = self._command_min + 0.5 * (

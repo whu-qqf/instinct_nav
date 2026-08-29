@@ -392,6 +392,71 @@ def _patch_terrain_generator():
     TerrainGenerator._get_terrain_mesh = _patched_get_terrain_mesh
 
 
+def _split_faces_spatially(mesh: "trimesh.Trimesh", max_faces: int) -> list[np.ndarray]:
+    """Partition a mesh's faces into spatially-coherent chunks of <= ``max_faces``.
+
+    Faces are sorted by their centroid X coordinate and split into contiguous
+    groups, so each chunk covers a seamless slab of the terrain (no gaps, every
+    face assigned exactly once). Returns a list of face-index arrays.
+    """
+    num_faces = len(mesh.faces)
+    n_chunks = max(1, int(np.ceil(num_faces / float(max(1, max_faces)))))
+    if n_chunks <= 1:
+        return [np.arange(num_faces)]
+    centroid_x = mesh.vertices[mesh.faces].mean(axis=1)[:, 0]
+    order = np.argsort(centroid_x, kind="stable")
+    return [grp for grp in np.array_split(order, n_chunks) if grp.size > 0]
+
+
+def _create_terrain_prims_split(importer, name: str, mesh: "trimesh.Trimesh") -> bool:
+    """Import ``mesh`` as N complete (visual + collision) sub-prims, one per slab.
+
+    Each sub-prim is structurally identical to the stock single-prim import
+    (``create_prim_from_mesh``: one Mesh with a CollisionAPI, visual + physics
+    materials), just covering a spatial slab of the terrain so every collision
+    mesh stays below the PhysX cooking limit. This lets multi-bank rich terrain
+    (720 tiles) cook where the single combined mesh failed, without the
+    visual/collision split that broke physics scene queries.
+
+    Sub-prims live at ``<prim_path>/terrain_{i}`` (still under ``/World/ground``),
+    so ray-casters using :class:`MultiMeshRayCaster` on ``/World/ground``
+    automatically pick up every chunk via recursive child-mesh discovery.
+
+    Returns True on success; False to fall back to the stock single-prim import
+    (e.g. only one chunk needed, or an unexpected error), so behaviour never
+    regresses below status quo.
+    """
+    try:
+        from isaaclab.terrains.utils import create_prim_from_mesh
+
+        max_faces = int(os.environ.get("TERRAIN_COLLIDER_MAX_FACES", "400000"))
+        face_groups = _split_faces_spatially(mesh, max_faces)
+
+        # A single group means the combined mesh already cooks fine; let the
+        # caller use the stock single-prim path (identical to legacy behaviour).
+        if len(face_groups) <= 1:
+            return False
+
+        prim_path = importer.cfg.prim_path + f"/{name}"
+        for i, faces in enumerate(face_groups):
+            sub = mesh.submesh([faces], append=True, repair=False)
+            create_prim_from_mesh(
+                f"{prim_path}/terrain_{i}",
+                sub,
+                visual_material=importer.cfg.visual_material,
+                physics_material=importer.cfg.physics_material,
+            )
+
+        print(
+            f"[terrain patches] Split '{name}' into {len(face_groups)} complete "
+            f"(visual+collision) terrain sub-prims (<= {max_faces} faces each)."
+        )
+        return True
+    except Exception as exc:  # noqa: BLE001 - fail-safe: never regress below default import
+        print(f"[terrain patches] Split import failed ({exc!r}); falling back to single-prim import.")
+        return False
+
+
 def _patch_terrain_importer():
     """Patch TerrainImporter to store height field data as attributes.
 
@@ -399,6 +464,7 @@ def _patch_terrain_importer():
     and store it as attributes on TerrainImporter for access via env.scene.terrain.
     """
     from isaaclab.terrains.terrain_importer import TerrainImporter
+    from isaaclab.terrains.utils import create_prim_from_mesh
 
     _original_importer_init = TerrainImporter.__init__
 
@@ -424,7 +490,38 @@ def _patch_terrain_importer():
         for attr in _HEIGHT_FIELD_ATTRS:
             setattr(self, f"_{attr}", _height_field_storage.get(attr))
 
+    def _patched_import_mesh(self, name: str, mesh):
+        """Import terrain as N complete (visual + collision) per-slab sub-prims.
+
+        Splitting the mesh into per-slab sub-prims keeps every collision mesh below
+        the PhysX cooking limit, so multi-bank rich terrain (720 tiles) cooks
+        successfully where the single combined mesh failed. Each sub-prim carries
+        both visual and collision (like the stock import), so physics scene queries
+        behave normally. Falls back to the stock single-prim import when only one
+        slab is needed or the split path errors, so behaviour never regresses. See
+        :func:`_create_terrain_prims_split`.
+        """
+        prim_path = self.cfg.prim_path + f"/{name}"
+        if prim_path in self.terrain_prim_paths:
+            raise ValueError(
+                f"A terrain with the name '{name}' already exists. Existing terrains: "
+                f"{', '.join(self.terrain_names)}."
+            )
+        self.terrain_prim_paths.append(prim_path)
+        # Escape hatch: TERRAIN_SPLIT_DISABLE=1 forces the stock single-prim import
+        # (visual + collision on one mesh). Useful when the combined mesh cooks fine
+        # (small terrains) or to isolate the split path during debugging.
+        use_split = os.environ.get("TERRAIN_SPLIT_DISABLE", "0") != "1"
+        if not (use_split and _create_terrain_prims_split(self, name, mesh)):
+            create_prim_from_mesh(
+                prim_path,
+                mesh,
+                visual_material=self.cfg.visual_material,
+                physics_material=self.cfg.physics_material,
+            )
+
     TerrainImporter.__init__ = _patched_importer_init
+    TerrainImporter.import_mesh = _patched_import_mesh
 
 
 def _patch_pinhole_camera_pattern_cfg():

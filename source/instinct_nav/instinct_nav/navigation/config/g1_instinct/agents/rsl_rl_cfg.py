@@ -263,6 +263,28 @@ class G1InstinctNavPPODynamicMapCrossOfficialRunnerCfg(
 
 
 @configclass
+class G1InstinctNavPPODynamicMapCrossBanksOfficialRunnerCfg(
+    G1InstinctNavPPODynamicMapCrossOfficialRunnerCfg
+):
+    """DynamicMapCross runner with smaller PPO mini-batches for terrain-bank training."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.algorithm.num_mini_batches = 8
+
+
+@configclass
+class G1InstinctNavPPODynamicMapCrossBanksOfficialRunnerDevCfg(
+    G1InstinctNavPPODynamicMapCrossBanksOfficialRunnerCfg
+):
+    def __post_init__(self):
+        super().__post_init__()
+        self.max_iterations = 10
+        self.experiment_name = "g1_instinct_navigation_dynamic_map_cross_banks_dev"
+        self.logger = "tensorboard"
+
+
+@configclass
 class G1InstinctNavPPODynamicMapCrossOfficialRunnerDevCfg(
     G1InstinctNavPPODynamicMapCrossOfficialRunnerCfg
 ):

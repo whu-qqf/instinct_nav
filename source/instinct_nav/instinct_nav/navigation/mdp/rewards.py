@@ -16,6 +16,7 @@ import torch
 
 from isaaclab.assets import Articulation
 from isaaclab.managers import SceneEntityCfg
+from isaaclab.utils.math import quat_rotate_inverse, yaw_quat
 
 from instinct_nav.navigation.mdp.navigation.goal_commands import RobotNavigationGoalCommand
 
@@ -196,3 +197,94 @@ def stair_centerline_alignment(
 
     values = field[terrain_idx, i, j]
     return torch.where(in_bounds, values, reward)
+
+
+def velocity_into_unobserved_penalty(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    speed_threshold: float = 0.1,
+    max_range_m: float = 1.5,
+) -> torch.Tensor:
+    """Penalize moving toward low-score ("black") cells of the vis_score field.
+
+    Treats the robot-centric visibility/score map as a scalar field ``s(x, y)``
+    (values in ``[0, 1]``, ``1`` == observed) and the robot's *actual* velocity as
+    a vector ``v``. The penalty is the blackness integrated along the ray ``v`` —
+    a discrete line integral ``(1/L) int_0^L (1 - s(robot + v_hat * t)) dt``, i.e.
+    "how much of the path ahead, in the direction of motion, is unobserved". No
+    hemisphere/cone restriction: ``v`` may point in any direction, so moving
+    backward/sideways into unobserved regions is penalized too, while moving
+    forward through open (observed) terrain yields ~0.
+
+    The map lives in the robot yaw frame (local ``+x`` forward, ``+y`` left, robot
+    at the center cell), matching ``cell_x_local``/``cell_y_local`` on the manager.
+
+    The map only encodes *observed vs. not-observed* — a low score means the cell
+    is occluded, outside the forward FOV, or beyond range (NOT that it is an
+    obstacle). Gated by a minimum speed (a stationary robot is never penalized)
+    and by the map having been populated. Purely positive; use with a negative
+    weight. Returns zeros when the visibility manager is absent (non-ScoreVis
+    tasks) so it is safe to leave in the base config at weight 0.
+
+    Args:
+        env: The learning environment.
+        asset_cfg: The robot asset.
+        speed_threshold: Minimum planar speed (m/s) below which no penalty is
+            applied.
+        max_range_m: Distance (m) along the velocity direction over which the score
+            field is integrated (a discrete line integral, one sample per grid cell).
+
+    Returns:
+        Dense penalty in ``[0, 1]`` (0 when not moving / no map).
+    """
+    reward = torch.zeros(env.num_envs, device=env.device)
+
+    mgr = getattr(env, "local_visibility_map_manager", None)
+    if mgr is None:
+        return reward
+
+    grid = mgr.map  # [N, 1, G, G], 1 == observed
+    G = mgr.grid_size
+    half = mgr.half_size
+    cell = mgr.cell_size
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    # The vis map is stored in a YAW-ONLY robot frame, so the velocity must be
+    # expressed in that same frame. root_lin_vel_b uses the full body frame
+    # (includes pitch/roll), which rotates v_hat off the map axes when the
+    # humanoid pitches/rolls while walking. Rotate world velocity by yaw only.
+    yaw_q = yaw_quat(asset.data.root_quat_w)
+    vel_xy = quat_rotate_inverse(yaw_q, asset.data.root_lin_vel_w)[:, :2]
+    speed = torch.norm(vel_xy, dim=1)
+    v_hat = vel_xy / speed.clamp_min(1e-6).unsqueeze(1)  # [N, 2] yaw frame (forward, left)
+
+    env_ids = torch.arange(env.num_envs, device=env.device)
+    # Dense ray-march along the velocity direction: one sample per grid cell over
+    # [cell, max_range_m]. This is the discrete line integral of blackness along v.
+    # Sample points start at `cell` (0.1 m), NOT the robot center cell, so the
+    # robot's own map state does not directly drive the penalty.
+    n_steps = max(1, int(round(max_range_m / cell)))
+    dists = (torch.arange(1, n_steps + 1, device=env.device, dtype=torch.float32)) * cell  # [n_steps]
+
+    px = v_hat[:, 0:1] * dists.unsqueeze(0)  # [N, n_steps] forward-local offsets
+    py = v_hat[:, 1:2] * dists.unsqueeze(0)  # [N, n_steps] left-local offsets
+    row = torch.round((half - px) / cell - 0.5).long()
+    col = torch.round((half - py) / cell - 0.5).long()
+
+    # Out-of-bounds samples (robot near / leaving the map) are excluded from the
+    # average instead of being clamped to the edge, which would double-count edge
+    # blackness when the robot drives toward the map border.
+    in_bounds = (row >= 0) & (row < G) & (col >= 0) & (col < G)
+    row_c = row.clamp(0, G - 1)
+    col_c = col.clamp(0, G - 1)
+    score = grid[env_ids.unsqueeze(1), 0, row_c, col_c]  # [N, n_steps], 1 == observed
+    blackness = 1.0 - score
+
+    denom = in_bounds.float().sum(dim=1).clamp_min(1.0)
+    penalty = (blackness * in_bounds.float()).sum(dim=1) / denom
+
+    gate = speed > speed_threshold
+    pose_valid = getattr(mgr, "pose_valid", None)
+    if pose_valid is not None:
+        gate = gate & pose_valid
+    return torch.where(gate, penalty, reward)

@@ -103,6 +103,16 @@ class HfMazeTerrainCfg(HfTerrainBaseCfg):
     stair_step_height_range: tuple[float, float] = (0.2, 0.2)
     """Step-height range in meters. The upper end is reached as difficulty increases."""
 
+    stair_step_depth_range: tuple[float, float] | None = None
+    """Optional independent tread-depth range in meters.
+
+    When unset, the steps divide the full cell as before. When set, the sampled
+    depth is constrained so the complete staircase still fits in one cell.
+    """
+
+    stair_max_total_height: float | None = None
+    """Optional maximum staircase/platform height in meters."""
+
     dynamic_obstacles: bool = False
     """Enable pit/trough obstacles. Defaults to False."""
 

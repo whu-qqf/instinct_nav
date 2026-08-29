@@ -49,6 +49,14 @@ parser.add_argument("--num_envs", type=int, default=None, help="Number of parall
 parser.add_argument("--num_episodes", type=int, default=200, help="Number of finished episodes to aggregate.")
 parser.add_argument("--seed", type=int, default=None, help="Seed for evaluation.")
 parser.add_argument(
+    "--legacy_tracker_success",
+    action="store_true",
+    help=(
+        "Compute headline success from the latest SuccessRateTracker entry, matching the legacy "
+        "sru_ref evaluator. Termination and episode-outcome diagnostics are still reported."
+    ),
+)
+parser.add_argument(
     "--episode_length_s",
     type=float,
     default=None,
@@ -3819,6 +3827,9 @@ def _run_eval_pass(
             termination_counts[term_name] += int(term_values.sum().item())
 
         successes, outcome_batch = classify_episode_outcomes(done_term_values)
+        if args_cli.legacy_tracker_success:
+            latest_indices = (success_tracker.write_index[done_ids] - 1) % success_tracker.buffer_size
+            successes = success_tracker.buffer[done_ids, latest_indices] > 0.0
         for outcome_name, count in outcome_batch.items():
             outcome_counts[outcome_name] += count
         total_successes += int(successes.sum().item())
@@ -3928,6 +3939,9 @@ def _run_eval_pass(
         "episodes": total_episodes,
         "successes": total_successes,
         "success_rate": summarize_rates(total_successes, total_episodes),
+        "success_metric": (
+            "legacy_success_tracker_latest" if args_cli.legacy_tracker_success else "exclusive_episode_outcome"
+        ),
         "action_stats": action_stats.summarize(),
         "termination_rates": {
             term_name: {"count": count, "rate": summarize_rates(count, total_episodes)}
@@ -4372,6 +4386,9 @@ def main():
             termination_counts[term_name] += int(term_values.sum().item())
 
         successes, outcome_batch = classify_episode_outcomes(done_term_values)
+        if args_cli.legacy_tracker_success:
+            latest_indices = (success_tracker.write_index[done_ids] - 1) % success_tracker.buffer_size
+            successes = success_tracker.buffer[done_ids, latest_indices] > 0.0
         for outcome_name, count in outcome_batch.items():
             outcome_counts[outcome_name] += count
         total_successes += int(successes.sum().item())
@@ -4521,6 +4538,9 @@ def main():
         "episodes": total_episodes,
         "successes": total_successes,
         "success_rate": summarize_rates(total_successes, total_episodes),
+        "success_metric": (
+            "legacy_success_tracker_latest" if args_cli.legacy_tracker_success else "exclusive_episode_outcome"
+        ),
         "action_stats": action_stats.summarize(),
         "termination_rates": {
             term_name: {
