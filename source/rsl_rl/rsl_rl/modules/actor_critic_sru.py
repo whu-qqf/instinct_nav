@@ -20,6 +20,44 @@ from rsl_rl.networks.sru_memory import LSTM_SRU, CrossAttentionFuseModule
 from rsl_rl.utils import unpad_trajectories
 
 
+class _DynamicMaskHead(nn.Module):
+    """Small encoder-decoder that segments dynamic obstacles from raw depth.
+
+    Input ``[B, 1, H, W]`` raw delayed depth -> a pooled ``feature_dim`` vector
+    (encoder bottleneck, fed into the SRU recurrent input) + a ``[B, 1, H, W]``
+    sigmoid mask (decoder upsampled back to the input resolution, supervised by
+    the training-time obstacle mask label). Fully convolutional and
+    resolution-agnostic: the decoder resizes the bottleneck feature map back to
+    the input ``(H, W)`` via bilinear interpolation.
+    """
+
+    def __init__(self, in_channels: int = 1, feature_dim: int = 64):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Conv2d(in_channels, 16, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, feature_dim, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+        )
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.decoder = nn.Sequential(
+            nn.Conv2d(feature_dim, 32, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 16, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, 1, kernel_size=1),
+        )
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        feat = self.encoder(x)  # [B, feature_dim, H/8, W/8]
+        pooled = self.pool(feat).flatten(1)  # [B, feature_dim]
+        up = torch.nn.functional.interpolate(feat, size=x.shape[-2:], mode="bilinear", align_corners=False)
+        mask = torch.sigmoid(self.decoder(up))  # [B, 1, H, W]
+        return pooled, mask
+
+
 class ActorCriticSRU(nn.Module):
     """Actor-Critic network with SRU memory and cross-attention for image processing.
 
@@ -76,6 +114,9 @@ class ActorCriticSRU(nn.Module):
         scene_token_feature_dim: int = 64,
         scene_token_query_num_heads: int = 4,
         use_dynamic_map_cross_attention: bool = False,
+        use_dynamic_mask: bool = False,
+        mask_input_dims: tuple[int, int, int] = (1, 36, 64),
+        mask_feature_dim: int = 64,
         **kwargs,
     ):
         if kwargs:
@@ -121,6 +162,12 @@ class ActorCriticSRU(nn.Module):
         self.use_dynamic_map_cross_attention = bool(use_dynamic_map_cross_attention)
         if self.use_dynamic_map_cross_attention and self.scene_token_dim != 5:
             raise ValueError("dynamic map cross-attention expects scene_token_dim=5")
+        self.use_dynamic_mask = bool(use_dynamic_mask)
+        self.mask_input_dims = tuple(mask_input_dims)
+        self.mask_feature_dim = int(mask_feature_dim) if self.use_dynamic_mask else 0
+        self.num_mask_input_features = (
+            mask_input_dims[0] * mask_input_dims[1] * mask_input_dims[2] if self.use_dynamic_mask else 0
+        )
 
         # Compute the total number of features from image, height, visibility, and scene-token inputs.
         self.num_image_features = image_input_dims[0] * image_input_dims[1] * image_input_dims[2]
@@ -144,6 +191,7 @@ class ActorCriticSRU(nn.Module):
         self.actor_proprioceptive_input_dim = (
             num_actor_obs
             - self.num_image_features * self.num_cameras
+            - self.num_mask_input_features
             - self.num_visibility_map_features
             - self.num_actor_scene_token_features
         )
@@ -151,6 +199,7 @@ class ActorCriticSRU(nn.Module):
             num_critic_obs
             - self.num_height_features
             - self.num_image_features * self.num_cameras
+            - self.num_mask_input_features
             - self.num_critic_scene_token_features
             - 1
         )
@@ -163,6 +212,8 @@ class ActorCriticSRU(nn.Module):
         # visibility-map features before the SRU; late/query fusion append them
         # after it so explicit spatial memory stays out of the recurrent state.
         self.mlp_input_dim_actor = self.actor_proprioceptive_input_dim + image_input_dims[0]
+        if self.use_dynamic_mask:
+            self.mlp_input_dim_actor += self.mask_feature_dim
         if self.use_actor_visibility_early_fusion:
             self.mlp_input_dim_actor += self.visibility_map_feature_dim
             self.actor_post_recurrent_input_dim = rnn_hidden_size
@@ -173,6 +224,8 @@ class ActorCriticSRU(nn.Module):
         self.mlp_input_dim_critic = (
             self.critic_proprioceptive_input_dim + height_input_dims[0] + image_input_dims[0]
         )
+        if self.use_dynamic_mask:
+            self.mlp_input_dim_critic += self.mask_feature_dim
         self.critic_post_recurrent_input_dim = rnn_hidden_size + time_embed_dim
         if self.use_critic_scene_tokens:
             self.critic_post_recurrent_input_dim += self.scene_token_feature_dim
@@ -353,6 +406,18 @@ class ActorCriticSRU(nn.Module):
             self.critic_scene_cross_attention = None
             self.critic_scene_attention_ffn = None
 
+        # Dynamic-obstacle segmentation head (shared by actor and critic). Its
+        # pooled feature enters the SRU recurrent input; its sigmoid mask is
+        # supervised by the training-time obstacle mask label (auxiliary loss).
+        if self.use_dynamic_mask:
+            self.mask_head = _DynamicMaskHead(
+                in_channels=mask_input_dims[0],
+                feature_dim=self.mask_feature_dim,
+            )
+        else:
+            self.mask_head = None
+        self._mask_pred = None
+
         # RNN memory modules (plain LSTM_SRU without attention)
         self.memory_a = MemorySRU(
             input_size=self.mlp_input_dim_actor,
@@ -459,6 +524,7 @@ class ActorCriticSRU(nn.Module):
             list(self.attn_image_net.parameters())
             + visibility_parameters
             + scene_parameters
+            + (list(self.mask_head.parameters()) if self.mask_head is not None else [])
             + list(self.linear_dropout_actor.parameters())
             + list(self.actor.parameters())
             + list(self.memory_a.parameters())
@@ -540,14 +606,28 @@ class ActorCriticSRU(nn.Module):
     def _extract_actor_scene_tokens(self, observations: torch.Tensor) -> torch.Tensor | None:
         if not self.use_actor_scene_tokens:
             return None
-        scene_obs = observations[..., -self.num_actor_scene_token_features :]
+        if self.use_dynamic_mask:
+            start = -(self.num_actor_scene_token_features + self.num_mask_input_features)
+            scene_obs = observations[..., start : -self.num_mask_input_features]
+        else:
+            scene_obs = observations[..., -self.num_actor_scene_token_features :]
         return scene_obs.reshape(-1, self.scene_token_num_tokens, self.scene_token_dim)
 
     def _extract_critic_scene_tokens(self, observations: torch.Tensor) -> torch.Tensor | None:
         if not self.use_critic_scene_tokens:
             return None
-        scene_obs = observations[..., -self.num_critic_scene_token_features :]
+        if self.use_dynamic_mask:
+            start = -(self.num_critic_scene_token_features + self.num_mask_input_features)
+            scene_obs = observations[..., start : -self.num_mask_input_features]
+        else:
+            scene_obs = observations[..., -self.num_critic_scene_token_features :]
         return scene_obs.reshape(-1, self.scene_token_num_tokens, self.scene_token_dim)
+
+    def _extract_raw_depth(self, observations: torch.Tensor) -> torch.Tensor | None:
+        if not self.use_dynamic_mask:
+            return None
+        raw = observations[..., -self.num_mask_input_features :]
+        return raw.reshape(-1, *self.mask_input_dims)
 
     @staticmethod
     def _match_recurrent_shape(features: torch.Tensor, recurrent_features: torch.Tensor) -> torch.Tensor:
@@ -642,15 +722,20 @@ class ActorCriticSRU(nn.Module):
         # Split observations into proprioceptive, image, and optional visibility-map parts.
         visual_tail_features = (
             self.num_image_features * self.num_cameras
+            + self.num_mask_input_features
             + self.num_visibility_map_features
             + self.num_actor_scene_token_features
         )
         other_obs = observations[..., : -visual_tail_features]
         image_list = self._extract_image_observations(
-            observations, trailing_features=self.num_visibility_map_features + self.num_actor_scene_token_features
+            observations,
+            trailing_features=self.num_mask_input_features
+            + self.num_visibility_map_features
+            + self.num_actor_scene_token_features,
         )
         visibility_obs = self._extract_actor_visibility_map(observations)
         scene_tokens = self._extract_actor_scene_tokens(observations)
+        raw_depth = self._extract_raw_depth(observations)
         other_obs = other_obs.reshape(-1, self.actor_proprioceptive_input_dim)
 
         # Stack images if multiple cameras, otherwise use single image
@@ -670,6 +755,12 @@ class ActorCriticSRU(nn.Module):
             else:
                 visibility_features = visibility_encoded
 
+        # Dynamic-obstacle mask head: pooled feature -> SRU input; mask -> aux loss.
+        mask_feature = None
+        if raw_depth is not None:
+            mask_feature, mask_pred = self.mask_head(raw_depth)
+            self._mask_pred = mask_pred
+
         # Reshape for batch mode
         if batch_mode:
             seq_len, batch_size, _ = observations.size()
@@ -680,6 +771,8 @@ class ActorCriticSRU(nn.Module):
                 visibility_tokens = visibility_tokens.reshape(seq_len, batch_size, -1)
             if scene_tokens is not None:
                 scene_tokens = scene_tokens.reshape(seq_len, batch_size, -1)
+            if mask_feature is not None:
+                mask_feature = mask_feature.view(seq_len, batch_size, -1)
             other_obs = other_obs.view(seq_len, batch_size, -1)
 
         # The recurrent actor state is based on the baseline observation stream,
@@ -689,6 +782,8 @@ class ActorCriticSRU(nn.Module):
             visibility_features = None
         else:
             combined_features = torch.cat([image_features, other_obs], dim=-1)
+        if mask_feature is not None:
+            combined_features = torch.cat([combined_features, mask_feature], dim=-1)
 
         # RNN processing
         combined_features = self.memory_a(combined_features, masks, hidden_states)
@@ -745,9 +840,10 @@ class ActorCriticSRU(nn.Module):
         """
         batch_mode = masks is not None
 
-        # Critic observation layout is: proprio | time | height | depth | optional scene_tokens.
+        # Critic observation layout is: proprio | time | height | depth | optional scene_tokens | optional raw depth.
         scene_tokens = self._extract_critic_scene_tokens(observations)
-        trailing_features = self.num_critic_scene_token_features
+        raw_depth = self._extract_raw_depth(observations)
+        trailing_features = self.num_critic_scene_token_features + self.num_mask_input_features
         depth_start_from_end = self.num_image_features * self.num_cameras + trailing_features
         height_start_from_end = self.num_height_features + depth_start_from_end
         time_index_from_end = height_start_from_end + 1
@@ -771,6 +867,13 @@ class ActorCriticSRU(nn.Module):
         height_features = self.attn_height_net(height_obs, other_obs)
         image_features = self.attn_critic_image_net(image_input, other_obs)
 
+        # Dynamic-obstacle mask head (shared with the actor). Only the pooled feature
+        # is used here for the critic SRU input; the mask prediction for the aux loss is
+        # cached by the actor pass.
+        mask_feature = None
+        if raw_depth is not None:
+            mask_feature, _ = self.mask_head(raw_depth)
+
         # Reshape for batch mode
         if batch_mode:
             seq_len, batch_size, _ = observations.size()
@@ -779,12 +882,16 @@ class ActorCriticSRU(nn.Module):
             other_obs = other_obs.view(seq_len, batch_size, -1)
             if scene_tokens is not None:
                 scene_tokens = scene_tokens.reshape(seq_len, batch_size, -1)
+            if mask_feature is not None:
+                mask_feature = mask_feature.view(seq_len, batch_size, -1)
 
         # Time embedding for the critic
         time_embed = self.time_layer(time_obs)
 
         # Concatenate height, image, and proprioceptive features
         combined_features = torch.cat([height_features, image_features, other_obs], dim=-1)
+        if mask_feature is not None:
+            combined_features = torch.cat([combined_features, mask_feature], dim=-1)
 
         # RNN processing
         combined_features = self.memory_c(combined_features, masks, hidden_states).squeeze(0)

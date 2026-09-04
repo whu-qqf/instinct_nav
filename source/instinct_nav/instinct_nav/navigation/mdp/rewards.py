@@ -16,7 +16,7 @@ import torch
 
 from isaaclab.assets import Articulation
 from isaaclab.managers import SceneEntityCfg
-from isaaclab.utils.math import quat_rotate_inverse, yaw_quat
+from isaaclab.utils.math import quat_apply_inverse, yaw_quat
 
 from instinct_nav.navigation.mdp.navigation.goal_commands import RobotNavigationGoalCommand
 
@@ -254,7 +254,7 @@ def velocity_into_unobserved_penalty(
     # (includes pitch/roll), which rotates v_hat off the map axes when the
     # humanoid pitches/rolls while walking. Rotate world velocity by yaw only.
     yaw_q = yaw_quat(asset.data.root_quat_w)
-    vel_xy = quat_rotate_inverse(yaw_q, asset.data.root_lin_vel_w)[:, :2]
+    vel_xy = quat_apply_inverse(yaw_q, asset.data.root_lin_vel_w)[:, :2]
     speed = torch.norm(vel_xy, dim=1)
     v_hat = vel_xy / speed.clamp_min(1e-6).unsqueeze(1)  # [N, 2] yaw frame (forward, left)
 

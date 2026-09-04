@@ -634,6 +634,10 @@ class G1InstinctNavigationEnvCfg_DYNAMIC_OFFICIAL(
     obstacle_graded_curriculum: bool = False
     obstacle_difficulty_step: float = 0.2
     obstacle_advance_success: float = 0.75
+    # 0.0 => monotonic-up curriculum (legacy). >0 enables demotion: difficulty drops one
+    # step when success falls below this, so the policy is not permanently pinned at a tier
+    # it cannot master. Keep < obstacle_advance_success (dead band prevents oscillation).
+    obstacle_demote_success: float = 0.0
     obstacle_easy_speed_range: tuple[float, float] = (0.1, 0.2)
     obstacle_easy_min_start_dist: float = 3.5
     obstacle_easy_max_start_dist: float = 6.0
@@ -641,6 +645,19 @@ class G1InstinctNavigationEnvCfg_DYNAMIC_OFFICIAL(
     # Look-ahead time-to-collision penalty horizon (seconds). Reward term weight defaults
     # to 0 on the base class (inert); the *-Avoid- ablation gives it a negative weight.
     obstacle_ttc_horizon: float = 2.0
+    # --- Reactive spawn + collision-aware metric (AvoidReact ablation). Default off =>
+    # legacy pop-in spawn and collision-blind success metric, so every existing task is
+    # byte-identical. Only the *-AvoidReact- ablation turns these on. ---
+    #   reactive_spawn: obstacles enter at >= visible_spawn_dist and travel inward (visible
+    #     approach) instead of materializing at close range; obstacle speed capped to
+    #     max_closing_speed so the closing rate stays reactable at the 5 Hz control rate.
+    #   record_collision_failure: obstacle-collision terminations write 0.0 to the goal
+    #     success tracker (like fall/contact/pitch), making success_rate collision-aware and
+    #     the graded curriculum's enable/advance gates honest.
+    obstacle_reactive_spawn: bool = False
+    obstacle_visible_spawn_dist: float = 5.0
+    obstacle_max_closing_speed: float = 1.0
+    obstacle_record_collision_failure: bool = False
 
     def __post_init__(self):
         super().__post_init__()
@@ -711,10 +728,14 @@ class G1InstinctNavigationEnvCfg_DYNAMIC_OFFICIAL(
             "graded_curriculum": self.obstacle_graded_curriculum,
             "difficulty_step": self.obstacle_difficulty_step,
             "advance_success": self.obstacle_advance_success,
+            "demote_success": self.obstacle_demote_success,
             "easy_speed_range": self.obstacle_easy_speed_range,
             "easy_min_start_dist": self.obstacle_easy_min_start_dist,
             "easy_max_start_dist": self.obstacle_easy_max_start_dist,
             "fraction_range": self.obstacle_fraction_range,
+            "reactive_spawn": self.obstacle_reactive_spawn,
+            "visible_spawn_dist": self.obstacle_visible_spawn_dist,
+            "max_closing_speed": self.obstacle_max_closing_speed,
         }
         self.events.dynamic_obstacles_reset = EventTerm(
             func=nav_mdp.reset_dynamic_obstacles,
@@ -755,6 +776,7 @@ class G1InstinctNavigationEnvCfg_DYNAMIC_OFFICIAL(
                 "obstacle_names": obstacle_names,
                 "collision_radius": self.obstacle_collision_radius,
                 "body_half_extent": self.obstacle_body_half_extent,
+                "record_failure": self.obstacle_record_collision_failure,
             },
         )
 
@@ -1085,6 +1107,11 @@ class G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERL
     """CENTERLINE_UNOBSERVED + rebalanced avoidance reward + graded obstacle curriculum."""
 
     obstacle_graded_curriculum: bool = True
+    # Lower first-enable gate than the 0.9 default: on the RichTerrain/banks terrain a
+    # strong resumed nav policy plateaus ~0.83, so 0.9 would never trigger and obstacles
+    # would only appear at the iteration fallback. 0.7 engages the curriculum once nav is
+    # competent; advance_success (0.75) still throttles per-tier difficulty progression.
+    obstacle_auto_switch_success: float = 0.7
 
     def __post_init__(self):
         super().__post_init__()
@@ -1164,3 +1191,202 @@ class G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERL
     def __post_init__(self):
         super().__post_init__()
         _apply_terrain_banks(self)
+
+
+# =============================================================================
+# Avoid ablation (rebalanced avoidance reward + graded obstacle curriculum) with
+# four pre-generated terrain banks switched every 1000 PPO iterations. Combines
+# the *-Avoid- reward/curriculum changes with the banks terrain rotation.
+# =============================================================================
+@configclass
+class G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_BANKS(
+    G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID
+):
+    """Avoid (graded curriculum + rebalanced reward) with four pre-generated terrain banks."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_terrain_banks(self)
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_BANKS_DEV(
+    G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_DEV
+):
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_terrain_banks(self)
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_BANKS_PLAY(
+    G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_PLAY
+):
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_terrain_banks(self)
+
+
+# =============================================================================
+# AvoidReact ablation: stacks three structural avoidance fixes on top of *-Avoid-,
+# all isolated behind default-off flags so every other task stays byte-identical:
+#   (P2) reactive_spawn: obstacles enter at >= visible_spawn_dist and travel inward
+#        (visible approach) instead of materializing at close range, with obstacle
+#        speed capped to max_closing_speed so the closing rate is reactable at 5 Hz.
+#        Removes physically-unavoidable close-range spawns.
+#   (metric) record_collision_failure: obstacle-collision terminations write 0.0 to
+#        the goal success tracker, making success_rate collision-aware and the graded
+#        curriculum's enable/advance gates honest (difficulty no longer ratchets up
+#        while the policy is still colliding).
+# Inherits the *-Avoid- rebalanced reward + graded curriculum unchanged.
+# =============================================================================
+@configclass
+class G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_REACT(
+    G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID
+):
+    """*-Avoid- + reactive visible-approach spawn + collision-aware success metric."""
+
+    obstacle_reactive_spawn: bool = True
+    obstacle_record_collision_failure: bool = True
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_REACT_DEV(
+    G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_DEV
+):
+    obstacle_reactive_spawn: bool = True
+    obstacle_record_collision_failure: bool = True
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_REACT_PLAY(
+    G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_PLAY
+):
+    obstacle_reactive_spawn: bool = True
+    obstacle_record_collision_failure: bool = True
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_REACT_BANKS(
+    G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_REACT
+):
+    """AvoidReact with four pre-generated terrain banks switched every 1000 PPO iters."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_terrain_banks(self)
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_REACT_BANKS_DEV(
+    G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_REACT_DEV
+):
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_terrain_banks(self)
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_REACT_BANKS_PLAY(
+    G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_REACT_PLAY
+):
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_terrain_banks(self)
+
+
+# AvoidReact-Banks + BIDIRECTIONAL graded curriculum: difficulty is demoted one step when
+# rolling success falls below obstacle_demote_success, so the policy can drop back and
+# consolidate at an easier level instead of being pinned at difficulty 1.0. Dead band
+# [demote, advance] = [0.73, 0.80] gives a stable resting difficulty (success in that band).
+# Everything else is inherited byte-identical from AvoidReact-Banks.
+@configclass
+class G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_REACT_DEMOTE_BANKS(
+    G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_REACT_BANKS
+):
+    """AvoidReact-Banks with bidirectional (promote/demote) difficulty curriculum."""
+
+    obstacle_demote_success: float = 0.73
+    obstacle_advance_success: float = 0.80
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_REACT_DEMOTE_BANKS_DEV(
+    G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_REACT_BANKS_DEV
+):
+    obstacle_demote_success: float = 0.73
+    obstacle_advance_success: float = 0.80
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_REACT_DEMOTE_BANKS_PLAY(
+    G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_REACT_BANKS_PLAY
+):
+    obstacle_demote_success: float = 0.73
+    obstacle_advance_success: float = 0.80
+
+
+@configclass
+class _DynamicMaskLabelObsGroup(ObsGroup):
+    """Auxiliary observation group holding the training-time obstacle mask label.
+
+    Never fed to the policy; only consumed by the auxiliary segmentation loss. It is
+    attached to the env config dynamically (not in the base ``ObservationsCfg``) so
+    every other task keeps its observation groups byte-identical.
+    """
+
+    mask = ObsTerm(func=nav_mdp.dynamic_obstacle_mask_label, params={"sensor_cfg": SceneEntityCfg("camera")})
+
+    def __post_init__(self):
+        self.enable_corruption = False
+        self.concatenate_terms = True
+
+
+def _apply_dynamic_mask_observations(cfg) -> None:
+    """Add the raw delayed depth block and the obstacle mask label to a task.
+
+    The raw depth is appended to the policy/critic obs (after the scene tokens), so
+    the network's mask head can consume it as the trailing observation block. The
+    mask label is a training-only auxiliary group, never fed to the policy.
+    """
+    sensor_cfg = SceneEntityCfg("camera")
+    cfg.observations.policy.raw_depth = ObsTerm(
+        func=nav_mdp.raw_depth_delayed, params={"sensor_cfg": sensor_cfg}
+    )
+    cfg.observations.critic.raw_depth = ObsTerm(
+        func=nav_mdp.raw_depth_delayed, params={"sensor_cfg": sensor_cfg}
+    )
+    cfg.observations.mask_label = _DynamicMaskLabelObsGroup()
+
+
+# AvoidReact-Banks + dynamic-obstacle segmentation mask head: the actor/critic
+# observations gain a raw delayed depth block (feeding the mask head), and the
+# training-time ground-truth obstacle mask label is exposed as an auxiliary obs
+# group for the BCE+Dice segmentation loss. Everything else inherited byte-identical.
+@configclass
+class G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_REACT_DYNAMIC_MASK_BANKS(
+    G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_REACT_BANKS
+):
+    """AvoidReact-Banks + dynamic-obstacle segmentation mask head + aux loss."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_dynamic_mask_observations(self)
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_REACT_DYNAMIC_MASK_BANKS_DEV(
+    G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_REACT_BANKS_DEV
+):
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_dynamic_mask_observations(self)
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_REACT_DYNAMIC_MASK_BANKS_PLAY(
+    G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_REACT_BANKS_PLAY
+):
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_dynamic_mask_observations(self)

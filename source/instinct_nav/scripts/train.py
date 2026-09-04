@@ -91,7 +91,11 @@ class LegacyRslRlVecEnvWrapper(RslRlVecEnvWrapper):
     def _to_legacy_obs(self, obs):
         policy_obs = obs["policy"]
         critic_obs = obs["critic"] if "critic" in obs.keys() else policy_obs
-        return policy_obs, {"observations": {"critic": critic_obs}}
+        legacy = {"critic": critic_obs}
+        # Pass through auxiliary observation groups (e.g. the training-only mask label).
+        if "mask_label" in obs.keys():
+            legacy["mask_label"] = obs["mask_label"]
+        return policy_obs, {"observations": legacy}
 
     def reset(self):
         obs, extras = super().reset()

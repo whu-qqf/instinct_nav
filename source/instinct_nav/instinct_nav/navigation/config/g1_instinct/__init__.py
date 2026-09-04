@@ -349,3 +349,92 @@ _register_navigation_task(
     navigation_env_cfg.G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_BANKS_PLAY,
     agents.rsl_rl_cfg.G1InstinctNavPPODynamicMapCrossBanksOfficialRunnerCfg,
 )
+
+# Avoid ablation (rebalanced reward + graded obstacle curriculum) with four terrain
+# banks switched every 1000 PPO iterations.
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-DynamicMapCross-RichTerrain-Centerline-Unobserved-Avoid-Banks-OfficialParkour-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_BANKS,
+    agents.rsl_rl_cfg.G1InstinctNavPPODynamicMapCrossBanksOfficialRunnerCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-DynamicMapCross-RichTerrain-Centerline-Unobserved-Avoid-Banks-OfficialParkour-Dev-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_BANKS_DEV,
+    agents.rsl_rl_cfg.G1InstinctNavPPODynamicMapCrossBanksOfficialRunnerDevCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-DynamicMapCross-RichTerrain-Centerline-Unobserved-Avoid-Banks-OfficialParkour-Play-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_BANKS_PLAY,
+    agents.rsl_rl_cfg.G1InstinctNavPPODynamicMapCrossBanksOfficialRunnerCfg,
+)
+
+# AvoidReact ablation: *-Avoid- + reactive visible-approach spawn (P2) + collision-aware
+# success metric/curriculum. All new behavior is flag-gated (default off) so every other
+# task stays byte-identical. Reuses the same runner cfgs as the *-Avoid- family.
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-DynamicMapCross-RichTerrain-Centerline-Unobserved-AvoidReact-OfficialParkour-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_REACT,
+    agents.rsl_rl_cfg.G1InstinctNavPPODynamicMapCrossOfficialRunnerCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-DynamicMapCross-RichTerrain-Centerline-Unobserved-AvoidReact-OfficialParkour-Dev-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_REACT_DEV,
+    agents.rsl_rl_cfg.G1InstinctNavPPODynamicMapCrossOfficialRunnerDevCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-DynamicMapCross-RichTerrain-Centerline-Unobserved-AvoidReact-OfficialParkour-Play-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_REACT_PLAY,
+    agents.rsl_rl_cfg.G1InstinctNavPPODynamicMapCrossOfficialRunnerCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-DynamicMapCross-RichTerrain-Centerline-Unobserved-AvoidReact-Banks-OfficialParkour-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_REACT_BANKS,
+    agents.rsl_rl_cfg.G1InstinctNavPPODynamicMapCrossBanksOfficialRunnerCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-DynamicMapCross-RichTerrain-Centerline-Unobserved-AvoidReact-Banks-OfficialParkour-Dev-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_REACT_BANKS_DEV,
+    agents.rsl_rl_cfg.G1InstinctNavPPODynamicMapCrossBanksOfficialRunnerDevCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-DynamicMapCross-RichTerrain-Centerline-Unobserved-AvoidReact-Banks-OfficialParkour-Play-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_REACT_BANKS_PLAY,
+    agents.rsl_rl_cfg.G1InstinctNavPPODynamicMapCrossBanksOfficialRunnerCfg,
+)
+
+# AvoidReact-Banks + bidirectional (promote/demote) difficulty curriculum. Only overrides
+# obstacle_demote_success/advance_success; reuses the same runner cfgs.
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-DynamicMapCross-RichTerrain-Centerline-Unobserved-AvoidReact-Demote-Banks-OfficialParkour-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_REACT_DEMOTE_BANKS,
+    agents.rsl_rl_cfg.G1InstinctNavPPODynamicMapCrossBanksOfficialRunnerCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-DynamicMapCross-RichTerrain-Centerline-Unobserved-AvoidReact-Demote-Banks-OfficialParkour-Dev-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_REACT_DEMOTE_BANKS_DEV,
+    agents.rsl_rl_cfg.G1InstinctNavPPODynamicMapCrossBanksOfficialRunnerDevCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-DynamicMapCross-RichTerrain-Centerline-Unobserved-AvoidReact-Demote-Banks-OfficialParkour-Play-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_REACT_DEMOTE_BANKS_PLAY,
+    agents.rsl_rl_cfg.G1InstinctNavPPODynamicMapCrossBanksOfficialRunnerCfg,
+)
+
+# AvoidReact-Banks + dynamic-obstacle segmentation mask head (raw delayed depth -> mask
+# CNN -> SRU feature) trained with an auxiliary BCE+Dice mask loss. Uses the dedicated
+# DynamicMask runner cfg (use_dynamic_mask=True, lambda_mask=0.2).
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-DynamicMapCross-RichTerrain-Centerline-Unobserved-AvoidReact-DynamicMask-Banks-OfficialParkour-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_REACT_DYNAMIC_MASK_BANKS,
+    agents.rsl_rl_cfg.G1InstinctNavPPODynamicMaskBanksOfficialRunnerCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-DynamicMapCross-RichTerrain-Centerline-Unobserved-AvoidReact-DynamicMask-Banks-OfficialParkour-Dev-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_REACT_DYNAMIC_MASK_BANKS_DEV,
+    agents.rsl_rl_cfg.G1InstinctNavPPODynamicMaskBanksOfficialRunnerDevCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-DynamicMapCross-RichTerrain-Centerline-Unobserved-AvoidReact-DynamicMask-Banks-OfficialParkour-Play-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_REACT_DYNAMIC_MASK_BANKS_PLAY,
+    agents.rsl_rl_cfg.G1InstinctNavPPODynamicMaskBanksOfficialRunnerCfg,
+)

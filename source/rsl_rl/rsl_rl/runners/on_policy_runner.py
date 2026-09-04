@@ -44,6 +44,9 @@ class OnPolicyRunner:
             num_critic_obs = extras["observations"]["critic"].shape[1]
         else:
             num_critic_obs = num_obs
+        mask_label_shape = None
+        if "mask_label" in extras["observations"]:
+            mask_label_shape = list(extras["observations"]["mask_label"].shape[1:])
         actor_critic_class = eval(self.policy_cfg.pop("class_name"))
         print("num obs", num_obs)
         print("num critic obs", num_critic_obs)
@@ -86,6 +89,7 @@ class OnPolicyRunner:
             [num_obs],
             [num_critic_obs],
             [self.env.num_actions],
+            mask_label_shape=mask_label_shape,
         )
 
         # Log
@@ -129,7 +133,10 @@ class OnPolicyRunner:
             )
         obs, extras = self.env.get_observations()
         critic_obs = extras["observations"].get("critic", obs)
+        mask_labels = extras["observations"].get("mask_label", None)
         obs, critic_obs = obs.to(self.device), critic_obs.to(self.device)
+        if mask_labels is not None:
+            mask_labels = mask_labels.to(self.device)
         self.train_mode()
 
         ep_infos = []
@@ -159,6 +166,7 @@ class OnPolicyRunner:
             with torch.no_grad():
                 for i in range(self.num_steps_per_env):
                     actions = self.alg.act(obs, critic_obs)
+                    self.alg.transition.mask_labels = mask_labels
                     obs, rewards, dones, infos = self.env.step(actions)
 
                     # Capture video frame if recording
@@ -175,6 +183,8 @@ class OnPolicyRunner:
                         critic_obs = self.critic_obs_normalizer(infos["observations"]["critic"])
                     else:
                         critic_obs = obs
+                    if "mask_label" in infos["observations"]:
+                        mask_labels = infos["observations"]["mask_label"].to(self.device)
                     obs, critic_obs, rewards, dones = (
                         obs.to(self.device),
                         critic_obs.to(self.device),
@@ -216,8 +226,11 @@ class OnPolicyRunner:
             update_result = self.alg.update(it, tot_iter)
             if self.is_mdpo:
                 mean_value_loss, mean_surrogate_loss, mean_kl_divergence = update_result
+                mean_mask_loss = 0.0
+                mean_mask_dice_loss = 0.0
+                mean_mask_positive_rate = 0.0
             else:
-                mean_value_loss, mean_surrogate_loss = update_result
+                mean_value_loss, mean_surrogate_loss, mean_mask_loss, mean_mask_dice_loss, mean_mask_positive_rate = update_result
                 mean_kl_divergence = None
 
             stop = time.time()
@@ -281,6 +294,9 @@ class OnPolicyRunner:
 
         self.writer.add_scalar("Loss/value_function", locs["mean_value_loss"], locs["it"])
         self.writer.add_scalar("Loss/surrogate", locs["mean_surrogate_loss"], locs["it"])
+        self.writer.add_scalar("Loss/mask", locs["mean_mask_loss"], locs["it"])
+        self.writer.add_scalar("Loss/mask_dice_loss", locs["mean_mask_dice_loss"], locs["it"])
+        self.writer.add_scalar("Loss/mask_positive_rate", locs["mean_mask_positive_rate"], locs["it"])
         if self.is_mdpo and locs["mean_kl_divergence"] is not None:
             self.writer.add_scalar("Loss/kl_divergence", locs["mean_kl_divergence"], locs["it"])
         self.writer.add_scalar("Loss/learning_rate", self.alg.learning_rate, locs["it"])
@@ -306,6 +322,7 @@ class OnPolicyRunner:
                 f"""{'Computation:':>{pad}} {fps:.0f} steps/s (collection: {locs['collection_time']:.3f}s, learning {locs['learn_time']:.3f}s)\n"""
                 f"""{'Value function loss:':>{pad}} {locs['mean_value_loss']:.4f}\n"""
                 f"""{'Surrogate loss:':>{pad}} {locs['mean_surrogate_loss']:.4f}\n"""
+                f"""{'Mask loss:':>{pad}} {locs['mean_mask_loss']:.4f} (dice {locs['mean_mask_dice_loss']:.4f}, pos {locs['mean_mask_positive_rate']:.4f})\n"""
             )
             if self.is_mdpo and locs["mean_kl_divergence"] is not None:
                 log_string += f"""{'KL divergence:':>{pad}} {locs['mean_kl_divergence']:.4f}\n"""
@@ -321,6 +338,7 @@ class OnPolicyRunner:
                 f"""{'Computation:':>{pad}} {fps:.0f} steps/s (collection: {locs['collection_time']:.3f}s, learning {locs['learn_time']:.3f}s)\n"""
                 f"""{'Value function loss:':>{pad}} {locs['mean_value_loss']:.4f}\n"""
                 f"""{'Surrogate loss:':>{pad}} {locs['mean_surrogate_loss']:.4f}\n"""
+                f"""{'Mask loss:':>{pad}} {locs['mean_mask_loss']:.4f} (dice {locs['mean_mask_dice_loss']:.4f}, pos {locs['mean_mask_positive_rate']:.4f})\n"""
                 f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n"""
             )
 

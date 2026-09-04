@@ -1084,6 +1084,163 @@ def depth_image_noisy_delayed(
     return packet["encoded_depth"]
 
 
+@torch.no_grad()
+def raw_depth_delayed(env, sensor_cfg):
+    """Return the raw noisy+delayed depth image, flattened.
+
+    This is the pixel-space depth (not the encoded VAE features) that the
+    dynamic-obstacle segmentation head consumes. It comes from the same delayed
+    visual packet as the encoded depth, so it is temporally aligned with the
+    actor's encoded-depth observation and with the mask label.
+
+    Returns:
+        Flattened depth ``[num_envs, H * W]`` where ``(H, W)`` is the camera
+        ``image_shape`` (currently 40 x 64 for the G1 high-level camera).
+    """
+    packet = _get_delayed_visual_packet(env, sensor_cfg)
+    return packet["depth"].flatten(start_dim=1)
+
+
+@torch.no_grad()
+def dynamic_obstacle_mask_label(
+    env,
+    sensor_cfg,
+    half_extent_m: float = 0.25,
+    half_height_m: float = 0.4,
+    depth_tol_m: float = 0.35,
+):
+    """Generate a training-only ground-truth dynamic-obstacle segmentation mask.
+
+    Projects each axis-aligned obstacle cuboid (world ``positions_w`` + half
+    extents) into the *delayed* camera frame and rasterizes its 2D silhouette,
+    marking a pixel only when the obstacle is the nearest surface (a simple
+    depth-consistency occlusion test against the delayed raw depth). The output
+    matches the raw depth resolution so it can supervise the mask head
+    pixel-for-pixel. No privileged information is needed at deployment; this term
+    only feeds the auxiliary segmentation loss during training.
+
+    Args:
+        env: The environment (must have ``_dynamic_obstacle_manager``).
+        sensor_cfg: The depth sensor configuration (same one as the depth obs).
+        half_extent_m: XY half-width of the obstacle cuboid (matches config
+            ``obstacle_body_half_extent`` = 0.25).
+        half_height_m: Z half-height of the obstacle cuboid (matches config
+            ``obstacle_half_height`` = 0.4).
+        depth_tol_m: Tolerance for the depth-consistency occlusion check.
+
+    Returns:
+        Flattened binary mask ``[num_envs, H * W]``.
+    """
+    manager = getattr(env, "_dynamic_obstacle_manager", None)
+    packet = _get_delayed_visual_packet(env, sensor_cfg)
+    depth = packet["depth"]  # [B, 1, H, W]
+    B, _, H, W = depth.shape
+    mask = torch.zeros(B, 1, H, W, device=env.device, dtype=torch.float32)
+
+    if manager is None:
+        return mask.flatten(start_dim=1)
+
+    positions = getattr(manager, "positions_w", None)  # [B, K, 3]
+    if positions is None or positions.shape[1] == 0:
+        return mask.flatten(start_dim=1)
+    K = positions.shape[1]
+
+    # Align obstacle state with the delayed camera frame: index the manager's
+    # per-step state history (positions_w + spawned) by the same visual lag as the
+    # delayed depth/camera packet. This is exact across spawn / direction-reversal
+    # / stop-and-go transitions (a velocity extrapolation would miss them).
+    positions = positions.clone()
+    spawned = getattr(manager, "spawned", torch.zeros(B, dtype=torch.bool, device=env.device)).clone()
+    lag = torch.zeros(B, device=env.device, dtype=torch.long)
+    delay_manager = getattr(env, "delay_manager", None)
+    if delay_manager is not None and getattr(delay_manager, "enabled", False):
+        buffers = getattr(delay_manager, "_delay_depth_buffers", {})
+        camera_name = sensor_cfg.name if hasattr(sensor_cfg, "name") else None
+        state = buffers.get(f"{camera_name}_visual_packet") if camera_name is not None else None
+        if state is None and len(buffers) == 1:
+            state = next(iter(buffers.values()))
+        if state is not None and getattr(state, "time_lags", None) is not None:
+            lag = state.time_lags.to(env.device)
+    pos_history = getattr(manager, "_positions_history", None)
+    spawned_history = getattr(manager, "_spawned_history", None)
+    if pos_history and spawned_history and bool(lag.any().item()):
+        # history[-1] is the current step; history[-(d+1)] is `d` steps ago.
+        for d in range(1, len(pos_history)):
+            mask_d = lag == d
+            if bool(mask_d.any().item()):
+                positions[mask_d] = pos_history[-(d + 1)][mask_d]
+                spawned[mask_d] = spawned_history[-(d + 1)][mask_d]
+
+    # Only spawned obstacles in curriculum envs are active; the rest stay parked
+    # off-camera and contribute nothing to the label.
+    active = spawned.bool()
+    curriculum = getattr(manager, "curriculum_envs", None)
+    if curriculum is not None:
+        active = active & curriculum.bool()
+    active_k = active.unsqueeze(1).expand(B, K)  # [B, K]
+
+    fx = packet["intrinsics"][:, 0, 0].clamp_min(1.0e-6)
+    fy = packet["intrinsics"][:, 1, 1].clamp_min(1.0e-6)
+    cx = packet["intrinsics"][:, 0, 2]
+    cy = packet["intrinsics"][:, 1, 2]
+
+    # Axis-aligned cuboid corners (identity orientation). The rotation matrix R
+    # maps camera->world (see LocalVisibilityMapManager.update), so world->camera
+    # is ``(p_w - cam_pos) @ R``.
+    corner_signs = torch.tensor(
+        [
+            [-1.0, -1.0, -1.0],
+            [1.0, -1.0, -1.0],
+            [-1.0, 1.0, -1.0],
+            [1.0, 1.0, -1.0],
+            [-1.0, -1.0, 1.0],
+            [1.0, -1.0, 1.0],
+            [-1.0, 1.0, 1.0],
+            [1.0, 1.0, 1.0],
+        ],
+        device=env.device,
+        dtype=positions.dtype,
+    )  # [8, 3]
+    half = torch.tensor([half_extent_m, half_extent_m, half_height_m], device=env.device, dtype=positions.dtype)
+    R = _quat_wxyz_to_matrix(packet["camera_quat_w"])  # [B, 3, 3]
+    cam_pos = packet["camera_pos_w"]  # [B, 3]
+
+    corners_w = positions.unsqueeze(2) + (corner_signs * half).unsqueeze(0).unsqueeze(0)  # [B, K, 8, 3]
+    corners_cam = torch.einsum("bkna,bac->bknc", corners_w - cam_pos.unsqueeze(1).unsqueeze(1), R)  # [B, K, 8, 3]
+    xc = corners_cam[..., 0]  # forward depth
+    yc = corners_cam[..., 1]
+    zc = corners_cam[..., 2]
+
+    col = cx.unsqueeze(1).unsqueeze(1) - fx.unsqueeze(1).unsqueeze(1) * yc / xc.clamp_min(1.0e-3)
+    row = cy.unsqueeze(1).unsqueeze(1) - fy.unsqueeze(1).unsqueeze(1) * zc / xc.clamp_min(1.0e-3)
+
+    # Obstacle is valid only if every corner is in front of the camera.
+    valid = (xc > 0.05).all(dim=-1) & active_k  # [B, K]
+    front_depth = xc.amin(dim=-1)  # [B, K] closest corner depth (front face proxy)
+
+    # Rasterize each obstacle's projected bounding box (per-env; the cuboid is only
+    # a few pixels wide so a bbox is a tight-enough silhouette). Depth consistency:
+    # mark a pixel only if the camera already sees at-or-beyond the obstacle front.
+    for k in range(K):
+        r_min = row[:, k].amin(dim=-1).clamp(0, H - 1).long()
+        r_max = row[:, k].amax(dim=-1).clamp(0, H - 1).long()
+        c_min = col[:, k].amin(dim=-1).clamp(0, W - 1).long()
+        c_max = col[:, k].amax(dim=-1).clamp(0, W - 1).long()
+        for e in range(B):
+            if not bool(valid[e, k].item()):
+                continue
+            r0, r1 = int(r_min[e].item()), int(r_max[e].item())
+            c0, c1 = int(c_min[e].item()), int(c_max[e].item())
+            ob_depth = front_depth[e, k]
+            cam_depth = depth[e, 0, r0 : r1 + 1, c0 : c1 + 1]
+            visible = cam_depth >= (ob_depth - depth_tol_m)
+            mask[e, 0, r0 : r1 + 1, c0 : c1 + 1] = torch.maximum(
+                mask[e, 0, r0 : r1 + 1, c0 : c1 + 1], visible.float()
+            )
+
+    return mask.flatten(start_dim=1)
+
+
 def local_visibility_map(
     env,
     sensor_cfg,

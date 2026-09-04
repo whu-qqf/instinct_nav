@@ -293,3 +293,29 @@ class G1InstinctNavPPODynamicMapCrossOfficialRunnerDevCfg(
         self.max_iterations = 10
         self.experiment_name = "g1_instinct_navigation_dynamic_map_cross_dev"
         self.logger = "tensorboard"
+
+
+@configclass
+class G1InstinctNavPPODynamicMaskBanksOfficialRunnerCfg(
+    G1InstinctNavPPODynamicMapCrossBanksOfficialRunnerCfg
+):
+    """DynamicMapCross-Banks + dynamic-obstacle segmentation mask head + aux loss."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.run_name = "dynamic_mask_banks_official_parkour"
+        self.policy.use_dynamic_mask = True
+        self.policy.mask_input_dims = (1, 36, 64)
+        self.policy.mask_feature_dim = 64
+        self.algorithm.lambda_mask = 0.2
+
+
+@configclass
+class G1InstinctNavPPODynamicMaskBanksOfficialRunnerDevCfg(
+    G1InstinctNavPPODynamicMaskBanksOfficialRunnerCfg
+):
+    def __post_init__(self):
+        super().__post_init__()
+        self.max_iterations = 10
+        self.experiment_name = "g1_instinct_navigation_dynamic_mask_banks_dev"
+        self.logger = "tensorboard"

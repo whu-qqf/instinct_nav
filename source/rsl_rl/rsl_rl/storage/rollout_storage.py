@@ -24,11 +24,12 @@ class RolloutStorage:
             self.action_sigma = None
             self.hidden_states = None
             self.dropout_masks = None
+            self.mask_labels = None
 
         def clear(self):
             self.__init__()
 
-    def __init__(self, num_envs, num_transitions_per_env, obs_shape, privileged_obs_shape, actions_shape, device="cpu"):
+    def __init__(self, num_envs, num_transitions_per_env, obs_shape, privileged_obs_shape, actions_shape, device="cpu", mask_label_shape=None):
         self.device = device
 
         self.obs_shape = obs_shape
@@ -54,6 +55,15 @@ class RolloutStorage:
         self.advantages = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
         self.mu = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
         self.sigma = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
+
+        # Auxiliary segmentation-mask labels (training-only supervision for the
+        # dynamic-obstacle mask head). None when the task has no mask loss.
+        if mask_label_shape is not None:
+            self.mask_labels = torch.zeros(
+                num_transitions_per_env, num_envs, *mask_label_shape, device=self.device
+            )
+        else:
+            self.mask_labels = None
 
         self.num_transitions_per_env = num_transitions_per_env
         self.num_envs = num_envs
@@ -81,6 +91,8 @@ class RolloutStorage:
         self.actions_log_prob[self.step].copy_(transition.actions_log_prob.view(-1, 1))
         self.mu[self.step].copy_(transition.action_mean)
         self.sigma[self.step].copy_(transition.action_sigma)
+        if self.mask_labels is not None and transition.mask_labels is not None:
+            self.mask_labels[self.step].copy_(transition.mask_labels)
         self._save_hidden_states(transition.hidden_states)
         self.step += 1
 
@@ -151,6 +163,7 @@ class RolloutStorage:
         advantages = self.advantages.flatten(0, 1)
         old_mu = self.mu.flatten(0, 1)
         old_sigma = self.sigma.flatten(0, 1)
+        mask_labels = self.mask_labels.flatten(0, 1) if self.mask_labels is not None else None
 
         for epoch in range(num_epochs):
             for i in range(num_mini_batches):
@@ -167,10 +180,11 @@ class RolloutStorage:
                 advantages_batch = advantages[batch_idx]
                 old_mu_batch = old_mu[batch_idx]
                 old_sigma_batch = old_sigma[batch_idx]
+                mask_labels_batch = mask_labels[batch_idx] if mask_labels is not None else None
                 yield obs_batch, critic_observations_batch, actions_batch, target_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (
                     None,
                     None,
-                ), None, None, None
+                ), None, None, None, mask_labels_batch
 
     # for RNNs only
     def reccurent_mini_batch_generator(self, num_mini_batches, num_epochs=8):
@@ -179,6 +193,10 @@ class RolloutStorage:
             padded_critic_obs_trajectories, _ = split_and_pad_trajectories(self.privileged_observations, self.dones)
         else:
             padded_critic_obs_trajectories = padded_obs_trajectories
+        if self.mask_labels is not None:
+            padded_mask_trajectories, _ = split_and_pad_trajectories(self.mask_labels, self.dones)
+        else:
+            padded_mask_trajectories = None
 
         mini_batch_size = self.num_envs // num_mini_batches
         for ep in range(num_epochs):
@@ -197,6 +215,9 @@ class RolloutStorage:
                 masks_batch = trajectory_masks[:, first_traj:last_traj]
                 obs_batch = padded_obs_trajectories[:, first_traj:last_traj]
                 critic_obs_batch = padded_critic_obs_trajectories[:, first_traj:last_traj]
+                mask_labels_batch = (
+                    padded_mask_trajectories[:, first_traj:last_traj] if padded_mask_trajectories is not None else None
+                )
 
                 actions_batch = self.actions[:, start:stop]
                 old_mu_batch = self.mu[:, start:stop]
@@ -233,6 +254,6 @@ class RolloutStorage:
                 yield obs_batch, critic_obs_batch, actions_batch, values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (
                     hid_a_batch,
                     hid_c_batch,
-                ), masks_batch, dropout_masks_a, dropout_masks_c
+                ), masks_batch, dropout_masks_a, dropout_masks_c, mask_labels_batch
 
                 first_traj = last_traj

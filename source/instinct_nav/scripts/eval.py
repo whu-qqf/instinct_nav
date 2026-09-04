@@ -383,6 +383,28 @@ parser.add_argument(
     help="Force-enable scripted dynamic obstacles for evaluation, so moving obstacles are active from the first episode.",
 )
 parser.add_argument(
+    "--force_obstacle_difficulty",
+    type=float,
+    default=None,
+    help=(
+        "When --force_dynamic_obstacles is set, pin the graded-curriculum difficulty to this "
+        "value (e.g. 1.0) for the whole evaluation. Default None leaves difficulty at its "
+        "initial 0.0 (easiest tier: 1 obstacle, slow speed, far spawn), which understates the "
+        "full-difficulty collision rate reached during training."
+    ),
+)
+parser.add_argument(
+    "--disable_dynamic_obstacles",
+    action="store_true",
+    default=False,
+    help=(
+        "Suppress the dynamic-obstacle auto-switch so the evaluation stays truly static: the "
+        "capability-triggered enable (auto_switch_success) and its fixed-iteration fallback are "
+        "both neutralized, so obstacles never pop in even when the nav success rate clears the "
+        "task's enable threshold."
+    ),
+)
+parser.add_argument(
     "--failure_rgb_gif_frame_ms",
     type=int,
     default=250,
@@ -4159,10 +4181,39 @@ def main():
                 env.unwrapped, obstacle_names=list(obstacle_names), **params
             )
             manager.enable()
+            if args_cli.force_obstacle_difficulty is not None:
+                manager.difficulty = float(args_cli.force_obstacle_difficulty)
+                manager._refresh_curriculum_envs()
+                print(
+                    f"[INFO] Dynamic obstacle difficulty pinned to {manager.difficulty:.2f} "
+                    "for evaluation."
+                )
             print("[INFO] Dynamic obstacles forced ENABLED for evaluation.")
         else:
             print(
                 "[WARN] --force_dynamic_obstacles set but task has no dynamic-obstacle "
+                "event term; ignoring."
+            )
+
+    if args_cli.disable_dynamic_obstacles:
+        from instinct_nav.navigation.mdp.dynamic_obstacles import _get_or_create_dynamic_obstacle_manager
+
+        # Neutralize the capability-triggered auto-switch and its fixed-iteration fallback so
+        # obstacles never pop in: an unreachable success threshold (2.0 > any rate in [0,1])
+        # and an unreachable iteration cap. This yields a truly static navigation eval.
+        update_term = getattr(getattr(env.unwrapped.cfg, "events", None), "dynamic_obstacles_update", None)
+        params = dict(getattr(update_term, "params", {}) or {})
+        obstacle_names = params.pop("obstacle_names", None)
+        if obstacle_names:
+            manager = _get_or_create_dynamic_obstacle_manager(
+                env.unwrapped, obstacle_names=list(obstacle_names), **params
+            )
+            manager.auto_switch_success = 2.0
+            manager.max_switch_iteration = 10 ** 9
+            print("[INFO] Dynamic obstacles DISABLED for evaluation (auto-switch suppressed).")
+        else:
+            print(
+                "[WARN] --disable_dynamic_obstacles set but task has no dynamic-obstacle "
                 "event term; ignoring."
             )
 

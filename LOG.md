@@ -6,6 +6,25 @@
 
 ---
 
+## 2026-08/09 动态障碍课程与分割 mask 工作
+
+**动态障碍避障课程（AvoidReact / Demote）**：在 `-Centerline-Unobserved-` 基础上叠加重平衡避障奖励（proximity −2.0 / approach −1.0 / 前瞻 TTC −0.5）+ 能力驱动分级课程（`dynamic_obstacles.py`）。
+
+- **`-AvoidReact-`**（P2 可见接近生成 `reactive_spawn=5m` + P3 碰撞写失败 `record_failure`）：障碍从 ≥5m 处 pop-in 接近、碰撞计入 success 失败。注册 `-AvoidReact-{Banks}` 系列。
+- **`-Demote-` 双向课程**：`demote_success=0.73 / advance_success=0.80` 死带。**结果：负**——满难度 eval 与 monotonic 基线打平（碰撞 0.073 vs 0.088、success 0.735 vs 0.745），双向降档未带来实质提升；唯一作用是让模型在扛不住满难度时退回 d≈0.6。已否决，不再投入。
+- 关键陷阱：`--force_dynamic_obstacles` 只 `enable()` 不设难度，且课程的 `_maybe_advance_difficulty` 会覆盖 `--force_obstacle_difficulty`（demote 模型会被降档）；要跑真·静态需 `--disable_dynamic_obstacles`（`eval.py` 新增，把 `auto_switch_success=2.0` + `max_switch_iteration=10^9`）。**并行跑 eval 会撞 carb mutex 卡死，eval 必须串行。**
+
+**动态障碍分割 mask（DynamicMask Phase 1，网络观测，替代"不增加网络观测"的旧约束）**：诊断发现 visibility map 是"只增不减"的 seen/unseen 记忆（`observations.py` `torch.maximum`），先天表示不了移动障碍物 → 动态避障失明。因此新增轻量分割头：
+
+- 观测：`raw_depth_delayed`（原始 36×64 延迟深度，供 mask 头）+ `dynamic_obstacle_mask_label`（训练期真值：障碍物包围盒投影到延迟相机帧 + 深度遮挡校验；用 manager 的 `positions_w`+`spawned` 状态历史按 visual lag 精确对齐）。
+- 网络：`actor_critic_sru.py` 新增 `_DynamicMaskHead`（raw depth → 64D bottleneck + sigmoid mask），64D feature 注入 actor/critic SRU 输入。
+- 训练：`rollout_storage` 存 mask label；`ppo.py` 加 `lambda_mask` BCE+Dice 辅助 loss；`on_policy_runner` 记录 `Loss/mask`、`Loss/mask_dice_loss`、`Loss/mask_positive_rate`。
+- 新 task `-AvoidReact-DynamicMask-Banks-{v0,Dev,Play}`（`lambda_mask=0.2`），默认关、旧 task 逐字节不变。
+- 注意：原始 depth 是 **36×64**（共享低层相机 `height=36`），不是 40×64；`mask_input_dims=(1,36,64)`。旧 checkpoint `strict=True` 加载会因新增 mask 头 mismatch → DynamicMask 需从头训。
+- `train_senior.py`/`train.py` 的 `_to_legacy_obs` 已改为透传 `mask_label` 观测组（此前被丢弃导致 mask loss 恒 0）。
+
+---
+
 ## 2026-07-15/16 进展记录
 
 本阶段目标从“尝试多种 MDPO/visibility/hybrid terrain 组合”收敛为：先复现师兄 G1 成功链路，再做 ablation。当前主线是：

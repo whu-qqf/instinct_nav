@@ -33,9 +33,11 @@ class PPO:
         schedule="fixed",
         desired_kl=0.01,
         device="cpu",
+        lambda_mask=0.0,
         **kwargs,
     ):
         self.device = device
+        self.lambda_mask = lambda_mask
 
         self.desired_kl = desired_kl
         self.schedule = schedule
@@ -60,9 +62,15 @@ class PPO:
         self.max_grad_norm = max_grad_norm
         self.use_clipped_value_loss = use_clipped_value_loss
 
-    def init_storage(self, num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, action_shape):
+    def init_storage(self, num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, action_shape, mask_label_shape=None):
         self.storage = RolloutStorage(
-            num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, action_shape, self.device
+            num_envs,
+            num_transitions_per_env,
+            actor_obs_shape,
+            critic_obs_shape,
+            action_shape,
+            self.device,
+            mask_label_shape=mask_label_shape,
         )
 
     def test_mode(self):
@@ -115,6 +123,9 @@ class PPO:
     def update(self, iter, max_iters):
         mean_value_loss = 0
         mean_surrogate_loss = 0
+        mean_mask_loss = 0
+        mean_mask_dice_loss = 0
+        mean_mask_positive_rate = 0
         if self.actor_critic.is_recurrent:
             generator = self.storage.reccurent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
         else:
@@ -133,6 +144,7 @@ class PPO:
             masks_batch,
             dropout_masks_a,
             dropout_masks_c,
+            mask_labels_batch,
         ) in generator:
             self.actor_critic.act(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0], dropout_masks=dropout_masks_a)
             actions_log_prob_batch = self.actor_critic.get_actions_log_prob(actions_batch)
@@ -190,6 +202,24 @@ class PPO:
 
             loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
 
+            # Auxiliary dynamic-obstacle segmentation loss (BCE + Dice) against the
+            # training-time mask label. The mask prediction is cached by the actor
+            # forward pass (self.actor_critic._mask_pred).
+            if self.lambda_mask > 0.0 and mask_labels_batch is not None and self.actor_critic._mask_pred is not None:
+                mask_pred = self.actor_critic._mask_pred.reshape(mask_labels_batch.shape)
+                if masks_batch is not None:
+                    valid = masks_batch.bool()
+                    mask_pred = mask_pred[valid]
+                    mask_labels_batch = mask_labels_batch[valid]
+                bce = torch.nn.functional.binary_cross_entropy(mask_pred, mask_labels_batch)
+                smooth = 1.0
+                intersection = (mask_pred * mask_labels_batch).sum()
+                dice = 1.0 - (2.0 * intersection + smooth) / (mask_pred.sum() + mask_labels_batch.sum() + smooth)
+                loss = loss + self.lambda_mask * (bce + dice)
+                mean_mask_loss += (bce + dice).item()
+                mean_mask_dice_loss += dice.item()
+                mean_mask_positive_rate += mask_labels_batch.mean().item()
+
             # Gradient step
             self.optimizer.zero_grad()
             loss.backward()
@@ -206,6 +236,9 @@ class PPO:
         num_updates = self.num_learning_epochs * self.num_mini_batches
         mean_value_loss /= num_updates
         mean_surrogate_loss /= num_updates
+        mean_mask_loss /= num_updates
+        mean_mask_dice_loss /= num_updates
+        mean_mask_positive_rate /= num_updates
         self.storage.clear()
 
-        return mean_value_loss, mean_surrogate_loss
+        return mean_value_loss, mean_surrogate_loss, mean_mask_loss, mean_mask_dice_loss, mean_mask_positive_rate

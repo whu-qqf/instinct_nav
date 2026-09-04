@@ -95,6 +95,16 @@ class RslRlPpoActorCriticCfg:
     use_dynamic_map_cross_attention: bool = False
     """Whether raw scene patches are fused by current-to-history cross-attention."""
 
+    use_dynamic_mask: bool = False
+    """Whether the actor/critic observations contain a raw delayed depth block that feeds
+    a dynamic-obstacle segmentation head (whose pooled feature enters the SRU input)."""
+
+    mask_input_dims: tuple[int, int, int] = (1, 36, 64)
+    """Raw delayed depth shape as (C, H, W) consumed by the mask head (G1 shared camera is 64x36)."""
+
+    mask_feature_dim: int = 64
+    """Pooled feature dimension of the mask head (injected into the SRU recurrent input)."""
+
 
 @configclass
 class RslRlPpoAlgorithmCfg:
@@ -141,6 +151,10 @@ class RslRlPpoAlgorithmCfg:
 
     max_grad_norm: float = MISSING
     """The maximum gradient norm."""
+
+    lambda_mask: float = 0.0
+    """Coefficient for the auxiliary dynamic-obstacle segmentation loss (BCE + Dice).
+    Default 0.0 disables it; only the DynamicMask tasks set a positive value."""
 
 
 @configclass
