@@ -10,6 +10,7 @@ Attention is applied in batched mode (outside RNN loop) for efficiency.
 
 from __future__ import annotations
 
+import math
 from typing import List, Optional
 
 import torch
@@ -58,6 +59,40 @@ class _DynamicMaskHead(nn.Module):
         return pooled, mask
 
 
+class _DynamicMaskEncoder(nn.Module):
+    """Encode an external binary mask while preserving coarse image location."""
+
+    def __init__(self, in_channels: int = 1, feature_dim: int = 64):
+        super().__init__()
+        self.spatial_encoder = nn.Sequential(
+            nn.Conv2d(in_channels, 16, kernel_size=3, stride=1, padding=1),
+            nn.ELU(inplace=True),
+            nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1),
+            nn.ELU(inplace=True),
+            nn.Conv2d(32, 32, kernel_size=3, stride=2, padding=1),
+            nn.ELU(inplace=True),
+            nn.AdaptiveMaxPool2d((4, 8)),
+        )
+        self.projector = nn.Sequential(
+            nn.Flatten(),
+            nn.LayerNorm(32 * 4 * 8),
+            nn.Linear(32 * 4 * 8, 128),
+            nn.ELU(inplace=True),
+            nn.Linear(128, feature_dim),
+        )
+        self.position_embedding = nn.Parameter(torch.randn(1, 32, 32) * 0.02)
+        self.attention_norm = nn.LayerNorm(32)
+        self.spatial_attention = nn.MultiheadAttention(32, 4, batch_first=True)
+
+    def forward(self, mask: torch.Tensor) -> torch.Tensor:
+        features = self.spatial_encoder(mask)
+        spatial = features.flatten(2).transpose(1, 2) + self.position_embedding
+        normalized = self.attention_norm(spatial)
+        attended, _ = self.spatial_attention(normalized, normalized, normalized, need_weights=False)
+        features = (spatial + attended).transpose(1, 2).reshape(-1, 32, 4, 8)
+        return self.projector(features)
+
+
 class ActorCriticSRU(nn.Module):
     """Actor-Critic network with SRU memory and cross-attention for image processing.
 
@@ -102,11 +137,15 @@ class ActorCriticSRU(nn.Module):
         time_embed_dim: int = 8,
         num_cameras: int = 1,
         use_actor_visibility_map: bool = False,
+        use_critic_visibility_map: bool = False,
         use_actor_visibility_early_fusion: bool = False,
         visibility_map_input_dims: tuple[int, int, int] = (1, 64, 64),
         visibility_map_feature_dim: int = 64,
         use_actor_visibility_query_attention: bool = False,
+        use_critic_visibility_query_attention: bool = False,
         visibility_map_query_num_heads: int = 4,
+        visibility_map_preserve_spatial_resolution: bool = False,
+        use_future_occupancy: bool = False,
         use_actor_scene_tokens: bool = False,
         use_critic_scene_tokens: bool = False,
         scene_token_num_tokens: int = 64,
@@ -114,9 +153,14 @@ class ActorCriticSRU(nn.Module):
         scene_token_feature_dim: int = 64,
         scene_token_query_num_heads: int = 4,
         use_dynamic_map_cross_attention: bool = False,
+        use_dynamic_scene_recurrent_fusion: bool = False,
+        dynamic_scene_recurrent_feature_dim: int = 64,
         use_dynamic_mask: bool = False,
+        dynamic_mask_input_mode: str = "predict_from_depth",
         mask_input_dims: tuple[int, int, int] = (1, 36, 64),
         mask_feature_dim: int = 64,
+        dynamic_mask_fusion_mode: str = "concat",
+        dynamic_mask_gate_init: float = 0.1,
         **kwargs,
     ):
         if kwargs:
@@ -135,6 +179,7 @@ class ActorCriticSRU(nn.Module):
         self.height_input_dims = height_input_dims
         self.num_cameras = num_cameras
         self.use_actor_visibility_map = bool(use_actor_visibility_map)
+        self.use_critic_visibility_map = bool(use_critic_visibility_map)
         self.use_actor_visibility_early_fusion = (
             bool(use_actor_visibility_early_fusion) and self.use_actor_visibility_map
         )
@@ -148,34 +193,83 @@ class ActorCriticSRU(nn.Module):
             and self.use_actor_visibility_map
             and not self.use_actor_visibility_early_fusion
         )
+        self.use_critic_visibility_query_attention = (
+            bool(use_critic_visibility_query_attention) and self.use_critic_visibility_map
+        )
         self.visibility_map_input_dims = visibility_map_input_dims
-        self.visibility_map_feature_dim = int(visibility_map_feature_dim) if self.use_actor_visibility_map else 0
+        self.visibility_map_feature_dim = (
+            int(visibility_map_feature_dim)
+            if (self.use_actor_visibility_map or self.use_critic_visibility_map)
+            else 0
+        )
         self.visibility_map_query_num_heads = int(visibility_map_query_num_heads)
+        self.visibility_map_preserve_spatial_resolution = bool(visibility_map_preserve_spatial_resolution)
+        self.use_future_occupancy = bool(use_future_occupancy)
         self.use_actor_scene_tokens = bool(use_actor_scene_tokens)
         self.use_critic_scene_tokens = use_critic_scene_tokens
         if self.use_actor_scene_tokens and self.use_actor_visibility_map:
             raise ValueError("Actor scene tokens and actor visibility map are mutually exclusive in this implementation")
+        if self.use_critic_scene_tokens and self.use_critic_visibility_map:
+            raise ValueError("Critic scene tokens and critic visibility map are mutually exclusive in this implementation")
         self.scene_token_num_tokens = int(scene_token_num_tokens)
         self.scene_token_dim = int(scene_token_dim)
         self.scene_token_feature_dim = int(scene_token_feature_dim) if (self.use_actor_scene_tokens or self.use_critic_scene_tokens) else 0
         self.scene_token_query_num_heads = int(scene_token_query_num_heads)
         self.use_dynamic_map_cross_attention = bool(use_dynamic_map_cross_attention)
-        if self.use_dynamic_map_cross_attention and self.scene_token_dim != 5:
-            raise ValueError("dynamic map cross-attention expects scene_token_dim=5")
+        if self.use_dynamic_map_cross_attention and self.scene_token_dim < 5:
+            raise ValueError("dynamic map cross-attention expects at least five scene-token channels")
+        self.use_dynamic_scene_recurrent_fusion = bool(use_dynamic_scene_recurrent_fusion)
+        self.dynamic_scene_recurrent_feature_dim = (
+            int(dynamic_scene_recurrent_feature_dim) if self.use_dynamic_scene_recurrent_fusion else 0
+        )
+        if self.use_dynamic_scene_recurrent_fusion:
+            if not (self.use_actor_scene_tokens and self.use_critic_scene_tokens):
+                raise ValueError("dynamic scene recurrent fusion requires actor and critic scene tokens")
+            if self.scene_token_dim < 6:
+                raise ValueError("dynamic scene recurrent fusion expects dynamic_presence as scene-token channel 6")
+            if self.dynamic_scene_recurrent_feature_dim <= 0:
+                raise ValueError("dynamic_scene_recurrent_feature_dim must be positive")
         self.use_dynamic_mask = bool(use_dynamic_mask)
+        self.dynamic_mask_input_mode = str(dynamic_mask_input_mode)
+        self.dynamic_mask_fusion_mode = str(dynamic_mask_fusion_mode)
+        if self.dynamic_mask_input_mode not in ("predict_from_depth", "direct_mask", "encoded_mask"):
+            raise ValueError(
+                "dynamic_mask_input_mode must be 'predict_from_depth', 'direct_mask', or 'encoded_mask', "
+                f"got {self.dynamic_mask_input_mode!r}"
+            )
+        if self.dynamic_mask_fusion_mode not in ("concat", "gated_add"):
+            raise ValueError(
+                "dynamic_mask_fusion_mode must be 'concat' or 'gated_add', "
+                f"got {self.dynamic_mask_fusion_mode!r}"
+            )
+        if not 0.0 < float(dynamic_mask_gate_init) < 1.0:
+            raise ValueError("dynamic_mask_gate_init must be strictly between 0 and 1")
         self.mask_input_dims = tuple(mask_input_dims)
-        self.mask_feature_dim = int(mask_feature_dim) if self.use_dynamic_mask else 0
         self.num_mask_input_features = (
             mask_input_dims[0] * mask_input_dims[1] * mask_input_dims[2] if self.use_dynamic_mask else 0
         )
+        if not self.use_dynamic_mask:
+            self.mask_feature_dim = 0
+        elif self.dynamic_mask_input_mode == "direct_mask":
+            # DirectMask deliberately has no learned perception encoder: the compact
+            # binary mask is flattened and appended to the recurrent input as-is.
+            self.mask_feature_dim = self.num_mask_input_features
+        else:
+            self.mask_feature_dim = int(mask_feature_dim)
 
         # Compute the total number of features from image, height, visibility, and scene-token inputs.
         self.num_image_features = image_input_dims[0] * image_input_dims[1] * image_input_dims[2]
         self.num_height_features = height_input_dims[0] * height_input_dims[1] * height_input_dims[2]
         self.num_visibility_map_features = (
             visibility_map_input_dims[0] * visibility_map_input_dims[1] * visibility_map_input_dims[2]
-            if self.use_actor_visibility_map
+            if (self.use_actor_visibility_map or self.use_critic_visibility_map)
             else 0
+        )
+        self.num_actor_visibility_map_features = (
+            self.num_visibility_map_features if self.use_actor_visibility_map else 0
+        )
+        self.num_critic_visibility_map_features = (
+            self.num_visibility_map_features if self.use_critic_visibility_map else 0
         )
         self.num_scene_token_features = (
             self.scene_token_num_tokens * self.scene_token_dim if (self.use_actor_scene_tokens or self.use_critic_scene_tokens) else 0
@@ -192,7 +286,7 @@ class ActorCriticSRU(nn.Module):
             num_actor_obs
             - self.num_image_features * self.num_cameras
             - self.num_mask_input_features
-            - self.num_visibility_map_features
+            - self.num_actor_visibility_map_features
             - self.num_actor_scene_token_features
         )
         self.critic_proprioceptive_input_dim = (
@@ -200,6 +294,7 @@ class ActorCriticSRU(nn.Module):
             - self.num_height_features
             - self.num_image_features * self.num_cameras
             - self.num_mask_input_features
+            - self.num_critic_visibility_map_features
             - self.num_critic_scene_token_features
             - 1
         )
@@ -212,7 +307,9 @@ class ActorCriticSRU(nn.Module):
         # visibility-map features before the SRU; late/query fusion append them
         # after it so explicit spatial memory stays out of the recurrent state.
         self.mlp_input_dim_actor = self.actor_proprioceptive_input_dim + image_input_dims[0]
-        if self.use_dynamic_mask:
+        if self.use_dynamic_scene_recurrent_fusion:
+            self.mlp_input_dim_actor += self.dynamic_scene_recurrent_feature_dim
+        if self.use_dynamic_mask and self.dynamic_mask_fusion_mode == "concat":
             self.mlp_input_dim_actor += self.mask_feature_dim
         if self.use_actor_visibility_early_fusion:
             self.mlp_input_dim_actor += self.visibility_map_feature_dim
@@ -224,9 +321,13 @@ class ActorCriticSRU(nn.Module):
         self.mlp_input_dim_critic = (
             self.critic_proprioceptive_input_dim + height_input_dims[0] + image_input_dims[0]
         )
-        if self.use_dynamic_mask:
+        if self.use_dynamic_scene_recurrent_fusion:
+            self.mlp_input_dim_critic += self.dynamic_scene_recurrent_feature_dim
+        if self.use_dynamic_mask and self.dynamic_mask_fusion_mode == "concat":
             self.mlp_input_dim_critic += self.mask_feature_dim
         self.critic_post_recurrent_input_dim = rnn_hidden_size + time_embed_dim
+        if self.use_critic_visibility_map:
+            self.critic_post_recurrent_input_dim += self.visibility_map_feature_dim
         if self.use_critic_scene_tokens:
             self.critic_post_recurrent_input_dim += self.scene_token_feature_dim
 
@@ -250,8 +351,13 @@ class ActorCriticSRU(nn.Module):
             num_heads=4,
             spatial_dims=(num_cameras, image_input_dims[1], image_input_dims[2]),
         )
-        if self.use_actor_visibility_map:
-            if self.use_actor_visibility_query_attention:
+        if self.use_actor_visibility_map or self.use_critic_visibility_map:
+            use_visibility_tokens = (
+                self.use_actor_visibility_query_attention or self.use_critic_visibility_query_attention
+            )
+            if use_visibility_tokens:
+                if self.visibility_map_preserve_spatial_resolution and min(visibility_map_input_dims[1:]) < 32:
+                    raise ValueError("Spatial-preserving query maps require height/width >= 32")
                 assert self.visibility_map_feature_dim % self.visibility_map_query_num_heads == 0, (
                     "visibility_map_feature_dim must be divisible by visibility_map_query_num_heads"
                 )
@@ -261,39 +367,19 @@ class ActorCriticSRU(nn.Module):
                     get_activation(activation),
                     nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1),
                     get_activation(activation),
-                    nn.Conv2d(32, self.visibility_map_feature_dim, kernel_size=3, stride=2, padding=1),
+                    nn.Conv2d(32, self.visibility_map_feature_dim, kernel_size=3,
+                              stride=1 if self.visibility_map_preserve_spatial_resolution else 2, padding=1),
                     get_activation(activation),
                     nn.AdaptiveAvgPool2d((8, 8)),
                 )
                 self.visibility_map_position_embedding = nn.Parameter(
                     torch.zeros(1, self.visibility_map_num_tokens, self.visibility_map_feature_dim)
                 )
-                self.visibility_query_proj = nn.Sequential(
-                    nn.Linear(rnn_hidden_size + self.actor_proprioceptive_input_dim, self.visibility_map_feature_dim),
-                    get_activation(activation),
-                    nn.Linear(self.visibility_map_feature_dim, self.visibility_map_feature_dim),
-                )
                 self.visibility_token_norm = nn.LayerNorm(self.visibility_map_feature_dim)
-                self.visibility_query_norm = nn.LayerNorm(self.visibility_map_feature_dim)
-                self.visibility_cross_attention = nn.MultiheadAttention(
-                    embed_dim=self.visibility_map_feature_dim,
-                    num_heads=self.visibility_map_query_num_heads,
-                    batch_first=True,
-                )
-                self.visibility_attention_ffn = nn.Sequential(
-                    nn.LayerNorm(self.visibility_map_feature_dim),
-                    nn.Linear(self.visibility_map_feature_dim, self.visibility_map_feature_dim * 2),
-                    get_activation(activation),
-                    nn.Linear(self.visibility_map_feature_dim * 2, self.visibility_map_feature_dim),
-                )
             else:
                 self.visibility_map_num_tokens = 0
-                self.visibility_query_proj = None
-                self.visibility_token_norm = None
-                self.visibility_query_norm = None
-                self.visibility_cross_attention = None
-                self.visibility_attention_ffn = None
                 self.visibility_map_position_embedding = None
+                self.visibility_token_norm = None
                 activation_layer = get_activation(activation)
                 self.visibility_map_encoder = nn.Sequential(
                     nn.Conv2d(visibility_map_input_dims[0], 16, kernel_size=5, stride=2, padding=2),
@@ -307,6 +393,54 @@ class ActorCriticSRU(nn.Module):
                     nn.Linear(32 * 4 * 4, self.visibility_map_feature_dim),
                     get_activation(activation),
                 )
+
+            if self.use_actor_visibility_query_attention:
+                self.visibility_query_proj = nn.Sequential(
+                    nn.Linear(rnn_hidden_size + self.actor_proprioceptive_input_dim, self.visibility_map_feature_dim),
+                    get_activation(activation),
+                    nn.Linear(self.visibility_map_feature_dim, self.visibility_map_feature_dim),
+                )
+                self.visibility_query_norm = nn.LayerNorm(self.visibility_map_feature_dim)
+                self.visibility_cross_attention = nn.MultiheadAttention(
+                    embed_dim=self.visibility_map_feature_dim,
+                    num_heads=self.visibility_map_query_num_heads,
+                    batch_first=True,
+                )
+                self.visibility_attention_ffn = nn.Sequential(
+                    nn.LayerNorm(self.visibility_map_feature_dim),
+                    nn.Linear(self.visibility_map_feature_dim, self.visibility_map_feature_dim * 2),
+                    get_activation(activation),
+                    nn.Linear(self.visibility_map_feature_dim * 2, self.visibility_map_feature_dim),
+                )
+            else:
+                self.visibility_query_proj = None
+                self.visibility_query_norm = None
+                self.visibility_cross_attention = None
+                self.visibility_attention_ffn = None
+
+            if self.use_critic_visibility_query_attention:
+                self.critic_visibility_query_proj = nn.Sequential(
+                    nn.Linear(rnn_hidden_size + self.critic_proprioceptive_input_dim, self.visibility_map_feature_dim),
+                    get_activation(activation),
+                    nn.Linear(self.visibility_map_feature_dim, self.visibility_map_feature_dim),
+                )
+                self.critic_visibility_query_norm = nn.LayerNorm(self.visibility_map_feature_dim)
+                self.critic_visibility_cross_attention = nn.MultiheadAttention(
+                    embed_dim=self.visibility_map_feature_dim,
+                    num_heads=self.visibility_map_query_num_heads,
+                    batch_first=True,
+                )
+                self.critic_visibility_attention_ffn = nn.Sequential(
+                    nn.LayerNorm(self.visibility_map_feature_dim),
+                    nn.Linear(self.visibility_map_feature_dim, self.visibility_map_feature_dim * 2),
+                    get_activation(activation),
+                    nn.Linear(self.visibility_map_feature_dim * 2, self.visibility_map_feature_dim),
+                )
+            else:
+                self.critic_visibility_query_proj = None
+                self.critic_visibility_query_norm = None
+                self.critic_visibility_cross_attention = None
+                self.critic_visibility_attention_ffn = None
         else:
             self.visibility_map_encoder = None
             self.visibility_map_num_tokens = 0
@@ -316,6 +450,10 @@ class ActorCriticSRU(nn.Module):
             self.visibility_cross_attention = None
             self.visibility_attention_ffn = None
             self.visibility_map_position_embedding = None
+            self.critic_visibility_query_proj = None
+            self.critic_visibility_query_norm = None
+            self.critic_visibility_cross_attention = None
+            self.critic_visibility_attention_ffn = None
 
         if self.use_actor_scene_tokens or self.use_critic_scene_tokens:
             if self.scene_token_feature_dim % self.scene_token_query_num_heads != 0:
@@ -335,7 +473,8 @@ class ActorCriticSRU(nn.Module):
                     nn.Linear(self.scene_token_feature_dim, self.scene_token_feature_dim),
                 )
                 self.current_map_projector = nn.Sequential(
-                    nn.Linear(4, self.scene_token_feature_dim), get_activation(activation),
+                    nn.Linear(self.scene_token_dim - 1, self.scene_token_feature_dim),
+                    get_activation(activation),
                     nn.Linear(self.scene_token_feature_dim, self.scene_token_feature_dim),
                 )
                 self.map_cross_attention = nn.MultiheadAttention(
@@ -357,6 +496,32 @@ class ActorCriticSRU(nn.Module):
             self.scene_token_norm = None
             self.history_map_projector = self.current_map_projector = None
             self.map_cross_attention = self.map_cross_norm = self.map_cross_ffn = None
+
+        if self.use_dynamic_scene_recurrent_fusion:
+            self.dynamic_scene_token_projector = nn.Sequential(
+                nn.Linear(self.scene_token_dim, self.scene_token_feature_dim),
+                get_activation(activation),
+                nn.Linear(self.scene_token_feature_dim, self.scene_token_feature_dim),
+            )
+            self.dynamic_scene_null_token = nn.Parameter(
+                torch.zeros(1, 1, self.scene_token_feature_dim)
+            )
+            self.dynamic_scene_attention_score = nn.Sequential(
+                nn.LayerNorm(self.scene_token_feature_dim),
+                nn.Linear(self.scene_token_feature_dim, self.scene_token_feature_dim),
+                get_activation(activation),
+                nn.Linear(self.scene_token_feature_dim, 1),
+            )
+            self.dynamic_scene_recurrent_projector = nn.Sequential(
+                nn.Linear(self.scene_token_feature_dim, self.dynamic_scene_recurrent_feature_dim),
+                get_activation(activation),
+                nn.LayerNorm(self.dynamic_scene_recurrent_feature_dim),
+            )
+        else:
+            self.dynamic_scene_token_projector = None
+            self.dynamic_scene_null_token = None
+            self.dynamic_scene_attention_score = None
+            self.dynamic_scene_recurrent_projector = None
 
         if self.use_actor_scene_tokens:
             self.scene_query_proj = nn.Sequential(
@@ -406,17 +571,65 @@ class ActorCriticSRU(nn.Module):
             self.critic_scene_cross_attention = None
             self.critic_scene_attention_ffn = None
 
-        # Dynamic-obstacle segmentation head (shared by actor and critic). Its
-        # pooled feature enters the SRU recurrent input; its sigmoid mask is
-        # supervised by the training-time obstacle mask label (auxiliary loss).
-        if self.use_dynamic_mask:
+        # The legacy DynamicMask mode predicts a mask from raw depth and trains
+        # it with an auxiliary loss. DirectMask consumes an externally supplied
+        # compact mask as-is, matching the deployment contract for YOLO output.
+        if self.use_dynamic_mask and self.dynamic_mask_input_mode == "predict_from_depth":
             self.mask_head = _DynamicMaskHead(
                 in_channels=mask_input_dims[0],
                 feature_dim=self.mask_feature_dim,
             )
         else:
             self.mask_head = None
+        if self.use_dynamic_mask and self.dynamic_mask_input_mode == "encoded_mask":
+            self.mask_encoder = _DynamicMaskEncoder(
+                in_channels=mask_input_dims[0],
+                feature_dim=self.mask_feature_dim,
+            )
+        else:
+            self.mask_encoder = None
+        if self.use_dynamic_mask and self.dynamic_mask_fusion_mode == "gated_add":
+            gate_bias = math.log(float(dynamic_mask_gate_init) / (1.0 - float(dynamic_mask_gate_init)))
+            self.actor_mask_adapter = nn.Sequential(
+                nn.LayerNorm(self.mask_feature_dim),
+                nn.Linear(self.mask_feature_dim, image_input_dims[0]),
+            )
+            self.critic_mask_adapter = nn.Sequential(
+                nn.LayerNorm(self.mask_feature_dim),
+                nn.Linear(self.mask_feature_dim, image_input_dims[0]),
+            )
+            self.actor_mask_gate = nn.Sequential(
+                nn.LayerNorm(self.mask_feature_dim),
+                nn.Linear(self.mask_feature_dim, 1),
+                nn.Sigmoid(),
+            )
+            self.critic_mask_gate = nn.Sequential(
+                nn.LayerNorm(self.mask_feature_dim),
+                nn.Linear(self.mask_feature_dim, 1),
+                nn.Sigmoid(),
+            )
+            nn.init.zeros_(self.actor_mask_gate[1].weight)
+            nn.init.constant_(self.actor_mask_gate[1].bias, gate_bias)
+            nn.init.zeros_(self.critic_mask_gate[1].weight)
+            nn.init.constant_(self.critic_mask_gate[1].bias, gate_bias)
+            self.actor_mask_fusion_norm = nn.LayerNorm(image_input_dims[0])
+            self.critic_mask_fusion_norm = nn.LayerNorm(image_input_dims[0])
+        else:
+            self.actor_mask_adapter = None
+            self.critic_mask_adapter = None
+            self.actor_mask_gate = None
+            self.critic_mask_gate = None
+            self.actor_mask_fusion_norm = None
+            self.critic_mask_fusion_norm = None
         self._mask_pred = None
+        self._last_actor_mask_gate_mean = None
+        self._last_critic_mask_gate_mean = None
+        if self.use_dynamic_mask:
+            print(
+                "[ActorCriticSRU] Dynamic mask: "
+                f"input_mode={self.dynamic_mask_input_mode}, fusion={self.dynamic_mask_fusion_mode}, "
+                f"feature_dim={self.mask_feature_dim}"
+            )
 
         # RNN memory modules (plain LSTM_SRU without attention)
         self.memory_a = MemorySRU(
@@ -475,6 +688,16 @@ class ActorCriticSRU(nn.Module):
                 f"[ActorCriticSRU] Actor visibility map branch: {branch_name}, "
                 f"input={self.visibility_map_input_dims}, feature_dim={self.visibility_map_feature_dim}"
             )
+        if self.use_critic_visibility_map:
+            branch_name = (
+                "query-attention late fusion"
+                if self.use_critic_visibility_query_attention
+                else "late fusion"
+            )
+            print(
+                f"[ActorCriticSRU] Critic visibility map branch: {branch_name}, "
+                f"input={self.visibility_map_input_dims}, feature_dim={self.visibility_map_feature_dim}"
+            )
         if self.use_actor_scene_tokens:
             print(
                 f"[ActorCriticSRU] Actor scene-token branch: query-attention late fusion, "
@@ -483,6 +706,25 @@ class ActorCriticSRU(nn.Module):
             )
             if self.use_dynamic_map_cross_attention:
                 print("[ActorCriticSRU] Scene tokens learned by current-to-history map cross-attention")
+            if self.use_dynamic_scene_recurrent_fusion:
+                print(
+                    "[ActorCriticSRU] Dynamic scene recurrent fusion: "
+                    f"presence-weighted pooling -> {self.dynamic_scene_recurrent_feature_dim}D actor/critic SRU input"
+                )
+        self.future_occupancy_head = None
+        if self.use_future_occupancy:
+            if not self.use_actor_visibility_query_attention or not self.visibility_map_preserve_spatial_resolution:
+                raise ValueError("Future occupancy requires spatial-preserving actor BEV query fusion")
+            if tuple(self.visibility_map_input_dims) != (6, 32, 32):
+                raise ValueError("Future occupancy supervision requires the six-channel 32x32 MotionBEV layout")
+            self.future_occupancy_head = nn.Sequential(
+                nn.ConvTranspose2d(self.visibility_map_feature_dim, 32, 4, 2, 1),
+                get_activation(activation),
+                nn.ConvTranspose2d(32, 16, 4, 2, 1),
+                get_activation(activation),
+                nn.Conv2d(16, 2, 1),
+            )
+            nn.init.constant_(self.future_occupancy_head[-1].bias, math.log(0.02 / 0.98))
         # Action noise: using log_std parameter
         self.log_std = nn.Parameter(torch.log(init_noise_std * torch.ones(num_actions)))
         self.distribution = None
@@ -510,6 +752,11 @@ class ActorCriticSRU(nn.Module):
                 scene_parameters += list(self.map_cross_attention.parameters())
                 scene_parameters += list(self.map_cross_norm.parameters())
                 scene_parameters += list(self.map_cross_ffn.parameters())
+            if self.use_dynamic_scene_recurrent_fusion:
+                scene_parameters += list(self.dynamic_scene_token_projector.parameters())
+                scene_parameters += [self.dynamic_scene_null_token]
+                scene_parameters += list(self.dynamic_scene_attention_score.parameters())
+                scene_parameters += list(self.dynamic_scene_recurrent_projector.parameters())
             if self.use_actor_scene_tokens:
                 scene_parameters += list(self.scene_query_proj.parameters())
                 scene_parameters += list(self.scene_query_norm.parameters())
@@ -523,18 +770,44 @@ class ActorCriticSRU(nn.Module):
         return (
             list(self.attn_image_net.parameters())
             + visibility_parameters
+            + (list(self.future_occupancy_head.parameters()) if self.future_occupancy_head is not None else [])
             + scene_parameters
             + (list(self.mask_head.parameters()) if self.mask_head is not None else [])
+            + (list(self.mask_encoder.parameters()) if self.mask_encoder is not None else [])
+            + (list(self.actor_mask_adapter.parameters()) if self.actor_mask_adapter is not None else [])
+            + (list(self.actor_mask_gate.parameters()) if self.actor_mask_gate is not None else [])
+            + (list(self.actor_mask_fusion_norm.parameters()) if self.actor_mask_fusion_norm is not None else [])
             + list(self.linear_dropout_actor.parameters())
             + list(self.actor.parameters())
             + list(self.memory_a.parameters())
             + [self.log_std]
         )
 
+    def predict_future_occupancy(self, actor_observations):
+        """Training-only prediction, sharing only the actor's learned BEV encoder."""
+        if self.future_occupancy_head is None:
+            raise RuntimeError("Future occupancy head is disabled")
+        bev = self._extract_actor_visibility_map(actor_observations)
+        features = self.visibility_map_encoder(bev)
+        logits = self.future_occupancy_head(features)
+        return torch.nn.functional.interpolate(
+            logits, size=self.visibility_map_input_dims[1:], mode="bilinear", align_corners=False
+        )
+
     def get_critic_parameters(self):
+        visibility_parameters = []
+        if self.use_critic_visibility_query_attention:
+            visibility_parameters += list(self.critic_visibility_query_proj.parameters())
+            visibility_parameters += list(self.critic_visibility_query_norm.parameters())
+            visibility_parameters += list(self.critic_visibility_cross_attention.parameters())
+            visibility_parameters += list(self.critic_visibility_attention_ffn.parameters())
         return (
             list(self.attn_height_net.parameters())
             + list(self.attn_critic_image_net.parameters())
+            + visibility_parameters
+            + (list(self.critic_mask_adapter.parameters()) if self.critic_mask_adapter is not None else [])
+            + (list(self.critic_mask_gate.parameters()) if self.critic_mask_gate is not None else [])
+            + (list(self.critic_mask_fusion_norm.parameters()) if self.critic_mask_fusion_norm is not None else [])
             + list(self.linear_dropout_critic.parameters())
             + list(self.time_layer.parameters())
             + list(self.critic.parameters())
@@ -600,7 +873,19 @@ class ActorCriticSRU(nn.Module):
     def _extract_actor_visibility_map(self, observations: torch.Tensor) -> torch.Tensor | None:
         if not self.use_actor_visibility_map:
             return None
-        visibility_obs = observations[..., -self.num_visibility_map_features :]
+        trailing = self.num_actor_scene_token_features + self.num_mask_input_features
+        start = -(self.num_actor_visibility_map_features + trailing)
+        end = None if trailing == 0 else -trailing
+        visibility_obs = observations[..., start:end]
+        return visibility_obs.reshape(-1, *self.visibility_map_input_dims)
+
+    def _extract_critic_visibility_map(self, observations: torch.Tensor) -> torch.Tensor | None:
+        if not self.use_critic_visibility_map:
+            return None
+        trailing = self.num_critic_scene_token_features + self.num_mask_input_features
+        start = -(self.num_critic_visibility_map_features + trailing)
+        end = None if trailing == 0 else -trailing
+        visibility_obs = observations[..., start:end]
         return visibility_obs.reshape(-1, *self.visibility_map_input_dims)
 
     def _extract_actor_scene_tokens(self, observations: torch.Tensor) -> torch.Tensor | None:
@@ -623,11 +908,44 @@ class ActorCriticSRU(nn.Module):
             scene_obs = observations[..., -self.num_critic_scene_token_features :]
         return scene_obs.reshape(-1, self.scene_token_num_tokens, self.scene_token_dim)
 
-    def _extract_raw_depth(self, observations: torch.Tensor) -> torch.Tensor | None:
+    def _extract_dynamic_mask_input(self, observations: torch.Tensor) -> torch.Tensor | None:
         if not self.use_dynamic_mask:
             return None
         raw = observations[..., -self.num_mask_input_features :]
         return raw.reshape(-1, *self.mask_input_dims)
+
+    def _encode_dynamic_mask_input(
+        self, mask_input: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if self.dynamic_mask_input_mode == "direct_mask":
+            return mask_input.flatten(start_dim=1), None
+        if self.dynamic_mask_input_mode == "encoded_mask":
+            if self.mask_encoder is None:
+                raise RuntimeError("Encoded mask mode requires mask_encoder")
+            return self.mask_encoder(mask_input), None
+        if self.mask_head is None:
+            raise RuntimeError("Dynamic mask prediction mode requires mask_head")
+        return self.mask_head(mask_input)
+
+    def _fuse_dynamic_mask_with_depth(
+        self,
+        depth_feature: torch.Tensor,
+        mask_feature: torch.Tensor,
+        *,
+        actor: bool,
+    ) -> torch.Tensor:
+        """Apply a bounded mask residual in the actor or critic depth-feature space."""
+        adapter = self.actor_mask_adapter if actor else self.critic_mask_adapter
+        gate = self.actor_mask_gate if actor else self.critic_mask_gate
+        norm = self.actor_mask_fusion_norm if actor else self.critic_mask_fusion_norm
+        if adapter is None or gate is None or norm is None:
+            raise RuntimeError("Gated-add mask fusion modules are not initialized")
+        gate_value = gate(mask_feature)
+        if actor:
+            self._last_actor_mask_gate_mean = gate_value.detach().mean()
+        else:
+            self._last_critic_mask_gate_mean = gate_value.detach().mean()
+        return norm(depth_feature + gate_value * adapter(mask_feature))
 
     @staticmethod
     def _match_recurrent_shape(features: torch.Tensor, recurrent_features: torch.Tensor) -> torch.Tensor:
@@ -653,6 +971,25 @@ class ActorCriticSRU(nn.Module):
         attended, _ = self.visibility_cross_attention(query, tokens, tokens, need_weights=False)
         visibility_features = attended.squeeze(1)
         visibility_features = visibility_features + self.visibility_attention_ffn(visibility_features)
+        return visibility_features.reshape(*leading_shape, self.visibility_map_feature_dim)
+
+    def _query_critic_visibility_map(
+        self, visibility_tokens: torch.Tensor, recurrent_features: torch.Tensor, proprio_features: torch.Tensor
+    ) -> torch.Tensor:
+        leading_shape = recurrent_features.shape[:-1]
+        flat_tokens = visibility_tokens.reshape(-1, self.visibility_map_num_tokens, self.visibility_map_feature_dim)
+        flat_context = torch.cat([recurrent_features, proprio_features], dim=-1).reshape(
+            -1, recurrent_features.shape[-1] + proprio_features.shape[-1]
+        )
+        tokens = flat_tokens + self.visibility_map_position_embedding.to(
+            device=flat_tokens.device, dtype=flat_tokens.dtype
+        )
+        query = self.critic_visibility_query_proj(flat_context).unsqueeze(1)
+        query = self.critic_visibility_query_norm(query)
+        tokens = self.visibility_token_norm(tokens)
+        attended, _ = self.critic_visibility_cross_attention(query, tokens, tokens, need_weights=False)
+        visibility_features = attended.squeeze(1)
+        visibility_features = visibility_features + self.critic_visibility_attention_ffn(visibility_features)
         return visibility_features.reshape(*leading_shape, self.visibility_map_feature_dim)
 
     def _query_actor_scene_tokens(
@@ -703,6 +1040,31 @@ class ActorCriticSRU(nn.Module):
         learned = self.map_cross_norm(current + attended)
         return learned + self.map_cross_ffn(learned)
 
+    def _pool_dynamic_scene_tokens(self, scene_tokens: torch.Tensor) -> torch.Tensor:
+        """Pool current dynamic BEV cells into a compact recurrent context.
+
+        The sixth raw token channel is current-only dynamic presence. Its value
+        acts as a soft prior on learned attention weights. A learned null token
+        keeps the no-detection case well-defined without confusing it with a
+        all-zero dynamic-mask case numerically stable.
+        """
+        flat_tokens = scene_tokens.reshape(-1, self.scene_token_num_tokens, self.scene_token_dim)
+        presence = flat_tokens[..., 5:6].clamp(0.0, 1.0)
+        tokens = self.dynamic_scene_token_projector(flat_tokens)
+        tokens = tokens + self.scene_token_position_embedding.to(device=tokens.device, dtype=tokens.dtype)
+        tokens = self.scene_token_norm(tokens)
+
+        null_token = self.dynamic_scene_null_token.to(device=tokens.device, dtype=tokens.dtype).expand(
+            tokens.shape[0], -1, -1
+        )
+        candidates = torch.cat([null_token, tokens], dim=1)
+        scores = self.dynamic_scene_attention_score(candidates)
+        presence_prior = torch.cat([torch.ones_like(presence[:, :1]), presence], dim=1)
+        scores = scores + torch.log(presence_prior.clamp_min(1.0e-6))
+        weights = torch.softmax(scores, dim=1)
+        pooled = torch.sum(weights * candidates, dim=1)
+        return self.dynamic_scene_recurrent_projector(pooled)
+
     def process_actor_input(self, observations: torch.Tensor, masks, hidden_states) -> torch.Tensor:
         """Process actor observations through attention and RNN.
 
@@ -723,19 +1085,22 @@ class ActorCriticSRU(nn.Module):
         visual_tail_features = (
             self.num_image_features * self.num_cameras
             + self.num_mask_input_features
-            + self.num_visibility_map_features
+            + self.num_actor_visibility_map_features
             + self.num_actor_scene_token_features
         )
         other_obs = observations[..., : -visual_tail_features]
         image_list = self._extract_image_observations(
             observations,
             trailing_features=self.num_mask_input_features
-            + self.num_visibility_map_features
+            + self.num_actor_visibility_map_features
             + self.num_actor_scene_token_features,
         )
         visibility_obs = self._extract_actor_visibility_map(observations)
         scene_tokens = self._extract_actor_scene_tokens(observations)
-        raw_depth = self._extract_raw_depth(observations)
+        dynamic_scene_features = None
+        if self.use_dynamic_scene_recurrent_fusion:
+            dynamic_scene_features = self._pool_dynamic_scene_tokens(scene_tokens)
+        mask_input = self._extract_dynamic_mask_input(observations)
         other_obs = other_obs.reshape(-1, self.actor_proprioceptive_input_dim)
 
         # Stack images if multiple cameras, otherwise use single image
@@ -749,17 +1114,18 @@ class ActorCriticSRU(nn.Module):
         visibility_features = None
         visibility_tokens = None
         if visibility_obs is not None:
-            visibility_encoded = self.visibility_map_encoder(visibility_obs)
+            visibility_encoded = self.encode_actor_visibility_map(visibility_obs)
             if self.use_actor_visibility_query_attention:
                 visibility_tokens = visibility_encoded.flatten(2).transpose(1, 2)
             else:
                 visibility_features = visibility_encoded
 
-        # Dynamic-obstacle mask head: pooled feature -> SRU input; mask -> aux loss.
+        # Predicted mode uses the learned depth-to-mask head; direct mode appends
+        # the compact external mask without a learned perception encoder.
         mask_feature = None
-        if raw_depth is not None:
-            mask_feature, mask_pred = self.mask_head(raw_depth)
-            self._mask_pred = mask_pred
+        self._mask_pred = None
+        if mask_input is not None:
+            mask_feature, self._mask_pred = self._encode_dynamic_mask_input(mask_input)
 
         # Reshape for batch mode
         if batch_mode:
@@ -771,9 +1137,17 @@ class ActorCriticSRU(nn.Module):
                 visibility_tokens = visibility_tokens.reshape(seq_len, batch_size, -1)
             if scene_tokens is not None:
                 scene_tokens = scene_tokens.reshape(seq_len, batch_size, -1)
+            if dynamic_scene_features is not None:
+                dynamic_scene_features = dynamic_scene_features.view(seq_len, batch_size, -1)
             if mask_feature is not None:
                 mask_feature = mask_feature.view(seq_len, batch_size, -1)
             other_obs = other_obs.view(seq_len, batch_size, -1)
+
+        if mask_feature is not None and self.dynamic_mask_fusion_mode == "gated_add":
+            image_features = self._fuse_dynamic_mask_with_depth(
+                image_features, mask_feature, actor=True
+            )
+            mask_feature = None
 
         # The recurrent actor state is based on the baseline observation stream,
         # except in early fusion where visibility features are recurrent input.
@@ -784,6 +1158,8 @@ class ActorCriticSRU(nn.Module):
             combined_features = torch.cat([image_features, other_obs], dim=-1)
         if mask_feature is not None:
             combined_features = torch.cat([combined_features, mask_feature], dim=-1)
+        if dynamic_scene_features is not None:
+            combined_features = torch.cat([combined_features, dynamic_scene_features], dim=-1)
 
         # RNN processing
         combined_features = self.memory_a(combined_features, masks, hidden_states)
@@ -824,6 +1200,9 @@ class ActorCriticSRU(nn.Module):
 
         return combined_features
 
+    def encode_actor_visibility_map(self, visibility_obs):
+        return self.visibility_map_encoder(visibility_obs)
+
     def process_critic_input(self, observations: torch.Tensor, masks, hidden_states) -> torch.Tensor:
         """Process critic observations through attention and RNN.
 
@@ -840,10 +1219,18 @@ class ActorCriticSRU(nn.Module):
         """
         batch_mode = masks is not None
 
-        # Critic observation layout is: proprio | time | height | depth | optional scene_tokens | optional raw depth.
+        # Critic layout: proprio | time | height | depth | optional visibility | scene | mask.
+        visibility_obs = self._extract_critic_visibility_map(observations)
         scene_tokens = self._extract_critic_scene_tokens(observations)
-        raw_depth = self._extract_raw_depth(observations)
-        trailing_features = self.num_critic_scene_token_features + self.num_mask_input_features
+        dynamic_scene_features = None
+        if self.use_dynamic_scene_recurrent_fusion:
+            dynamic_scene_features = self._pool_dynamic_scene_tokens(scene_tokens)
+        mask_input = self._extract_dynamic_mask_input(observations)
+        trailing_features = (
+            self.num_critic_visibility_map_features
+            + self.num_critic_scene_token_features
+            + self.num_mask_input_features
+        )
         depth_start_from_end = self.num_image_features * self.num_cameras + trailing_features
         height_start_from_end = self.num_height_features + depth_start_from_end
         time_index_from_end = height_start_from_end + 1
@@ -866,13 +1253,20 @@ class ActorCriticSRU(nn.Module):
         # Batched attention (process all timesteps at once)
         height_features = self.attn_height_net(height_obs, other_obs)
         image_features = self.attn_critic_image_net(image_input, other_obs)
+        visibility_features = None
+        visibility_tokens = None
+        if visibility_obs is not None:
+            visibility_encoded = self.visibility_map_encoder(visibility_obs)
+            if self.use_critic_visibility_query_attention:
+                visibility_tokens = visibility_encoded.flatten(2).transpose(1, 2)
+            else:
+                visibility_features = visibility_encoded
 
-        # Dynamic-obstacle mask head (shared with the actor). Only the pooled feature
-        # is used here for the critic SRU input; the mask prediction for the aux loss is
-        # cached by the actor pass.
+        # Actor and critic share the predicted-mode mask head. In direct mode,
+        # both consume the same cached compact observation without an encoder.
         mask_feature = None
-        if raw_depth is not None:
-            mask_feature, _ = self.mask_head(raw_depth)
+        if mask_input is not None:
+            mask_feature, _ = self._encode_dynamic_mask_input(mask_input)
 
         # Reshape for batch mode
         if batch_mode:
@@ -880,10 +1274,22 @@ class ActorCriticSRU(nn.Module):
             height_features = height_features.view(seq_len, batch_size, -1)
             image_features = image_features.view(seq_len, batch_size, -1)
             other_obs = other_obs.view(seq_len, batch_size, -1)
+            if visibility_features is not None:
+                visibility_features = visibility_features.view(seq_len, batch_size, -1)
+            if visibility_tokens is not None:
+                visibility_tokens = visibility_tokens.reshape(seq_len, batch_size, -1)
             if scene_tokens is not None:
                 scene_tokens = scene_tokens.reshape(seq_len, batch_size, -1)
+            if dynamic_scene_features is not None:
+                dynamic_scene_features = dynamic_scene_features.view(seq_len, batch_size, -1)
             if mask_feature is not None:
                 mask_feature = mask_feature.view(seq_len, batch_size, -1)
+
+        if mask_feature is not None and self.dynamic_mask_fusion_mode == "gated_add":
+            image_features = self._fuse_dynamic_mask_with_depth(
+                image_features, mask_feature, actor=False
+            )
+            mask_feature = None
 
         # Time embedding for the critic
         time_embed = self.time_layer(time_obs)
@@ -892,6 +1298,8 @@ class ActorCriticSRU(nn.Module):
         combined_features = torch.cat([height_features, image_features, other_obs], dim=-1)
         if mask_feature is not None:
             combined_features = torch.cat([combined_features, mask_feature], dim=-1)
+        if dynamic_scene_features is not None:
+            combined_features = torch.cat([combined_features, dynamic_scene_features], dim=-1)
 
         # RNN processing
         combined_features = self.memory_c(combined_features, masks, hidden_states).squeeze(0)
@@ -899,6 +1307,26 @@ class ActorCriticSRU(nn.Module):
         if batch_mode:
             time_embed = unpad_trajectories(time_embed, masks)
             time_embed = self._match_recurrent_shape(time_embed, combined_features)
+
+        if visibility_features is not None:
+            if batch_mode:
+                visibility_features = unpad_trajectories(visibility_features, masks)
+                visibility_features = self._match_recurrent_shape(visibility_features, combined_features)
+            combined_features = torch.cat([combined_features, visibility_features], dim=-1)
+        elif visibility_tokens is not None:
+            proprio_features = other_obs
+            if batch_mode:
+                proprio_features = unpad_trajectories(proprio_features, masks)
+                proprio_features = self._match_recurrent_shape(proprio_features, combined_features)
+                visibility_tokens = unpad_trajectories(visibility_tokens, masks)
+                visibility_tokens = self._match_recurrent_shape(visibility_tokens, combined_features)
+            visibility_tokens = visibility_tokens.reshape(
+                *combined_features.shape[:-1], self.visibility_map_num_tokens, self.visibility_map_feature_dim
+            )
+            visibility_features = self._query_critic_visibility_map(
+                visibility_tokens, combined_features, proprio_features
+            )
+            combined_features = torch.cat([combined_features, visibility_features], dim=-1)
 
         if scene_tokens is not None:
             proprio_features = other_obs

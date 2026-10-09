@@ -52,7 +52,7 @@ class WandbSummaryWriter(SummaryWriter):
         # Set wandb run name to match the log directory name
         wandb.run.name = run_name
 
-        wandb.log({"log_dir": run_name})
+        wandb.log({"log_dir": run_name}, step=0, commit=False)
 
     def store_config(self, env_cfg, runner_cfg, alg_cfg, policy_cfg):
         wandb.config.update({"runner_cfg": runner_cfg})
@@ -74,7 +74,8 @@ class WandbSummaryWriter(SummaryWriter):
             walltime=walltime,
             new_style=new_style,
         )
-        wandb.log({self._map_path(tag): scalar_value}, step=global_step)
+        # Commit implicitly when the next iteration arrives, not after each scalar.
+        wandb.log({self._map_path(tag): scalar_value}, step=global_step, commit=False)
 
     def stop(self):
         wandb.finish()
@@ -122,5 +123,5 @@ class WandbSummaryWriter(SummaryWriter):
 
         # Create wandb video and log
         video = wandb.Video(frames, fps=fps, format="mp4")
-        wandb.log({tag: video}, step=step)
+        wandb.log({tag: video}, step=step, commit=False)
         return True

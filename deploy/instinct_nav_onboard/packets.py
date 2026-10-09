@@ -23,6 +23,7 @@ class SensorPacket:
     joint_vel: np.ndarray           # shape (num_joints,)
     depth_m: np.ndarray             # raw depth image, expected shape (36, 64)
     goal_b: np.ndarray              # robot-body goal command, shape (4,): dir_xyz + log_dist
+    color_rgb: Optional[np.ndarray] = None  # registered RGB frame for dynamic-mask inference
     reset: bool = False
     base_pos_w: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=np.float32))
     base_yaw_w: float = 0.0

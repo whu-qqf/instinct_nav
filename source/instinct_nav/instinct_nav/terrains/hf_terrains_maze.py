@@ -30,7 +30,7 @@ import torch
 
 from isaaclab.terrains.height_field.utils import height_field_to_mesh
 
-from .terrain_constants import HEIGHTS, PADDING, STAIRS, OBSTACLES, ObstacleType
+from .terrain_constants import CELL_PIXELS, HEIGHTS, PADDING, STAIRS, OBSTACLES, ObstacleType
 
 if TYPE_CHECKING:
     from . import hf_terrains_maze_cfg
@@ -333,7 +333,7 @@ def make_random_obstacle(
     scale = rng.uniform(OBSTACLES.SCALE_MIN, OBSTACLES.SCALE_MAX)
     if is_pit is None:
         is_pit = rng.random() < OBSTACLES.DEFAULT_PIT_PROB
-    thickness = rng.integers(OBSTACLES.THICKNESS_MIN, OBSTACLES.THICKNESS_MAX)
+    thickness = _sample_obstacle_thickness(rng, size)
 
     # Select obstacle type (with optional pillar weighting)
     if pillar_weight is not None and pillar_weight > 0:
@@ -348,6 +348,17 @@ def make_random_obstacle(
 
     generator = _OBSTACLE_GENERATORS[obstacle_type]
     return generator(rng, size, wall_height, scale, is_pit, thickness)
+
+
+def _sample_obstacle_thickness(rng: np.random.Generator, size: int) -> int:
+    """Scale legacy obstacle thickness to the configured maze-cell resolution."""
+
+    scale = size / CELL_PIXELS
+    minimum = max(1, int(round(OBSTACLES.THICKNESS_MIN * scale)))
+    maximum = max(minimum + 1, int(round(OBSTACLES.THICKNESS_MAX * scale)))
+    maximum = min(maximum, size // 2 + 1)
+    minimum = min(minimum, maximum - 1)
+    return int(rng.integers(minimum, maximum))
 
 
 # =============================================================================
@@ -696,7 +707,7 @@ def _add_pits(
     pit_rows = {trench_offset, grid_h - trench_offset - 1}
 
     # Generate bridge positions for crossing pit trenches
-    bridges = _generate_bridges(rng, grid_w)
+    bridges = _generate_bridges(rng, grid_w, cfg.bridge_width_cells)
 
     # Add pit trenches (negative height = troughs)
     for pit_y in pit_rows:
@@ -712,12 +723,13 @@ def _add_pits(
     _add_middle_obstacles(rng, terrain, cfg, difficulty, wall_height, cell_pixels, pit_rows)
 
 
-def _generate_bridges(rng: np.random.Generator, grid_width: int) -> set:
+def _generate_bridges(rng: np.random.Generator, grid_width: int, width_cells: int = 2) -> set:
     """Generate bridge positions across pit rows.
 
     Returns set of x-coordinates where bridges (gaps in pits) are placed.
-    Bridges are 2 cells wide for easier robot crossing.
+    Bridge width is configurable so terrain clearance can match the robot scale.
     """
+    width_cells = max(1, int(width_cells))
     num_bridges = rng.integers(OBSTACLES.BRIDGE_COUNT_MIN, OBSTACLES.BRIDGE_COUNT_MAX)
     margin = OBSTACLES.PITS_EDGE_MARGIN
     available = list(range(margin, grid_width - margin))
@@ -727,9 +739,9 @@ def _generate_bridges(rng: np.random.Generator, grid_width: int) -> set:
     for i in range(min(num_bridges, len(available))):
         pos = available[i]
         bridges.add(pos)
-        # Make bridges 2 cells wide
-        if pos + 1 < grid_width - margin:
-            bridges.add(pos + 1)
+        for offset in range(1, width_cells):
+            if pos + offset < grid_width - margin:
+                bridges.add(pos + offset)
 
     return bridges
 
@@ -958,7 +970,7 @@ def _generate_pit_obstacle(
         # Bar obstacle with high pit probability
         is_pit = rng.random() < OBSTACLES.PITS_BAR_PIT_PROB
         scale = rng.uniform(OBSTACLES.SCALE_MIN, OBSTACLES.SCALE_MAX)
-        thickness = rng.integers(OBSTACLES.THICKNESS_MIN, OBSTACLES.THICKNESS_MAX)
+        thickness = _sample_obstacle_thickness(rng, cell_pixels)
         return make_bar(rng, cell_pixels, wall_height, scale, is_pit, thickness)
     else:
         # Random obstacle type (pillar, cross, block) with moderate pit probability

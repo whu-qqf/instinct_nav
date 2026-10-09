@@ -46,3 +46,9 @@ dist/
 .env
 .venv/
 venv/
+/.venv-yolo11/
+
+# Local third-party perception sources and deployment weights
+/external/yolov9/
+/external/segment-anything/
+/artifacts/deploy_models/

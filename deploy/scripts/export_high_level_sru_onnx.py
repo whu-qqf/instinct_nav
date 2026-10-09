@@ -45,6 +45,14 @@ class SceneTokenSruOnnxActor(nn.Module):
         self.scene_token_position_embedding = nn.Parameter(ac.scene_token_position_embedding.detach().clone())
         self.scene_token_norm = copy.deepcopy(ac.scene_token_norm)
         self.use_dynamic_map_cross_attention = bool(ac.use_dynamic_map_cross_attention)
+        self.use_dynamic_scene_recurrent_fusion = bool(
+            getattr(ac, "use_dynamic_scene_recurrent_fusion", False)
+        )
+        if self.use_dynamic_scene_recurrent_fusion:
+            self.dynamic_scene_token_projector = copy.deepcopy(ac.dynamic_scene_token_projector)
+            self.dynamic_scene_null_token = nn.Parameter(ac.dynamic_scene_null_token.detach().clone())
+            self.dynamic_scene_attention_score = copy.deepcopy(ac.dynamic_scene_attention_score)
+            self.dynamic_scene_recurrent_projector = copy.deepcopy(ac.dynamic_scene_recurrent_projector)
         if self.use_dynamic_map_cross_attention:
             self.history_map_projector = copy.deepcopy(ac.history_map_projector)
             self.current_map_projector = copy.deepcopy(ac.current_map_projector)
@@ -81,6 +89,26 @@ class SceneTokenSruOnnxActor(nn.Module):
 
         image_features = self.attn_image_net(image, proprio)
         recurrent_input = torch.cat([image_features, proprio], dim=-1)
+        if self.use_dynamic_scene_recurrent_fusion:
+            dynamic_presence = scene_tokens[..., 5:6].clamp(0.0, 1.0)
+            dynamic_tokens = self.dynamic_scene_token_projector(scene_tokens)
+            dynamic_tokens = dynamic_tokens + self.scene_token_position_embedding.to(
+                device=dynamic_tokens.device, dtype=dynamic_tokens.dtype
+            )
+            dynamic_tokens = self.scene_token_norm(dynamic_tokens)
+            null_token = self.dynamic_scene_null_token.to(
+                device=dynamic_tokens.device, dtype=dynamic_tokens.dtype
+            ).expand(dynamic_tokens.shape[0], -1, -1)
+            candidates = torch.cat([null_token, dynamic_tokens], dim=1)
+            scores = self.dynamic_scene_attention_score(candidates)
+            presence_prior = torch.cat(
+                [torch.ones_like(dynamic_presence[:, :1]), dynamic_presence], dim=1
+            )
+            weights = torch.softmax(scores + torch.log(presence_prior.clamp_min(1.0e-6)), dim=1)
+            dynamic_context = self.dynamic_scene_recurrent_projector(
+                torch.sum(weights * candidates, dim=1)
+            )
+            recurrent_input = torch.cat([recurrent_input, dynamic_context], dim=-1)
         recurrent_features, (h_out, c_out) = self.rnn(recurrent_input.unsqueeze(0), (h_in, c_in))
         recurrent_features = recurrent_features.squeeze(0)
 
@@ -118,6 +146,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--parity_atol", type=float, default=1.0e-5)
     parser.add_argument("--parity_rtol", type=float, default=1.0e-4)
     parser.add_argument("--require_onnx_parity", action="store_true", default=False)
+    parser.add_argument(
+        "--scene_token_layout",
+        choices=("scene_risk", "dynamic_map_cross", "dynamic_map_mask"),
+        default="scene_risk",
+        help="Semantic layout of scene tokens; DynamicMapMask exports must set dynamic_map_mask.",
+    )
     return parser.parse_args()
 
 
@@ -257,8 +291,12 @@ def main() -> None:
             "scene_token_num_tokens": int(getattr(actor_critic, "scene_token_num_tokens", 0)),
             "scene_token_dim": int(getattr(actor_critic, "scene_token_dim", 0)),
             "scene_token_features_total": int(getattr(actor_critic, "num_actor_scene_token_features", 0)),
+            "scene_token_layout": args.scene_token_layout,
             "use_dynamic_map_cross_attention": bool(
                 getattr(actor_critic, "use_dynamic_map_cross_attention", False)
+            ),
+            "use_dynamic_scene_recurrent_fusion": bool(
+                getattr(actor_critic, "use_dynamic_scene_recurrent_fusion", False)
             ),
             "visibility_decay": 0.995,
             "encoded_depth_dim": int(getattr(actor_critic, "num_image_features", 0)),

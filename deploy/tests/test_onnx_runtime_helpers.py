@@ -8,6 +8,7 @@ import torch.nn.functional as F
 sys.modules.setdefault("onnxruntime", types.SimpleNamespace(InferenceSession=object))
 
 from instinct_nav_onboard.config import ObservationLayout, OnboardConfig
+from instinct_nav_onboard.dynamic_mask import resize_binary_mask
 from instinct_nav_onboard.onnx_high_level_runtime import (
     OnnxHighLevelRuntime,
     _adaptive_avg_pool2d,
@@ -109,3 +110,42 @@ def test_dynamic_map_cross_layout_builds_history_and_current_patches():
     assert patches[:, 0].sum() > 0.0
     assert patches[:, 1].sum() > 0.0
     np.testing.assert_allclose(patches[:, 4], patches[:, 1] - patches[:, 0], atol=1.0e-6)
+
+
+def test_resize_binary_mask_preserves_binary_values():
+    mask = np.asarray([[0.0, 1.0], [0.6, 0.4]], dtype=np.float32)
+    resized = resize_binary_mask(mask, (4, 4))
+    assert resized.shape == (4, 4)
+    assert set(np.unique(resized)) == {0.0, 1.0}
+
+
+def test_dynamic_map_mask_projects_current_only_presence():
+    layout = ObservationLayout(scene_token_feature_dim=6, scene_token_dim=64 * 6)
+    cfg = OnboardConfig(visibility_decay=0.995, scene_token_layout="dynamic_map_mask", layout=layout)
+    runtime = _runtime_without_onnx(cfg)
+    runtime.scene_token_layout = "dynamic_map_mask"
+    depth = np.full((36, 64), 2.0, dtype=np.float32)
+    mask = np.zeros((36, 64), dtype=np.float32)
+    mask[2:8, 2:8] = 1.0
+
+    first = runtime.build_scene_tokens(depth, dynamic_mask=mask).reshape(64, 6)
+    assert first.shape == (64, 6)
+    assert first[:, 0].sum() == 0.0
+    assert first[:, 1].sum() > 0.0
+    assert first[:, 5].sum() > 0.0
+
+    second = runtime.build_scene_tokens(depth, dynamic_mask=np.zeros_like(mask)).reshape(64, 6)
+    assert second[:, 0].sum() > 0.0
+    assert second[:, 5].sum() == 0.0
+
+
+def test_dynamic_mask_requires_valid_depth_for_bev_projection():
+    layout = ObservationLayout(scene_token_feature_dim=6, scene_token_dim=64 * 6)
+    cfg = OnboardConfig(scene_token_layout="dynamic_map_mask", layout=layout)
+    runtime = _runtime_without_onnx(cfg)
+    runtime.scene_token_layout = "dynamic_map_mask"
+    depth = np.zeros((36, 64), dtype=np.float32)
+    mask = np.ones((36, 64), dtype=np.float32)
+
+    tokens = runtime.build_scene_tokens(depth, dynamic_mask=mask).reshape(64, 6)
+    assert tokens[:, 5].sum() == 0.0

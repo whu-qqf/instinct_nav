@@ -23,11 +23,13 @@ class RealsenseCamera(CameraBase):
         *args,
         depth_fps: int = 60,
         color_fps: int = 30,
+        color_stream_resolution: tuple[int, int] | None = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self.depth_fps = depth_fps
         self.color_fps = color_fps
+        self.color_stream_resolution = color_stream_resolution or self.color_resolution
 
         try:
             import pyrealsense2 as _rs
@@ -54,8 +56,8 @@ class RealsenseCamera(CameraBase):
         if self.color_resolution is not None:
             self.config.enable_stream(
                 _rs.stream.color,
-                self.color_resolution[0],
-                self.color_resolution[1],
+                self.color_stream_resolution[0],
+                self.color_stream_resolution[1],
                 _rs.format.rgb8,
                 color_fps,
             )
@@ -98,6 +100,9 @@ class RealsenseCamera(CameraBase):
                 return False
             raise
 
+        if self.depth_resolution is not None and self.color_resolution is not None:
+            frames = self.align.process(frames)
+
         got_data = False
 
         if self.depth_resolution is not None:
@@ -138,6 +143,7 @@ class RealsenseMPCamera(CameraProcessSpawner):
         *args,
         depth_fps: int = 60,
         color_fps: int = 30,
+        color_stream_resolution: tuple[int, int] | None = None,
         **kwargs,
     ):
         super().__init__(
@@ -146,6 +152,7 @@ class RealsenseMPCamera(CameraProcessSpawner):
             camera_kwargs={
                 "depth_fps": depth_fps,
                 "color_fps": color_fps,
+                "color_stream_resolution": color_stream_resolution,
             },
             depth_fps=depth_fps,
             **kwargs,

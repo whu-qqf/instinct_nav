@@ -42,8 +42,22 @@ class RobotNavigationGoalCommandCfg(CommandTermCfg):
     """Number of terrain columns in one bank. Required when terrain banks are enabled."""
 
     terrain_bank_switch_interval: int = 1000
-    """PPO iterations between terrain-bank switches."""
+    """PPO iterations between terrain-bank switches. Ignored by success-gated banks."""
 
     terrain_bank_env_steps_per_iteration: int = 16
     """Environment steps collected by one PPO iteration."""
 
+    terrain_bank_advance_success: float = 0.0
+    """Mean success required to advance one bank. Values <= 0 disable success gating."""
+
+    terrain_bank_success_check_interval: int = 100
+    """Environment steps between success-gate checks."""
+
+    terrain_bank_success_min_full_fraction: float = 0.95
+    """Required fraction of environments with a full success window before advancing."""
+
+    report_dynamic_env_success: bool = False
+    """Report separate rolling success rates for static and dynamic environments."""
+
+    reset_success_on_dynamic_enable: bool = False
+    """Clear rolling success windows once when the dynamic phase starts."""

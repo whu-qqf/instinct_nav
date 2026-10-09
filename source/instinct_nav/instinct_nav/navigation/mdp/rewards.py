@@ -243,7 +243,9 @@ def velocity_into_unobserved_penalty(
     if mgr is None:
         return reward
 
-    grid = mgr.map  # [N, 1, G, G], 1 == observed
+    # Dynamic-risk BEV tasks expose a current-only overlay in which segmented
+    # obstacles are black. Other tasks keep the legacy visibility map unchanged.
+    grid = getattr(mgr, "risk_adjusted_map", mgr.map)  # [N, 1, G, G], 1 == observed/safe
     G = mgr.grid_size
     half = mgr.half_size
     cell = mgr.cell_size

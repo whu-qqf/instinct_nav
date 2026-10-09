@@ -171,6 +171,11 @@ class LocalVisibilityMapManager:
         # Binary map memory. ``pose_valid`` marks whether a map has a previous
         # robot pose; without it we cannot warp old memory into the new frame.
         self.map = torch.zeros((self.num_envs, 1, self.grid_size, self.grid_size), device=self.device)
+        self.current_dynamic_risk = torch.zeros_like(self.map)
+        # Two ego-motion-compensated dynamic occupancy frames. They are kept
+        # separate from persistent visibility memory so moving objects never
+        # leave permanent "ghost" cells in the static map.
+        self.dynamic_history: torch.Tensor | None = None
         self.last_root_pos_w = torch.zeros((self.num_envs, 3), device=self.device)
         self.last_root_yaw = torch.zeros((self.num_envs,), device=self.device)
         self.pose_valid = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
@@ -197,11 +202,22 @@ class LocalVisibilityMapManager:
         """
         if env_ids is None:
             self.map.zero_()
+            self.current_dynamic_risk.zero_()
+            if self.dynamic_history is not None:
+                self.dynamic_history.zero_()
             self.pose_valid.zero_()
             return
         env_ids = env_ids.to(device=self.device, dtype=torch.long)
         self.map[env_ids] = 0.0
+        self.current_dynamic_risk[env_ids] = 0.0
+        if self.dynamic_history is not None:
+            self.dynamic_history[env_ids] = 0.0
         self.pose_valid[env_ids] = False
+
+    @property
+    def risk_adjusted_map(self) -> torch.Tensor:
+        """Current visibility with transient dynamic hazards rendered as black."""
+        return self.map * (1.0 - self.current_dynamic_risk)
 
     def _pixel_grid(self, height: int, width: int) -> tuple[torch.Tensor, torch.Tensor]:
         """Return flattened image row/column coordinates for sampled pixels.
@@ -276,6 +292,15 @@ class LocalVisibilityMapManager:
             warped_memory,
             torch.zeros_like(warped),
         )
+        if self.dynamic_history is not None:
+            warped_dynamic = F.grid_sample(
+                self.dynamic_history, sample_grid, mode="bilinear", padding_mode="zeros", align_corners=True
+            )
+            self.dynamic_history = torch.where(
+                self.pose_valid.view(-1, 1, 1, 1),
+                (warped_dynamic > 0.5).to(warped_dynamic.dtype),
+                torch.zeros_like(warped_dynamic),
+            )
 
     def update(
         self,
@@ -286,7 +311,9 @@ class LocalVisibilityMapManager:
         root_pos_w: torch.Tensor,
         root_quat_w: torch.Tensor,
         return_components: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        pixel_mask: torch.Tensor | None = None,
+        exclude_masked_pixels_from_visibility: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Insert one delayed depth frame into the local visibility map.
 
         Inputs are batched over environments. The function performs the complete
@@ -304,6 +331,20 @@ class LocalVisibilityMapManager:
         num_envs, height, width = depth.shape
         if num_envs != self.num_envs:
             raise ValueError(f"Expected {self.num_envs} envs, got {num_envs}")
+        self.current_dynamic_risk.zero_()
+
+        pixel_mask_sub = None
+        if pixel_mask is not None:
+            pixel_mask = pixel_mask.to(self.device)
+            if pixel_mask.dim() == 4:
+                pixel_mask = pixel_mask[:, 0]
+            if pixel_mask.shape != depth.shape:
+                raise ValueError(
+                    f"pixel_mask shape {tuple(pixel_mask.shape)} must match depth shape {tuple(depth.shape)}"
+                )
+            pixel_mask_sub = pixel_mask[:, :: self.pixel_stride, :: self.pixel_stride].reshape(
+                num_envs, -1
+            )
 
         # Keep all tensors on the map device and extract yaw-only robot heading.
         # Roll/pitch are deliberately ignored for BEV memory alignment.
@@ -372,13 +413,24 @@ class LocalVisibilityMapManager:
         # depth point lands in a cell, that cell becomes visible.
         linear_idx = (row.clamp(0, self.grid_size - 1) * self.grid_size + col.clamp(0, self.grid_size - 1))
         updates = torch.zeros((self.num_envs, self.grid_size * self.grid_size), device=self.device)
-        values = valid.to(dtype=updates.dtype)
+        visibility_valid = valid
+        if exclude_masked_pixels_from_visibility and pixel_mask_sub is not None:
+            visibility_valid = valid & (pixel_mask_sub < 0.5)
+        values = visibility_valid.to(dtype=updates.dtype)
         updates.scatter_reduce_(1, linear_idx, values, reduce="amax", include_self=True)
+
+        dynamic_updates = None
+        if pixel_mask_sub is not None:
+            dynamic_updates = torch.zeros_like(updates)
+            dynamic_values = (valid & (pixel_mask_sub >= 0.5)).to(dtype=updates.dtype)
+            dynamic_updates.scatter_reduce_(
+                1, linear_idx, dynamic_values, reduce="amax", include_self=True
+            )
 
         # Preserve current-frame depth in the same BEV coordinates. Empty cells
         # are masked to zero; callers use current_hits to distinguish them.
         depth_values = ((depth_sub - self.depth_min_m) / (self.depth_max_m - self.depth_min_m)).clamp(0.0, 1.0)
-        depth_values = torch.where(valid, depth_values, torch.ones_like(depth_values))
+        depth_values = torch.where(visibility_valid, depth_values, torch.ones_like(depth_values))
         current_depth = torch.ones_like(updates)
         current_depth.scatter_reduce_(1, linear_idx, depth_values, reduce="amin", include_self=True)
 
@@ -401,12 +453,15 @@ class LocalVisibilityMapManager:
         if not return_components:
             return updated_history
         assert history_before_update is not None
-        return (
+        components = (
             updated_history,
             history_before_update.flatten(start_dim=1),
             current_hits.flatten(start_dim=1),
             current_depth.flatten(start_dim=1),
         )
+        if dynamic_updates is None:
+            return components
+        return components + (dynamic_updates,)
 
 
 def _get_or_create_visibility_map_manager(
@@ -1095,7 +1150,7 @@ def raw_depth_delayed(env, sensor_cfg):
 
     Returns:
         Flattened depth ``[num_envs, H * W]`` where ``(H, W)`` is the camera
-        ``image_shape`` (currently 40 x 64 for the G1 high-level camera).
+        ``image_shape`` (currently 36 x 64 for the shared G1 camera).
     """
     packet = _get_delayed_visual_packet(env, sensor_cfg)
     return packet["depth"].flatten(start_dim=1)
@@ -1105,9 +1160,10 @@ def raw_depth_delayed(env, sensor_cfg):
 def dynamic_obstacle_mask_label(
     env,
     sensor_cfg,
-    half_extent_m: float = 0.25,
-    half_height_m: float = 0.4,
+    half_extent_m: float | None = None,
+    half_height_m: float | None = None,
     depth_tol_m: float = 0.35,
+    return_instance_visibility: bool = False,
 ):
     """Generate a training-only ground-truth dynamic-obstacle segmentation mask.
 
@@ -1115,17 +1171,14 @@ def dynamic_obstacle_mask_label(
     extents) into the *delayed* camera frame and rasterizes its 2D silhouette,
     marking a pixel only when the obstacle is the nearest surface (a simple
     depth-consistency occlusion test against the delayed raw depth). The output
-    matches the raw depth resolution so it can supervise the mask head
-    pixel-for-pixel. No privileged information is needed at deployment; this term
-    only feeds the auxiliary segmentation loss during training.
+    matches the raw depth resolution. In simulation it supplies the mask input
+    and, for the legacy prediction task, the auxiliary segmentation label.
 
     Args:
         env: The environment (must have ``_dynamic_obstacle_manager``).
         sensor_cfg: The depth sensor configuration (same one as the depth obs).
-        half_extent_m: XY half-width of the obstacle cuboid (matches config
-            ``obstacle_body_half_extent`` = 0.25).
-        half_height_m: Z half-height of the obstacle cuboid (matches config
-            ``obstacle_half_height`` = 0.4).
+        half_extent_m: Optional XY half-width override; defaults to the spawned cuboid size.
+        half_height_m: Optional Z half-height override; defaults to the spawned cuboid size.
         depth_tol_m: Tolerance for the depth-consistency occlusion check.
 
     Returns:
@@ -1138,19 +1191,31 @@ def dynamic_obstacle_mask_label(
     mask = torch.zeros(B, 1, H, W, device=env.device, dtype=torch.float32)
 
     if manager is None:
+        if return_instance_visibility:
+            return mask.flatten(start_dim=1), torch.zeros(B, 0, device=env.device, dtype=torch.bool)
         return mask.flatten(start_dim=1)
 
     positions = getattr(manager, "positions_w", None)  # [B, K, 3]
     if positions is None or positions.shape[1] == 0:
+        if return_instance_visibility:
+            return mask.flatten(start_dim=1), torch.zeros(B, 0, device=env.device, dtype=torch.bool)
         return mask.flatten(start_dim=1)
     K = positions.shape[1]
+    if half_extent_m is None:
+        half_extent_m = manager.body_half_extent
+    if half_height_m is None:
+        half_height_m = manager.obstacle_half_height
 
     # Align obstacle state with the delayed camera frame: index the manager's
-    # per-step state history (positions_w + spawned) by the same visual lag as the
+    # per-step state history (positions_w + activation state) by the same visual lag as the
     # delayed depth/camera packet. This is exact across spawn / direction-reversal
     # / stop-and-go transitions (a velocity extrapolation would miss them).
     positions = positions.clone()
-    spawned = getattr(manager, "spawned", torch.zeros(B, dtype=torch.bool, device=env.device)).clone()
+    spawned = getattr(manager, "spawned_obstacles", None)
+    if spawned is None:
+        spawned = getattr(manager, "spawned", torch.zeros(B, dtype=torch.bool, device=env.device))
+    spawned = spawned.clone()
+    curriculum = getattr(manager, "curriculum_envs", torch.ones(B, dtype=torch.bool, device=env.device)).clone()
     lag = torch.zeros(B, device=env.device, dtype=torch.long)
     delay_manager = getattr(env, "delay_manager", None)
     if delay_manager is not None and getattr(delay_manager, "enabled", False):
@@ -1163,21 +1228,21 @@ def dynamic_obstacle_mask_label(
             lag = state.time_lags.to(env.device)
     pos_history = getattr(manager, "_positions_history", None)
     spawned_history = getattr(manager, "_spawned_history", None)
-    if pos_history and spawned_history and bool(lag.any().item()):
+    curriculum_history = getattr(manager, "_curriculum_envs_history", None)
+    if pos_history and spawned_history and curriculum_history and bool(lag.any().item()):
         # history[-1] is the current step; history[-(d+1)] is `d` steps ago.
         for d in range(1, len(pos_history)):
             mask_d = lag == d
             if bool(mask_d.any().item()):
                 positions[mask_d] = pos_history[-(d + 1)][mask_d]
                 spawned[mask_d] = spawned_history[-(d + 1)][mask_d]
+                curriculum[mask_d] = curriculum_history[-(d + 1)][mask_d]
 
     # Only spawned obstacles in curriculum envs are active; the rest stay parked
     # off-camera and contribute nothing to the label.
-    active = spawned.bool()
-    curriculum = getattr(manager, "curriculum_envs", None)
-    if curriculum is not None:
-        active = active & curriculum.bool()
-    active_k = active.unsqueeze(1).expand(B, K)  # [B, K]
+    if spawned.ndim == 1:
+        spawned = spawned.unsqueeze(1).expand(B, K)
+    active_k = spawned.bool() & curriculum.bool().unsqueeze(1)  # [B, K]
 
     fx = packet["intrinsics"][:, 0, 0].clamp_min(1.0e-6)
     fy = packet["intrinsics"][:, 1, 1].clamp_min(1.0e-6)
@@ -1218,27 +1283,303 @@ def dynamic_obstacle_mask_label(
     valid = (xc > 0.05).all(dim=-1) & active_k  # [B, K]
     front_depth = xc.amin(dim=-1)  # [B, K] closest corner depth (front face proxy)
 
-    # Rasterize each obstacle's projected bounding box (per-env; the cuboid is only
-    # a few pixels wide so a bbox is a tight-enough silhouette). Depth consistency:
-    # mark a pixel only if the camera already sees at-or-beyond the obstacle front.
+    # Rasterize each obstacle's projected bounding box. Keep the small obstacle loop,
+    # but process every environment and pixel in one CUDA broadcast. This avoids the
+    # O(K * B) Python loop and thousands of .item() synchronizations at 4096 envs.
+    pixel_rows = torch.arange(H, device=env.device).view(1, H, 1)
+    pixel_cols = torch.arange(W, device=env.device).view(1, 1, W)
+    mask_2d = mask[:, 0]
+    instance_visibility = torch.zeros(B, K, device=env.device, dtype=torch.bool)
     for k in range(K):
-        r_min = row[:, k].amin(dim=-1).clamp(0, H - 1).long()
-        r_max = row[:, k].amax(dim=-1).clamp(0, H - 1).long()
-        c_min = col[:, k].amin(dim=-1).clamp(0, W - 1).long()
-        c_max = col[:, k].amax(dim=-1).clamp(0, W - 1).long()
-        for e in range(B):
-            if not bool(valid[e, k].item()):
-                continue
-            r0, r1 = int(r_min[e].item()), int(r_max[e].item())
-            c0, c1 = int(c_min[e].item()), int(c_max[e].item())
-            ob_depth = front_depth[e, k]
-            cam_depth = depth[e, 0, r0 : r1 + 1, c0 : c1 + 1]
-            visible = cam_depth >= (ob_depth - depth_tol_m)
-            mask[e, 0, r0 : r1 + 1, c0 : c1 + 1] = torch.maximum(
-                mask[e, 0, r0 : r1 + 1, c0 : c1 + 1], visible.float()
-            )
+        raw_r_min = row[:, k].amin(dim=-1)
+        raw_r_max = row[:, k].amax(dim=-1)
+        raw_c_min = col[:, k].amin(dim=-1)
+        raw_c_max = col[:, k].amax(dim=-1)
+        intersects_image = (
+            (raw_r_max >= 0)
+            & (raw_r_min <= H - 1)
+            & (raw_c_max >= 0)
+            & (raw_c_min <= W - 1)
+        )
+        r_min = raw_r_min.clamp(0, H - 1).floor().long().view(B, 1, 1)
+        r_max = raw_r_max.clamp(0, H - 1).ceil().long().view(B, 1, 1)
+        c_min = raw_c_min.clamp(0, W - 1).floor().long().view(B, 1, 1)
+        c_max = raw_c_max.clamp(0, W - 1).ceil().long().view(B, 1, 1)
+        inside_bbox = (
+            (pixel_rows >= r_min)
+            & (pixel_rows <= r_max)
+            & (pixel_cols >= c_min)
+            & (pixel_cols <= c_max)
+        )
+        depth_consistent = depth[:, 0] >= (front_depth[:, k].view(B, 1, 1) - depth_tol_m)
+        obstacle_mask = (
+            valid[:, k].view(B, 1, 1)
+            & intersects_image.view(B, 1, 1)
+            & inside_bbox
+            & depth_consistent
+        )
+        instance_visibility[:, k] = obstacle_mask.flatten(start_dim=1).any(dim=1)
+        mask_2d.logical_or_(obstacle_mask)
 
-    return mask.flatten(start_dim=1)
+    flat_mask = mask.flatten(start_dim=1)
+    if return_instance_visibility:
+        return flat_mask, instance_visibility
+    return flat_mask
+
+
+def _delayed_dynamic_state_for_risk(env, sensor_cfg):
+    """Return obstacle position/velocity synchronized with the delayed camera packet."""
+    manager = getattr(env, "_dynamic_obstacle_manager", None)
+    if manager is None:
+        return None
+    positions = manager.positions_w.clone()
+    spawned = manager.spawned_obstacles.clone()
+    curriculum = manager.curriculum_envs.clone()
+    velocity = manager.dirs * (
+        manager.speeds
+        * (~manager.paused).to(manager.speeds.dtype)
+        * manager.spawned_obstacles.to(manager.speeds.dtype)
+    ).unsqueeze(-1)
+
+    lag = torch.zeros(env.num_envs, device=env.device, dtype=torch.long)
+    delay_manager = getattr(env, "delay_manager", None)
+    if delay_manager is not None and getattr(delay_manager, "enabled", False):
+        buffers = getattr(delay_manager, "_delay_depth_buffers", {})
+        camera_name = getattr(sensor_cfg, "name", None)
+        state = buffers.get(f"{camera_name}_visual_packet") if camera_name is not None else None
+        if state is None and len(buffers) == 1:
+            state = next(iter(buffers.values()))
+        if state is not None and getattr(state, "time_lags", None) is not None:
+            lag = state.time_lags.to(env.device)
+
+    pos_history = getattr(manager, "_positions_history", None)
+    spawned_history = getattr(manager, "_spawned_history", None)
+    curriculum_history = getattr(manager, "_curriculum_envs_history", None)
+    velocity_history = getattr(manager, "_velocities_history", None)
+    if pos_history and spawned_history and curriculum_history and velocity_history:
+        history_len = min(
+            len(pos_history), len(spawned_history), len(curriculum_history), len(velocity_history)
+        )
+        for delay in range(1, history_len):
+            use_history = lag == delay
+            if bool(use_history.any().item()):
+                positions[use_history] = pos_history[-(delay + 1)][use_history]
+                spawned[use_history] = spawned_history[-(delay + 1)][use_history]
+                curriculum[use_history] = curriculum_history[-(delay + 1)][use_history]
+                velocity[use_history] = velocity_history[-(delay + 1)][use_history]
+    active = spawned.bool() & curriculum.bool().unsqueeze(1)
+    return positions, velocity, active
+
+
+def _render_dynamic_sector_risk(
+    positions_w: torch.Tensor,
+    velocities_w: torch.Tensor,
+    active: torch.Tensor,
+    visible: torch.Tensor,
+    root_pos_w: torch.Tensor,
+    root_quat_w: torch.Tensor,
+    *,
+    size_m: float,
+    grid_size: int,
+    body_half_extent_m: float,
+    clearance_m: float,
+    horizon_s: float,
+    sigma_long_m: float,
+    sigma_lat_m: float,
+    softness_m: float,
+    stationary_speed_mps: float,
+) -> torch.Tensor:
+    """Rasterize current occupancy plus a velocity-aligned soft risk sector."""
+    batch, obstacle_count = positions_w.shape[:2]
+    device = positions_w.device
+    dtype = positions_w.dtype
+    yaw = _quat_wxyz_to_yaw(root_quat_w)
+    cos_yaw = torch.cos(yaw)
+    sin_yaw = torch.sin(yaw)
+
+    relative = positions_w[..., :2] - root_pos_w[:, None, :2]
+    center_x = cos_yaw[:, None] * relative[..., 0] + sin_yaw[:, None] * relative[..., 1]
+    center_y = -sin_yaw[:, None] * relative[..., 0] + cos_yaw[:, None] * relative[..., 1]
+    velocity_x = cos_yaw[:, None] * velocities_w[..., 0] + sin_yaw[:, None] * velocities_w[..., 1]
+    velocity_y = -sin_yaw[:, None] * velocities_w[..., 0] + cos_yaw[:, None] * velocities_w[..., 1]
+
+    cell_size = float(size_m) / int(grid_size)
+    half_size = 0.5 * float(size_m)
+    axis = half_size - (torch.arange(grid_size, device=device, dtype=dtype) + 0.5) * cell_size
+    grid_x = axis.view(1, grid_size, 1)
+    grid_y = axis.view(1, 1, grid_size)
+    risk = torch.zeros(batch, 1, grid_size, grid_size, device=device, dtype=dtype)
+    base_radius = float(body_half_extent_m) + float(clearance_m)
+    softness = max(float(softness_m), 1.0e-3)
+
+    for obstacle_index in range(obstacle_count):
+        enabled = active[:, obstacle_index] & visible[:, obstacle_index]
+        if not bool(enabled.any().item()):
+            continue
+        dx = grid_x - center_x[:, obstacle_index, None, None]
+        dy = grid_y - center_y[:, obstacle_index, None, None]
+        speed = torch.sqrt(
+            velocity_x[:, obstacle_index].square() + velocity_y[:, obstacle_index].square()
+        )
+        unit_x = velocity_x[:, obstacle_index] / speed.clamp_min(1.0e-6)
+        unit_y = velocity_y[:, obstacle_index] / speed.clamp_min(1.0e-6)
+        along = dx * unit_x[:, None, None] + dy * unit_y[:, None, None]
+        lateral = torch.abs(-dx * unit_y[:, None, None] + dy * unit_x[:, None, None])
+        travel = speed * float(horizon_s) + float(sigma_long_m)
+        progress = (along / travel[:, None, None].clamp_min(1.0e-3)).clamp(0.0, 1.0)
+        width = base_radius + float(sigma_lat_m) * (1.0 + progress)
+        longitudinal_gate = torch.sigmoid((along + base_radius) / softness)
+        longitudinal_gate *= torch.sigmoid((travel[:, None, None] + base_radius - along) / softness)
+        lateral_gate = torch.sigmoid((width - lateral) / softness)
+        sector = longitudinal_gate * lateral_gate
+        current_disk = torch.sigmoid(
+            (base_radius - torch.sqrt(dx.square() + dy.square())) / softness
+        )
+        moving = speed >= float(stationary_speed_mps)
+        obstacle_risk = torch.where(moving[:, None, None], torch.maximum(sector, current_disk), current_disk)
+        obstacle_risk *= enabled[:, None, None].to(dtype)
+        risk[:, 0] = torch.maximum(risk[:, 0], obstacle_risk)
+    return risk.clamp_(0.0, 1.0)
+
+
+@torch.no_grad()
+def dynamic_obstacle_mask_observation(
+    env,
+    sensor_cfg,
+    output_height: int = 9,
+    output_width: int = 16,
+    apply_corruption: bool = True,
+    frame_dropout_prob: float = 0.08,
+    pixel_dropout_prob: float = 0.05,
+    false_positive_prob: float = 0.001,
+    erode_prob: float = 0.10,
+    dilate_prob: float = 0.15,
+    max_shift_pixels: int = 1,
+    include_masked_depth: bool = False,
+    force_zero: bool = False,
+    return_instance_visibility: bool = False,
+):
+    """Return a compact dynamic-obstacle mask for direct policy input.
+
+    Simulation ground truth is projected into the same delayed camera frame as
+    the depth observation, then max-pooled to a compact grid. During training,
+    simple mask-space corruption approximates deployment-time segmentation
+    failures: latency is already provided by the delayed visual packet, while
+    this function adds frame drops, holes, false positives, boundary changes,
+    and spatial jitter.
+
+    The result is cached per environment step so actor and critic observe the
+    same corrupted mask.
+    """
+    step = int(getattr(env, "common_step_counter", -1))
+    camera_name = sensor_cfg.name if hasattr(sensor_cfg, "name") else "camera"
+    obstacle_manager = getattr(env, "_dynamic_obstacle_manager", None)
+    obstacle_positions = getattr(obstacle_manager, "positions_w", None)
+    obstacle_count = int(obstacle_positions.shape[1]) if obstacle_positions is not None else 0
+    cache_key = (
+        step,
+        camera_name,
+        obstacle_count,
+        int(output_height),
+        int(output_width),
+        bool(apply_corruption),
+        float(frame_dropout_prob),
+        float(pixel_dropout_prob),
+        float(false_positive_prob),
+        float(erode_prob),
+        float(dilate_prob),
+        int(max_shift_pixels),
+        bool(include_masked_depth),
+        bool(force_zero),
+    )
+    cache = getattr(env, "_instinct_nav_direct_mask_cache", None)
+    if cache is not None and cache.get("key") == cache_key:
+        manager = getattr(env, "_dynamic_obstacle_manager", None)
+        if manager is not None:
+            manager._last_direct_mask_clean_positive_rate = cache["clean_positive_rate"]
+            manager._last_direct_mask_input_positive_rate = cache["input_positive_rate"]
+        if return_instance_visibility:
+            return cache["mask"], cache["instance_visibility"]
+        return cache["mask"]
+
+    packet = _get_delayed_visual_packet(env, sensor_cfg)
+    batch_size = packet["depth"].shape[0]
+    input_height, input_width = packet["depth"].shape[-2:]
+    flat_mask, instance_visibility = dynamic_obstacle_mask_label(
+        env, sensor_cfg, return_instance_visibility=True
+    )
+    mask = flat_mask.reshape(batch_size, 1, input_height, input_width)
+    mask = F.adaptive_max_pool2d(mask, (int(output_height), int(output_width)))
+    clean_positive_rate = mask.mean().detach()
+
+    if apply_corruption:
+        out_h, out_w = mask.shape[-2:]
+
+        if max_shift_pixels > 0:
+            shift_y = torch.randint(
+                -max_shift_pixels, max_shift_pixels + 1, (batch_size,), device=env.device
+            )
+            shift_x = torch.randint(
+                -max_shift_pixels, max_shift_pixels + 1, (batch_size,), device=env.device
+            )
+            rows = torch.arange(out_h, device=env.device).view(1, out_h, 1) - shift_y.view(-1, 1, 1)
+            cols = torch.arange(out_w, device=env.device).view(1, 1, out_w) - shift_x.view(-1, 1, 1)
+            valid = (rows >= 0) & (rows < out_h) & (cols >= 0) & (cols < out_w)
+            source = rows.clamp(0, out_h - 1) * out_w + cols.clamp(0, out_w - 1)
+            source = source.expand(-1, out_h, out_w).reshape(batch_size, 1, -1)
+            mask = mask.flatten(2).gather(2, source).reshape(batch_size, 1, out_h, out_w)
+            mask = mask * valid.unsqueeze(1)
+
+        morphology_choice = torch.rand(batch_size, 1, 1, 1, device=env.device)
+        eroded = 1.0 - F.max_pool2d(1.0 - mask, kernel_size=3, stride=1, padding=1)
+        dilated = F.max_pool2d(mask, kernel_size=3, stride=1, padding=1)
+        mask = torch.where(
+            morphology_choice < erode_prob,
+            eroded,
+            torch.where(morphology_choice < erode_prob + dilate_prob, dilated, mask),
+        )
+
+        if pixel_dropout_prob > 0.0:
+            keep = torch.rand_like(mask) >= pixel_dropout_prob
+            mask = mask * keep
+        if false_positive_prob > 0.0:
+            false_positive_seed = (torch.rand_like(mask) < false_positive_prob).float()
+            false_positive = F.max_pool2d(false_positive_seed, kernel_size=3, stride=1, padding=1)
+            mask = torch.maximum(mask, false_positive)
+        if frame_dropout_prob > 0.0:
+            keep_frame = (
+                torch.rand(batch_size, 1, 1, 1, device=env.device) >= frame_dropout_prob
+            )
+            mask = mask * keep_frame
+
+    result = (mask >= 0.5).float().flatten(start_dim=1)
+    input_positive_rate = result.mean().detach()
+    if include_masked_depth:
+        depth = packet["depth"].reshape(batch_size, 1, input_height, input_width)
+        depth = F.adaptive_avg_pool2d(depth, (int(output_height), int(output_width)))
+        valid = torch.isfinite(depth) & (depth > 0.0)
+        depth = torch.where(valid, depth.clamp(0.0, 8.0) / 8.0, 0.0)
+        binary = result.reshape(batch_size, 1, int(output_height), int(output_width))
+        result = torch.cat((binary, binary * depth), dim=1).flatten(1)
+    if force_zero:
+        # Preserve the normal mask path and its RNG consumption so a seeded
+        # ablation changes only the tensor presented to the network.
+        result = torch.zeros_like(result)
+        input_positive_rate = result.new_tensor(0.0)
+    manager = getattr(env, "_dynamic_obstacle_manager", None)
+    if manager is not None:
+        manager._last_direct_mask_clean_positive_rate = clean_positive_rate
+        manager._last_direct_mask_input_positive_rate = input_positive_rate
+    env._instinct_nav_direct_mask_cache = {
+        "key": cache_key,
+        "mask": result,
+        "clean_positive_rate": clean_positive_rate,
+        "input_positive_rate": input_positive_rate,
+        "instance_visibility": instance_visibility,
+    }
+    if return_instance_visibility:
+        return result, instance_visibility
+    return result
 
 
 def local_visibility_map(
@@ -1608,12 +1949,33 @@ def dynamic_map_patches_from_visibility_map(
     depth_max_m: float = 8.0,
     pixel_stride: int = 2,
     decay: float = 0.995,
+    include_dynamic_mask: bool = False,
+    mask_frame_dropout_prob: float = 0.08,
+    mask_pixel_dropout_prob: float = 0.05,
+    mask_false_positive_prob: float = 0.001,
+    mask_erode_prob: float = 0.10,
+    mask_dilate_prob: float = 0.15,
+    mask_max_shift_pixels: int = 3,
+    merge_dynamic_as_risk: bool = False,
+    dynamic_risk_inflation_cells: int = 0,
+    exclude_dynamic_from_visibility_history: bool = False,
+    dynamic_risk_mode: str = "occupancy",
+    sector_horizon_s: float = 1.2,
+    sector_clearance_m: float = 0.30,
+    sector_sigma_long_m: float = 0.15,
+    sector_sigma_lat_m: float = 0.12,
+    sector_softness_m: float = 0.08,
+    sector_stationary_speed_mps: float = 0.10,
 ) -> torch.Tensor:
     """Return spatially aligned history/current BEV patches.
 
-    Layout per patch: pre-update history score, current BEV hit ratio, current
-    BEV normalized depth, current BEV depth edge, and current-minus-history
-    score. All five channels use the same robot-local 8x8 patch coordinates.
+    The base layout per patch is: pre-update history score, current BEV hit
+    ratio, current BEV normalized depth, current BEV depth edge, and
+    current-minus-history score. With include_dynamic_mask enabled, the default
+    behavior appends a sixth current-frame dynamic-occupancy channel. When
+    ``merge_dynamic_as_risk`` is enabled instead, dynamic BEV cells are rendered
+    as black in the existing five visibility features. The risk overlay is
+    current-only and never modifies persistent visibility memory.
     """
     cache_key = (
         "dynamic_map_patches_from_visibility_map",
@@ -1622,6 +1984,23 @@ def dynamic_map_patches_from_visibility_map(
         int(grid_size),
         int(token_grid_size),
         float(decay),
+        bool(include_dynamic_mask),
+        float(mask_frame_dropout_prob),
+        float(mask_pixel_dropout_prob),
+        float(mask_false_positive_prob),
+        float(mask_erode_prob),
+        float(mask_dilate_prob),
+        int(mask_max_shift_pixels),
+        bool(merge_dynamic_as_risk),
+        int(dynamic_risk_inflation_cells),
+        bool(exclude_dynamic_from_visibility_history),
+        str(dynamic_risk_mode),
+        float(sector_horizon_s),
+        float(sector_clearance_m),
+        float(sector_sigma_long_m),
+        float(sector_sigma_lat_m),
+        float(sector_softness_m),
+        float(sector_stationary_speed_mps),
     )
     cache = getattr(env, "_instinct_nav_dynamic_map_patch_cache", None)
     if cache is not None and cache.get("key") == cache_key:
@@ -1638,7 +2017,31 @@ def dynamic_map_patches_from_visibility_map(
         pixel_stride=pixel_stride,
         decay=decay,
     )
-    _, history_flat, current_hit_flat, current_depth_flat = manager.update(
+    pixel_mask = None
+    instance_visibility = None
+    if include_dynamic_mask:
+        image_height, image_width = sample["depth"].shape[-2:]
+        mask_result = dynamic_obstacle_mask_observation(
+            env,
+            sensor_cfg,
+            output_height=image_height,
+            output_width=image_width,
+            apply_corruption=True,
+            frame_dropout_prob=mask_frame_dropout_prob,
+            pixel_dropout_prob=mask_pixel_dropout_prob,
+            false_positive_prob=mask_false_positive_prob,
+            erode_prob=mask_erode_prob,
+            dilate_prob=mask_dilate_prob,
+            max_shift_pixels=mask_max_shift_pixels,
+            return_instance_visibility=dynamic_risk_mode == "sector",
+        )
+        if dynamic_risk_mode == "sector":
+            pixel_mask, instance_visibility = mask_result
+        else:
+            pixel_mask = mask_result
+        pixel_mask = pixel_mask.reshape(env.num_envs, 1, image_height, image_width)
+
+    components = manager.update(
         sample["depth"],
         sample["camera_pos_w"],
         sample["camera_quat_w"],
@@ -1646,10 +2049,78 @@ def dynamic_map_patches_from_visibility_map(
         robot.data.root_pos_w,
         robot.data.root_quat_w,
         return_components=True,
+        pixel_mask=pixel_mask,
+        exclude_masked_pixels_from_visibility=exclude_dynamic_from_visibility_history,
     )
+    if include_dynamic_mask:
+        _, history_flat, current_hit_flat, current_depth_flat, dynamic_hit_flat = components
+    else:
+        _, history_flat, current_hit_flat, current_depth_flat = components
+        dynamic_hit_flat = None
     history = history_flat.view(env.num_envs, 1, grid_size, grid_size)
     current_hit_bev = current_hit_flat.view(env.num_envs, 1, grid_size, grid_size)
     current_depth_bev = current_depth_flat.view(env.num_envs, 1, grid_size, grid_size)
+    dynamic_hit_bev = None
+    if dynamic_hit_flat is not None:
+        dynamic_hit_bev = dynamic_hit_flat.view(env.num_envs, 1, grid_size, grid_size)
+        if dynamic_risk_mode == "sector":
+            delayed_state = _delayed_dynamic_state_for_risk(env, sensor_cfg)
+            obstacle_manager = getattr(env, "_dynamic_obstacle_manager", None)
+            if delayed_state is not None and instance_visibility is not None:
+                positions_w, velocities_w, active = delayed_state
+                obstacle_count = active.shape[1]
+                if instance_visibility.shape[1] < obstacle_count:
+                    instance_visibility = F.pad(
+                        instance_visibility,
+                        (0, obstacle_count - instance_visibility.shape[1]),
+                        value=False,
+                    )
+                elif instance_visibility.shape[1] > obstacle_count:
+                    instance_visibility = instance_visibility[:, :obstacle_count]
+                # A simulated detector frame drop must suppress its tracks as
+                # well; otherwise the sector leaks privileged GT information.
+                frame_has_mask = pixel_mask.flatten(start_dim=1).any(dim=1)
+                visible = instance_visibility & frame_has_mask.unsqueeze(1)
+                body_half_extent = float(getattr(obstacle_manager, "body_half_extent", 0.25))
+                sector_risk = _render_dynamic_sector_risk(
+                    positions_w,
+                    velocities_w,
+                    active,
+                    visible,
+                    robot.data.root_pos_w,
+                    robot.data.root_quat_w,
+                    size_m=size_m,
+                    grid_size=grid_size,
+                    body_half_extent_m=body_half_extent,
+                    clearance_m=sector_clearance_m,
+                    horizon_s=sector_horizon_s,
+                    sigma_long_m=sector_sigma_long_m,
+                    sigma_lat_m=sector_sigma_lat_m,
+                    softness_m=sector_softness_m,
+                    stationary_speed_mps=sector_stationary_speed_mps,
+                )
+                dynamic_hit_bev = torch.maximum(dynamic_hit_bev, sector_risk)
+                if obstacle_manager is not None:
+                    obstacle_manager._last_dynamic_sector_risk_rate = (
+                        (sector_risk >= 0.5).float().mean().detach()
+                    )
+                    obstacle_manager._last_dynamic_visible_instances = (
+                        visible.float().sum(dim=1).mean().detach()
+                    )
+        elif dynamic_risk_mode != "occupancy":
+            raise ValueError(f"Unknown dynamic_risk_mode={dynamic_risk_mode!r}")
+        inflation = max(0, int(dynamic_risk_inflation_cells))
+        if inflation > 0:
+            kernel_size = 2 * inflation + 1
+            dynamic_hit_bev = F.max_pool2d(
+                dynamic_hit_bev, kernel_size=kernel_size, stride=1, padding=inflation
+            )
+        if merge_dynamic_as_risk:
+            manager.current_dynamic_risk.copy_(dynamic_hit_bev)
+            safe = 1.0 - dynamic_hit_bev
+            history = history * safe
+            current_hit_bev = current_hit_bev * safe
+            current_depth_bev = current_depth_bev * safe
     patch_size = grid_size // token_grid_size
     if patch_size * token_grid_size != grid_size:
         raise ValueError(f"grid_size={grid_size} must be divisible by token_grid_size={token_grid_size}")
@@ -1677,11 +2148,218 @@ def dynamic_map_patches_from_visibility_map(
         (grad_x + grad_y).clamp(0.0, 1.0), patch_size, patch_size
     ).flatten(start_dim=1)
     visibility_delta = (current_hit - history_score).clamp(-1.0, 1.0)
-    patches = torch.stack(
-        (history_score, current_hit, current_depth, current_edge, visibility_delta), dim=-1
-    ).reshape(env.num_envs, -1)
+    patch_channels = (
+        history_score,
+        current_hit,
+        current_depth,
+        current_edge,
+        visibility_delta,
+    )
+    if dynamic_hit_bev is not None:
+        dynamic_presence = F.max_pool2d(
+            dynamic_hit_bev, patch_size, patch_size
+        ).flatten(start_dim=1)
+        obstacle_manager = getattr(env, "_dynamic_obstacle_manager", None)
+        if obstacle_manager is not None:
+            obstacle_manager._last_dynamic_bev_token_positive_rate = (
+                dynamic_presence.mean().detach()
+            )
+        if not merge_dynamic_as_risk:
+            patch_channels = patch_channels + (dynamic_presence,)
+    patches = torch.stack(patch_channels, dim=-1).reshape(env.num_envs, -1)
     env._instinct_nav_dynamic_map_patch_cache = {"key": cache_key, "patches": patches}
     return patches
+
+
+@torch.no_grad()
+def learned_dynamic_bev_observation(
+    env,
+    sensor_cfg,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    size_m: float = 6.4,
+    grid_size: int = 64,
+    output_grid_size: int = 32,
+    depth_min_m: float = 0.5,
+    depth_max_m: float = 8.0,
+    pixel_stride: int = 2,
+    decay: float = 0.995,
+    mask_frame_dropout_prob: float = 0.08,
+    mask_pixel_dropout_prob: float = 0.05,
+    mask_false_positive_prob: float = 0.0,
+    mask_erode_prob: float = 0.10,
+    mask_dilate_prob: float = 0.15,
+    mask_max_shift_pixels: int = 2,
+    dynamic_history_offsets_s: tuple[float, float] | None = None,
+    dynamic_dilation_kernel: int = 7,
+) -> torch.Tensor:
+    """Build a six-channel BEV image for learned spatial query fusion.
+
+    Channels are persistent static visibility, current static depth hits,
+    normalized current static depth, current dynamic occupancy, and the two
+    preceding dynamic occupancy frames (or the configured time offsets). The dynamic history is warped into the
+    current robot frame before it is returned, making temporal differences
+    describe obstacle motion rather than ego motion.
+
+    Geometry is accumulated at ``grid_size`` resolution, then downsampled to
+    ``output_grid_size`` before PPO storage. Actor and critic calls share the
+    same step cache, so temporal history advances exactly once per policy step.
+    """
+    if grid_size % output_grid_size != 0:
+        raise ValueError(
+            f"grid_size={grid_size} must be divisible by output_grid_size={output_grid_size}"
+        )
+    if dynamic_dilation_kernel < 1 or dynamic_dilation_kernel % 2 != 1:
+        raise ValueError("dynamic_dilation_kernel must be a positive odd integer")
+    history_steps = (1, 2)
+    if dynamic_history_offsets_s is not None:
+        if len(dynamic_history_offsets_s) != 2 or not 0 < dynamic_history_offsets_s[0] < dynamic_history_offsets_s[1]:
+            raise ValueError("dynamic_history_offsets_s must contain two increasing positive times")
+        dt = float(env.step_dt)
+        history_steps = tuple(max(1, round(offset / dt)) for offset in dynamic_history_offsets_s)
+        if history_steps[0] >= history_steps[1]:
+            raise ValueError("dynamic history offsets must resolve to distinct policy steps")
+    cache_key = (
+        "learned_dynamic_bev_observation",
+        getattr(sensor_cfg, "name", "camera"),
+        int(getattr(env, "common_step_counter", -1)),
+        int(grid_size),
+        int(output_grid_size),
+        float(decay),
+        float(mask_frame_dropout_prob),
+        float(mask_pixel_dropout_prob),
+        float(mask_false_positive_prob),
+        float(mask_erode_prob),
+        float(mask_dilate_prob),
+        int(mask_max_shift_pixels),
+        history_steps,
+        int(dynamic_dilation_kernel),
+    )
+    cache = getattr(env, "_instinct_nav_learned_bev_cache", None)
+    if cache is not None and cache.get("key") == cache_key:
+        return cache["bev"]
+
+    sample = _get_delayed_visual_packet(env, sensor_cfg)
+    robot = env.scene[asset_cfg.name]
+    manager = _get_or_create_visibility_map_manager(
+        env,
+        size_m=size_m,
+        grid_size=grid_size,
+        depth_min_m=depth_min_m,
+        depth_max_m=depth_max_m,
+        pixel_stride=pixel_stride,
+        decay=decay,
+    )
+    if manager.dynamic_history is None or manager.dynamic_history.shape[1] != history_steps[-1]:
+        manager.dynamic_history = torch.zeros(
+            (env.num_envs, history_steps[-1], grid_size, grid_size), device=manager.device
+        )
+    image_height, image_width = sample["depth"].shape[-2:]
+    pixel_mask = dynamic_obstacle_mask_observation(
+        env,
+        sensor_cfg,
+        output_height=image_height,
+        output_width=image_width,
+        apply_corruption=True,
+        frame_dropout_prob=mask_frame_dropout_prob,
+        pixel_dropout_prob=mask_pixel_dropout_prob,
+        false_positive_prob=mask_false_positive_prob,
+        erode_prob=mask_erode_prob,
+        dilate_prob=mask_dilate_prob,
+        max_shift_pixels=mask_max_shift_pixels,
+    ).reshape(env.num_envs, 1, image_height, image_width)
+
+    _, _, current_hit_flat, current_depth_flat, dynamic_hit_flat = manager.update(
+        sample["depth"],
+        sample["camera_pos_w"],
+        sample["camera_quat_w"],
+        sample["intrinsics"],
+        robot.data.root_pos_w,
+        robot.data.root_quat_w,
+        return_components=True,
+        pixel_mask=pixel_mask,
+        exclude_masked_pixels_from_visibility=True,
+    )
+    current_hit_native = current_hit_flat.view(env.num_envs, 1, grid_size, grid_size)
+    current_depth = current_depth_flat.view(env.num_envs, 1, grid_size, grid_size)
+    current_dynamic = dynamic_hit_flat.view(env.num_envs, 1, grid_size, grid_size)
+
+    # Preserve a small safety margin around a detected body at the native
+    # 0.1 m grid. This is detector-space morphology, not a hand-designed future
+    # trajectory; motion must be inferred from the temporal channels.
+    current_dynamic = F.max_pool2d(
+        current_dynamic, kernel_size=dynamic_dilation_kernel,
+        stride=1, padding=dynamic_dilation_kernel // 2,
+    )
+    previous_dynamic = manager.dynamic_history[:, [step - 1 for step in history_steps]].clone()
+    manager.dynamic_history[:, 1:].copy_(manager.dynamic_history[:, :-1].clone())
+    manager.dynamic_history[:, 0].copy_(current_dynamic[:, 0])
+    manager.current_dynamic_risk.copy_(current_dynamic)
+
+    downsample = grid_size // output_grid_size
+    static_history = F.avg_pool2d(manager.map, downsample, downsample)
+    current_hit = F.avg_pool2d(current_hit_native, downsample, downsample)
+    depth_sum = F.avg_pool2d(
+        current_depth * (current_hit_native > 0.0), downsample, downsample
+    )
+    current_depth = torch.where(
+        current_hit > 0.0,
+        depth_sum / current_hit.clamp_min(1.0e-6),
+        torch.zeros_like(depth_sum),
+    )
+    current_dynamic = F.max_pool2d(current_dynamic, downsample, downsample)
+    previous_dynamic = F.max_pool2d(previous_dynamic, downsample, downsample)
+    bev = torch.cat(
+        (
+            static_history,
+            current_hit,
+            current_depth,
+            current_dynamic,
+            previous_dynamic[:, 0:1],
+            previous_dynamic[:, 1:2],
+        ),
+        dim=1,
+    ).clamp_(0.0, 1.0)
+
+    obstacle_manager = getattr(env, "_dynamic_obstacle_manager", None)
+    if obstacle_manager is not None:
+        obstacle_manager._last_dynamic_bev_token_positive_rate = current_dynamic.mean().detach()
+    bev_flat = bev.flatten(start_dim=1)
+    env._instinct_nav_learned_bev_cache = {"key": cache_key, "bev": bev_flat}
+    return bev_flat
+
+
+def bev_odometry_pose(env, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")):
+    """Planar odometry for temporal-map alignment only, not navigation features."""
+    robot = env.scene[asset_cfg.name]
+    return torch.cat((robot.data.root_pos_w[:, :2],
+                      _quat_wxyz_to_yaw(robot.data.root_quat_w)[:, None]), 1)
+
+
+def future_occupancy_teacher_state(env, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")):
+    """Training-only actual obstacle state; never append to actor/critic inputs."""
+    robot = env.scene[asset_cfg.name]
+    pose = torch.cat((robot.data.root_pos_w[:, :2], _quat_wxyz_to_yaw(robot.data.root_quat_w)[:, None]), 1)
+    manager = getattr(env, "_dynamic_obstacle_manager", None)
+    count = int(env.cfg.num_obstacles)
+    slots = torch.zeros(env.num_envs, count, 4, device=env.device)
+    if manager is not None:
+        for index in range(count):
+            slots[:, index, :2] = env.scene[f"obstacle_{index}"].data.root_pos_w[:, :2]
+        slots[..., 2] = (manager.spawned_obstacles & manager.curriculum_envs[:, None] & bool(manager.enabled)).float()
+        # The BEV observation has already computed visibility from the aligned
+        # visual packet; do not run or corrupt the detector a second time.
+        cache = getattr(env, "_instinct_nav_direct_mask_cache", None)
+        if (cache is not None and cache["key"][0] == int(env.common_step_counter)
+                and cache["instance_visibility"].shape == slots[..., 3].shape):
+            slots[..., 3] = cache["instance_visibility"].float()
+        relative = slots[..., :2] - pose[:, None, :2]
+        cos, sin = pose[:, 2].cos()[:, None], pose[:, 2].sin()[:, None]
+        local_x = cos * relative[..., 0] + sin * relative[..., 1]
+        local_y = -sin * relative[..., 0] + cos * relative[..., 1]
+        half_size = float(env.cfg.observations.policy.visibility_map.params["size_m"]) / 2
+        slots[..., 3] *= ((local_x.abs() <= half_size + 0.25)
+                         & (local_y.abs() <= half_size + 0.25)).float()
+    return torch.cat((pose, slots.flatten(1)), 1)
 
 
 def in_goal(

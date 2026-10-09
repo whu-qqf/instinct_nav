@@ -25,11 +25,12 @@ class RolloutStorage:
             self.hidden_states = None
             self.dropout_masks = None
             self.mask_labels = None
+            self.future_teacher = None
 
         def clear(self):
             self.__init__()
 
-    def __init__(self, num_envs, num_transitions_per_env, obs_shape, privileged_obs_shape, actions_shape, device="cpu", mask_label_shape=None):
+    def __init__(self, num_envs, num_transitions_per_env, obs_shape, privileged_obs_shape, actions_shape, device="cpu", mask_label_shape=None, future_teacher_shape=None):
         self.device = device
 
         self.obs_shape = obs_shape
@@ -66,6 +67,8 @@ class RolloutStorage:
             self.mask_labels = None
 
         self.num_transitions_per_env = num_transitions_per_env
+        self.future_teacher = (torch.zeros(num_transitions_per_env, num_envs, *future_teacher_shape,
+                                           device=self.device) if future_teacher_shape is not None else None)
         self.num_envs = num_envs
 
         # rnn
@@ -90,6 +93,10 @@ class RolloutStorage:
         self.values[self.step].copy_(transition.values)
         self.actions_log_prob[self.step].copy_(transition.actions_log_prob.view(-1, 1))
         self.mu[self.step].copy_(transition.action_mean)
+        if self.future_teacher is not None:
+            if transition.future_teacher is None:
+                raise ValueError("Future occupancy task requires teacher states for every transition")
+            self.future_teacher[self.step].copy_(transition.future_teacher)
         self.sigma[self.step].copy_(transition.action_sigma)
         if self.mask_labels is not None and transition.mask_labels is not None:
             self.mask_labels[self.step].copy_(transition.mask_labels)
@@ -114,6 +121,7 @@ class RolloutStorage:
         # copy the states
         for i in range(len(hid_a)):
             self.saved_hidden_states_a[i][self.step].copy_(hid_a[i])
+        for i in range(len(hid_c)):
             self.saved_hidden_states_c[i][self.step].copy_(hid_c[i])
 
     def clear(self):

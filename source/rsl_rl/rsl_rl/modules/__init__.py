@@ -6,6 +6,7 @@
 from .actor_critic import ActorCritic
 from .actor_critic_recurrent import ActorCriticRecurrent
 from .actor_critic_sru import ActorCriticSRU
+from .actor_critic_bev_convlstm import ActorCriticBEVConvLSTM
 from .normalizer import EmpiricalNormalization
 
-__all__ = ["ActorCritic", "ActorCriticRecurrent", "ActorCriticSRU", "EmpiricalNormalization"]
+__all__ = ["ActorCritic", "ActorCriticRecurrent", "ActorCriticSRU", "ActorCriticBEVConvLSTM", "EmpiricalNormalization"]

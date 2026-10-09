@@ -309,3 +309,63 @@ configured threshold continuously, or the IMU gravity vector becomes invalid,
 it writes a critical event, publishes the existing motor-off command, and
 exits. Motor-off makes the robot limp: a support harness and a spotter are still
 required and this software guard is not a substitute for the physical E-stop.
+
+## DynamicMapMask YOLO11 segmentation
+
+Training continues to use the IsaacLab GT dynamic-obstacle mask with corruption.
+Deployment uses a single-stage pipeline: registered RealSense RGB -> YOLO11-seg
+instance masks -> depth-aligned 64x64 BEV -> current-only `dynamic_presence`.
+
+The local model assets are intentionally ignored by Git:
+
+```text
+artifacts/deploy_models/yolo11_seg/yolo11s-seg.pt
+```
+
+Default weight provenance:
+
+```text
+yolo11s-seg.pt  sha256 1caa81c0195412efa411b632bcfb8c184939dddb6ae41f6a80c41b211ff257c3
+```
+
+Install the segmentation dependency in the robot/deployment environment, not in
+the Isaac Sim training environment (their `filelock` requirements conflict):
+
+```bash
+pip install -r deploy/requirements-yolo.txt
+```
+
+Export a DynamicMapMask checkpoint with explicit token semantics:
+
+```bash
+python deploy/scripts/export_high_level_sru_onnx.py \
+  --checkpoint_path /path/to/model.pt \
+  --output_dir /path/to/export \
+  --scene_token_layout dynamic_map_mask \
+  --require_onnx_parity
+```
+
+Add the backend to the production command for dry-run validation:
+
+```bash
+--scene_token_layout dynamic_map_mask \
+--dynamic_mask_backend yolo11_seg \
+--yolo11_seg_weights artifacts/deploy_models/yolo11_seg/yolo11s-seg.pt \
+--yolo_dynamic_class_ids 0 \
+--yolo_confidence 0.25 \
+--yolo_iou 0.45 \
+--yolo_device 0
+```
+
+Class IDs refer to the segmentation checkpoint. The official YOLO11s-seg weights
+use COCO classes; `0` selects people. A semantic class does not prove that an
+instance is moving, so deployments that must distinguish stationary people or
+vehicles need temporal tracking.
+
+YOLO11-seg removes the expensive SAM ViT-H image encoder. A real-weight CPU smoke
+on the development EPYC host measured 25.62 ms per 480x270 frame after warm-up
+(39.03 FPS), including Ultralytics preprocessing and mask union. This is not a
+target-computer deadline result. The provider remains dry-run-only until it is
+measured on the robot computer or perception is moved out of the 50 Hz control
+callback. Debug dumps include `color_rgb` and `dynamic_mask` for checking
+registration and mask quality.

@@ -59,6 +59,9 @@ class RslRlPpoActorCriticCfg:
     use_actor_visibility_map: bool = False
     """Whether the actor observation contains a local visibility map after the depth features."""
 
+    use_critic_visibility_map: bool = False
+    """Whether the critic observation contains the same local visibility map after depth."""
+
     use_actor_visibility_early_fusion: bool = False
     """Whether to concatenate the visibility-map feature into the actor recurrent input."""
 
@@ -70,6 +73,9 @@ class RslRlPpoActorCriticCfg:
 
     use_actor_visibility_query_attention: bool = False
     """Whether to query visibility-map tokens with the actor recurrent context before fusion."""
+
+    use_critic_visibility_query_attention: bool = False
+    """Whether to query visibility-map tokens with the critic recurrent context before fusion."""
 
     visibility_map_query_num_heads: int = 4
     """Number of attention heads for actor visibility-map query fusion."""
@@ -95,15 +101,37 @@ class RslRlPpoActorCriticCfg:
     use_dynamic_map_cross_attention: bool = False
     """Whether raw scene patches are fused by current-to-history cross-attention."""
 
+    visibility_map_preserve_spatial_resolution: bool = False
+    """Keep 32x32 query-map features at 8x8 instead of expanding a 4x4 bottleneck."""
+
+    use_future_occupancy: bool = False
+    """Train a two-horizon occupancy decoder from actor BEV features only."""
+
+    use_dynamic_scene_recurrent_fusion: bool = False
+    """Whether dynamic BEV scene-token context is also fused into the actor/critic SRU inputs."""
+
+    dynamic_scene_recurrent_feature_dim: int = 64
+    """Feature dimension of the presence-weighted dynamic context entering each SRU."""
+
     use_dynamic_mask: bool = False
-    """Whether the actor/critic observations contain a raw delayed depth block that feeds
-    a dynamic-obstacle segmentation head (whose pooled feature enters the SRU input)."""
+    """Whether actor/critic observations contain a trailing dynamic-mask input block."""
+
+    dynamic_mask_input_mode: str = "predict_from_depth"
+    """Mask input mode: predict_from_depth learns segmentation, direct_mask flattens
+    an external mask, and encoded_mask applies a spatial CNN before recurrent fusion."""
 
     mask_input_dims: tuple[int, int, int] = (1, 36, 64)
-    """Raw delayed depth shape as (C, H, W) consumed by the mask head (G1 shared camera is 64x36)."""
+    """Trailing input shape as (C, H, W): raw depth for predicted mode or compact mask for direct mode."""
 
     mask_feature_dim: int = 64
-    """Pooled feature dimension of the mask head (injected into the SRU recurrent input)."""
+    """Predicted-mode bottleneck size; direct mode always uses the flattened mask size."""
+
+    dynamic_mask_fusion_mode: Literal["concat", "gated_add"] = "concat"
+    """How the mask feature enters the recurrent stream. ``concat`` preserves the
+    existing checkpoints; ``gated_add`` projects it into each 64D depth feature."""
+
+    dynamic_mask_gate_init: float = 0.1
+    """Initial sigmoid gate value for gated mask-to-depth residual fusion."""
 
 
 @configclass
@@ -153,8 +181,14 @@ class RslRlPpoAlgorithmCfg:
     """The maximum gradient norm."""
 
     lambda_mask: float = 0.0
-    """Coefficient for the auxiliary dynamic-obstacle segmentation loss (BCE + Dice).
-    Default 0.0 disables it; only the DynamicMask tasks set a positive value."""
+    """Auxiliary segmentation coefficient; zero disables the depth-to-mask loss."""
+
+    lambda_future: float = 0.0
+    """Auxiliary future occupancy coefficient; only future-aware tasks enable it."""
+    future_horizon_steps: tuple[int, int] = (2, 4)
+    """0.4/0.8 seconds at the navigation policy's 5 Hz rate."""
+    future_batch_size: int = 256
+    """Maximum sampled source frames per PPO minibatch auxiliary loss."""
 
 
 @configclass

@@ -10,6 +10,7 @@ import torch.optim as optim
 
 from rsl_rl.modules import ActorCritic
 from rsl_rl.storage import RolloutStorage
+from .future_occupancy import future_occupancy_targets
 
 EPSILON = 1e-7
 
@@ -34,10 +35,22 @@ class PPO:
         desired_kl=0.01,
         device="cpu",
         lambda_mask=0.0,
+        lambda_future=0.0,
+        future_horizon_steps=(2, 4),
+        future_batch_size=256,
         **kwargs,
     ):
         self.device = device
         self.lambda_mask = lambda_mask
+        self.lambda_future = float(lambda_future)
+        self.future_horizon_steps = tuple(int(h) for h in future_horizon_steps)
+        self.future_batch_size = int(future_batch_size)
+        self.last_future_metrics = {}
+        if self.lambda_future > 0:
+            if self.future_horizon_steps != (2, 4) or self.future_batch_size < 1:
+                raise ValueError("Future occupancy uses horizons (2, 4) and a positive batch size")
+            if not getattr(actor_critic, "use_future_occupancy", False):
+                raise ValueError("lambda_future requires an enabled prediction head")
 
         self.desired_kl = desired_kl
         self.schedule = schedule
@@ -62,7 +75,9 @@ class PPO:
         self.max_grad_norm = max_grad_norm
         self.use_clipped_value_loss = use_clipped_value_loss
 
-    def init_storage(self, num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, action_shape, mask_label_shape=None):
+    def init_storage(self, num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, action_shape, mask_label_shape=None, future_teacher_shape=None):
+        if self.lambda_future > 0 and (future_teacher_shape is None or num_transitions_per_env <= max(self.future_horizon_steps)):
+            raise ValueError("Future loss requires teacher states and a rollout longer than its horizon")
         self.storage = RolloutStorage(
             num_envs,
             num_transitions_per_env,
@@ -71,6 +86,7 @@ class PPO:
             action_shape,
             self.device,
             mask_label_shape=mask_label_shape,
+            future_teacher_shape=future_teacher_shape,
         )
 
     def test_mode(self):
@@ -121,11 +137,26 @@ class PPO:
         self.actor_critic.reset_dropout_masks()
 
     def update(self, iter, max_iters):
+        self.last_future_metrics = {tag: 0.0 for tag in (
+            "Loss/future_occupancy", "Loss/future_bce", "Loss/future_dice",
+            "Metrics/future/soft_iou", "Metrics/future/label_positive_rate",
+            "Metrics/future/pred_positive_rate", "Metrics/future/valid_fraction",
+        )} if self.lambda_future > 0 else {}
+        future_updates = 0
+        future_candidates = None
+        if self.lambda_future > 0:
+            teacher = self.storage.future_teacher
+            slots = teacher[:-max(self.future_horizon_steps), :, 3:].reshape(
+                teacher.shape[0] - max(self.future_horizon_steps), teacher.shape[1], -1, 4)
+            eligible = ((slots[..., 2] > 0.5) & (slots[..., 3] > 0.5)).any(-1)
+            future_candidates = eligible.nonzero()
         mean_value_loss = 0
         mean_surrogate_loss = 0
         mean_mask_loss = 0
         mean_mask_dice_loss = 0
         mean_mask_positive_rate = 0
+        mean_mask_pred_positive_rate = 0
+        mean_mask_soft_iou = 0
         if self.actor_critic.is_recurrent:
             generator = self.storage.reccurent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
         else:
@@ -202,6 +233,39 @@ class PPO:
 
             loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
 
+            if future_candidates is not None and future_candidates.shape[0] > 0:
+                selected = future_candidates[torch.randint(
+                    future_candidates.shape[0], (self.future_batch_size,), device=self.device)]
+                times, envs = selected.unbind(1)
+                targets, valid = future_occupancy_targets(
+                    self.storage.future_teacher, self.storage.dones, times, envs,
+                    self.future_horizon_steps,
+                )
+                if valid.any():
+                    if hasattr(self.actor_critic, "predict_future_from_rollout"):
+                        predictions = self.actor_critic.predict_future_from_rollout(self.storage, times, envs)
+                    else:
+                        predictions = self.actor_critic.predict_future_occupancy(self.storage.observations[times, envs])
+                    logits, labels = predictions[valid], targets[valid]
+                    bce = torch.nn.functional.binary_cross_entropy_with_logits(
+                        logits, labels, pos_weight=logits.new_tensor(20.0))
+                    probabilities = logits.sigmoid()
+                    intersection = (probabilities * labels).sum((-2, -1))
+                    union = probabilities.sum((-2, -1)) + labels.sum((-2, -1))
+                    dice = (1 - (2 * intersection + 1) / (union + 1)).mean()
+                    loss = loss + self.lambda_future * (bce + dice)
+                    metrics = {
+                        "Loss/future_occupancy": bce + dice, "Loss/future_bce": bce,
+                        "Loss/future_dice": dice,
+                        "Metrics/future/soft_iou": (intersection / (union - intersection).clamp_min(1e-6)).mean(),
+                        "Metrics/future/label_positive_rate": labels.mean(),
+                        "Metrics/future/pred_positive_rate": (probabilities >= 0.5).float().mean(),
+                        "Metrics/future/valid_fraction": valid.float().mean(),
+                    }
+                    for tag, value in metrics.items():
+                        self.last_future_metrics[tag] += value.detach().item()
+                    future_updates += 1
+
             # Auxiliary dynamic-obstacle segmentation loss (BCE + Dice) against the
             # training-time mask label. The mask prediction is cached by the actor
             # forward pass (self.actor_critic._mask_pred).
@@ -216,9 +280,15 @@ class PPO:
                 intersection = (mask_pred * mask_labels_batch).sum()
                 dice = 1.0 - (2.0 * intersection + smooth) / (mask_pred.sum() + mask_labels_batch.sum() + smooth)
                 loss = loss + self.lambda_mask * (bce + dice)
+                soft_union = mask_pred.sum() + mask_labels_batch.sum() - intersection
+                # Treat empty prediction/target batches as zero IoU so early
+                # no-obstacle minibatches do not inflate the training metric.
+                soft_iou = intersection / soft_union.clamp_min(1.0e-6)
                 mean_mask_loss += (bce + dice).item()
                 mean_mask_dice_loss += dice.item()
                 mean_mask_positive_rate += mask_labels_batch.mean().item()
+                mean_mask_pred_positive_rate += (mask_pred >= 0.5).float().mean().item()
+                mean_mask_soft_iou += soft_iou.item()
 
             # Gradient step
             self.optimizer.zero_grad()
@@ -239,6 +309,18 @@ class PPO:
         mean_mask_loss /= num_updates
         mean_mask_dice_loss /= num_updates
         mean_mask_positive_rate /= num_updates
+        mean_mask_pred_positive_rate /= num_updates
+        mean_mask_soft_iou /= num_updates
+        for tag in self.last_future_metrics:
+            self.last_future_metrics[tag] /= max(1, future_updates)
         self.storage.clear()
 
-        return mean_value_loss, mean_surrogate_loss, mean_mask_loss, mean_mask_dice_loss, mean_mask_positive_rate
+        return (
+            mean_value_loss,
+            mean_surrogate_loss,
+            mean_mask_loss,
+            mean_mask_dice_loss,
+            mean_mask_positive_rate,
+            mean_mask_pred_positive_rate,
+            mean_mask_soft_iou,
+        )

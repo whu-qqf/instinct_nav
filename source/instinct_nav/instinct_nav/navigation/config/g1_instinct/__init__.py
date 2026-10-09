@@ -313,6 +313,19 @@ _register_navigation_task(
     agents.rsl_rl_cfg.G1InstinctNavPPODynamicMapCrossOfficialRunnerCfg,
 )
 
+# Dynamic-scene eval: v3 DynamicMapCross-BEV network + current training's dynamic-obstacle
+# generation logic (5 obstacles, 1.6 m tall, full difficulty, 100% envs, staggered patrol).
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-DynamicMapCross-RichTerrain-Centerline-Unobserved-DynamicEval-OfficialParkour-Play-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_DYNAMIC_EVAL_PLAY,
+    agents.rsl_rl_cfg.G1InstinctNavPPODynamicMapCrossOfficialRunnerCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-DynamicMapCross-RichTerrain-Centerline-Unobserved-DynamicEvalPhysical-OfficialParkour-Play-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_DYNAMIC_EVAL_PHYSICAL_PLAY,
+    agents.rsl_rl_cfg.G1InstinctNavPPODynamicMapCrossOfficialRunnerCfg,
+)
+
 # Ablation: Centerline-Unobserved + rebalanced avoidance reward (P0) + capability-driven
 # graded obstacle curriculum (P1). Isolated via graded_curriculum flag; all other tasks
 # keep the legacy binary iteration switch and inert (weight-0) TTC term.
@@ -420,7 +433,390 @@ _register_navigation_task(
     agents.rsl_rl_cfg.G1InstinctNavPPODynamicMapCrossBanksOfficialRunnerCfg,
 )
 
+# AvoidReact-Banks + 6D DynamicMapCross tokens. Dynamic-mask pixels are
+# back-projected with delayed depth into a current-only BEV presence channel.
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-DynamicMapCross-RichTerrain-NoCenterline-Unobserved-AvoidReact-DynamicMapMask-Banks-OfficialParkour-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_REACT_DYNAMIC_MAP_MASK_BANKS,
+    agents.rsl_rl_cfg.G1InstinctNavPPODynamicMapMaskBanksOfficialRunnerCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-DynamicMapCross-RichTerrain-NoCenterline-Unobserved-AvoidReact-DynamicMapMask-Banks-OfficialParkour-Dev-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_REACT_DYNAMIC_MAP_MASK_BANKS_DEV,
+    agents.rsl_rl_cfg.G1InstinctNavPPODynamicMapMaskBanksOfficialRunnerDevCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-DynamicMapCross-RichTerrain-NoCenterline-Unobserved-AvoidReact-DynamicMapMask-Banks-OfficialParkour-Play-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_REACT_DYNAMIC_MAP_MASK_BANKS_PLAY,
+    agents.rsl_rl_cfg.G1InstinctNavPPODynamicMapMaskBanksOfficialRunnerCfg,
+)
+
+# DynamicMapMask recurrent-fusion ablation. The same 6D BEV tokens are pooled
+# into a dynamic context before both SRUs while retaining late scene attention.
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-DynamicMapCross-RichTerrain-NoCenterline-Unobserved-AvoidReact-DynamicMapMask-RecurrentFusion-Banks-OfficialParkour-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_DYNAMIC_MAP_MASK_RECURRENT_FUSION_BANKS,
+    agents.rsl_rl_cfg.G1InstinctNavPPODynamicMapMaskRecurrentFusionBanksOfficialRunnerCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-DynamicMapCross-RichTerrain-NoCenterline-Unobserved-AvoidReact-DynamicMapMask-RecurrentFusion-Banks-OfficialParkour-Dev-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_DYNAMIC_MAP_MASK_RECURRENT_FUSION_BANKS_DEV,
+    agents.rsl_rl_cfg.G1InstinctNavPPODynamicMapMaskRecurrentFusionBanksOfficialRunnerDevCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-DynamicMapCross-RichTerrain-NoCenterline-Unobserved-AvoidReact-DynamicMapMask-RecurrentFusion-Banks-OfficialParkour-Play-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_DYNAMIC_MAP_MASK_RECURRENT_FUSION_BANKS_PLAY,
+    agents.rsl_rl_cfg.G1InstinctNavPPODynamicMapMaskRecurrentFusionBanksOfficialRunnerCfg,
+)
+
+# AvoidReact-Banks + direct 9x16 dynamic mask observation. Simulation supplies a
+# delayed, YOLO-corrupted mask; the policy consumes it without a learned mask CNN.
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-DynamicMapCross-RichTerrain-Centerline-Unobserved-AvoidReact-DirectMask-Banks-OfficialParkour-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_REACT_DIRECT_MASK_BANKS,
+    agents.rsl_rl_cfg.G1InstinctNavPPODirectMaskBanksOfficialRunnerCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-DynamicMapCross-RichTerrain-Centerline-Unobserved-AvoidReact-DirectMask-Banks-OfficialParkour-Dev-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_REACT_DIRECT_MASK_BANKS_DEV,
+    agents.rsl_rl_cfg.G1InstinctNavPPODirectMaskBanksOfficialRunnerDevCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-DynamicMapCross-RichTerrain-Centerline-Unobserved-AvoidReact-DirectMask-Banks-OfficialParkour-Play-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_REACT_DIRECT_MASK_BANKS_PLAY,
+    agents.rsl_rl_cfg.G1InstinctNavPPODirectMaskBanksOfficialRunnerCfg,
+)
+
+# External mask/depth image features enter both SRUs; visibility BEV remains
+# available through the inherited map-query branch.
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-RichTerrain-NoCenterline-AvoidReact-MaskCNN-Banks-OfficialParkour-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_MASK_CNN_RICH_TERRAIN_AVOID_REACT_BANKS,
+    agents.rsl_rl_cfg.G1InstinctNavPPOMaskCnnBanksOfficialRunnerCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-RichTerrain-NoCenterline-AvoidReact-MaskCNN-Banks-OfficialParkour-Dev-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_MASK_CNN_RICH_TERRAIN_AVOID_REACT_BANKS_DEV,
+    agents.rsl_rl_cfg.G1InstinctNavPPOMaskCnnBanksOfficialRunnerDevCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-RichTerrain-NoCenterline-AvoidReact-MaskCNN-Banks-OfficialParkour-Play-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_MASK_CNN_RICH_TERRAIN_AVOID_REACT_BANKS_PLAY,
+    agents.rsl_rl_cfg.G1InstinctNavPPOMaskCnnBanksOfficialRunnerCfg,
+)
+
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-MaskCNN-OldBaseline-OfficialParkour-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_MASK_CNN_OLD_BASELINE,
+    agents.rsl_rl_cfg.G1InstinctNavPPOMaskCnnOldBaselineRunnerCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-MaskCNN-OldBaseline-OfficialParkour-Dev-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_MASK_CNN_OLD_BASELINE_DEV,
+    agents.rsl_rl_cfg.G1InstinctNavPPOMaskCnnOldBaselineRunnerDevCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-MaskCNN-OldBaseline-OfficialParkour-Play-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_MASK_CNN_OLD_BASELINE_PLAY,
+    agents.rsl_rl_cfg.G1InstinctNavPPOMaskCnnOldBaselineRunnerCfg,
+)
+
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-MaskCNN-Encounter-RestoredRewards-Banks-OfficialParkour-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_MASK_CNN_ENCOUNTER_RESTORED_REWARDS,
+    agents.rsl_rl_cfg.G1InstinctNavPPOMaskCnnBanksOfficialRunnerCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-MaskCNN-Encounter-RestoredRewards-Banks-OfficialParkour-Dev-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_MASK_CNN_ENCOUNTER_RESTORED_REWARDS_DEV,
+    agents.rsl_rl_cfg.G1InstinctNavPPOMaskCnnBanksOfficialRunnerDevCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-MaskCNN-Encounter-RestoredRewards-Banks-OfficialParkour-Play-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_MASK_CNN_ENCOUNTER_RESTORED_REWARDS_PLAY,
+    agents.rsl_rl_cfg.G1InstinctNavPPOMaskCnnBanksOfficialRunnerCfg,
+)
+
+# MaskCNN64 gated residual fusion with the restored navigation rewards. Dynamic
+# obstacles start at difficulty 1 in every environment and use 1.6 m geometry.
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-MaskCNN64-GatedAdd-Encounter-RestoredRewards-Banks-OfficialParkour-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_MASK_CNN64_GATED_ADD,
+    agents.rsl_rl_cfg.G1InstinctNavPPOMaskCnn64GatedAddBanksOfficialRunnerCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-MaskCNN64-GatedAdd-Encounter-RestoredRewards-Banks-OfficialParkour-Dev-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_MASK_CNN64_GATED_ADD_DEV,
+    agents.rsl_rl_cfg.G1InstinctNavPPOMaskCnn64GatedAddBanksOfficialRunnerDevCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-MaskCNN64-GatedAdd-Encounter-RestoredRewards-Banks-OfficialParkour-Play-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_MASK_CNN64_GATED_ADD_PLAY,
+    agents.rsl_rl_cfg.G1InstinctNavPPOMaskCnn64GatedAddBanksOfficialRunnerCfg,
+)
+
+# Small mask-CNN feature concatenated to the SRU, with the same hard obstacle
+# setup as MaskCNN64-GatedAdd for a controlled architecture comparison.
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-MaskCNN32-Concat-Encounter-RestoredRewards-Banks-OfficialParkour-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_MASK_CNN32_CONCAT,
+    agents.rsl_rl_cfg.G1InstinctNavPPOMaskCnn32ConcatBanksOfficialRunnerCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-MaskCNN32-Concat-Encounter-RestoredRewards-Banks-OfficialParkour-Dev-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_MASK_CNN32_CONCAT_DEV,
+    agents.rsl_rl_cfg.G1InstinctNavPPOMaskCnn32ConcatBanksOfficialRunnerDevCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-MaskCNN32-Concat-Encounter-RestoredRewards-Banks-OfficialParkour-Play-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_MASK_CNN32_CONCAT_PLAY,
+    agents.rsl_rl_cfg.G1InstinctNavPPOMaskCnn32ConcatBanksOfficialRunnerCfg,
+)
+
+# Identical hard encounter/bank setup, with only the mask observation and encoder removed.
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-NoMaskControl-Encounter-RestoredRewards-Banks-OfficialParkour-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_NOMASK_CONTROL,
+    agents.rsl_rl_cfg.G1InstinctNavPPONoMaskControlBanksOfficialRunnerCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-NoMaskControl-Encounter-RestoredRewards-Banks-OfficialParkour-Dev-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_NOMASK_CONTROL_DEV,
+    agents.rsl_rl_cfg.G1InstinctNavPPONoMaskControlBanksOfficialRunnerDevCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-NoMaskControl-Encounter-RestoredRewards-Banks-OfficialParkour-Play-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_NOMASK_CONTROL_PLAY,
+    agents.rsl_rl_cfg.G1InstinctNavPPONoMaskControlBanksOfficialRunnerCfg,
+)
+
+# Original 5D DynamicMapCross/SRU structure. Dynamic masks are projected with
+# delayed depth and rendered as current-only black/high-risk visibility cells;
+# terrain banks advance only after the current bank reaches 90% success.
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-DynamicRiskBEV-Encounter-RestoredRewards-SuccessBanks-OfficialParkour-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_DYNAMIC_RISK_BEV_SUCCESS_BANKS,
+    agents.rsl_rl_cfg.G1InstinctNavPPODynamicRiskBevSuccessBanksRunnerCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-DynamicRiskBEV-Encounter-RestoredRewards-SuccessBanks-OfficialParkour-Dev-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_DYNAMIC_RISK_BEV_SUCCESS_BANKS_DEV,
+    agents.rsl_rl_cfg.G1InstinctNavPPODynamicRiskBevSuccessBanksRunnerDevCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-DynamicRiskBEV-Encounter-RestoredRewards-SuccessBanks-OfficialParkour-Play-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_DYNAMIC_RISK_BEV_SUCCESS_BANKS_PLAY,
+    agents.rsl_rl_cfg.G1InstinctNavPPODynamicRiskBevSuccessBanksRunnerCfg,
+)
+
+# One continuous run on one terrain bank: mask/depth projection is active from
+# iteration 0, obstacles are disabled for 5000 iterations, then enabled in a
+# fixed 50% environment cohort for the remaining 2000 iterations.
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-DynamicRiskBEV-Static5000-Mixed50-SingleTerrain-OfficialParkour-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_DYNAMIC_RISK_BEV_STATIC5000_MIXED50_SINGLE_TERRAIN,
+    agents.rsl_rl_cfg.G1InstinctNavPPODynamicRiskBevPhasedSingleTerrainRunnerCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-DynamicRiskBEV-Static5000-Mixed50-SingleTerrain-OfficialParkour-Dev-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_DYNAMIC_RISK_BEV_STATIC5000_MIXED50_SINGLE_TERRAIN_DEV,
+    agents.rsl_rl_cfg.G1InstinctNavPPODynamicRiskBevPhasedSingleTerrainRunnerDevCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-DynamicRiskBEV-Static5000-Mixed50-SingleTerrain-OfficialParkour-Play-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_DYNAMIC_RISK_BEV_STATIC5000_MIXED50_SINGLE_TERRAIN_PLAY,
+    agents.rsl_rl_cfg.G1InstinctNavPPODynamicRiskBevPhasedSingleTerrainRunnerCfg,
+)
+
+# Controlled two-run ablation. Both runs use one terrain set and the same
+# 3000-static + 2000-mixed50 schedule; only the 5D visibility BEV differs.
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-Ablation-NoBEV-Static3000-Mixed50-OfficialParkour-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_ABLATION_SRU_NOBEV_STATIC3000_MIXED50,
+    agents.rsl_rl_cfg.G1InstinctNavPPOAblationNoBevPhasedRunnerCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-Ablation-NoBEV-Static3000-Mixed50-OfficialParkour-Dev-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_ABLATION_SRU_NOBEV_STATIC3000_MIXED50_DEV,
+    agents.rsl_rl_cfg.G1InstinctNavPPOAblationNoBevPhasedRunnerDevCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-Ablation-NoBEV-Static3000-Mixed50-OfficialParkour-Play-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_ABLATION_SRU_NOBEV_STATIC3000_MIXED50_PLAY,
+    agents.rsl_rl_cfg.G1InstinctNavPPOAblationNoBevPhasedRunnerCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-Ablation-BEV-Static3000-Mixed50-OfficialParkour-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_ABLATION_SRU_BEV_STATIC3000_MIXED50,
+    agents.rsl_rl_cfg.G1InstinctNavPPOAblationBevPhasedRunnerCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-Ablation-BEV-Static3000-Mixed50-OfficialParkour-Dev-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_ABLATION_SRU_BEV_STATIC3000_MIXED50_DEV,
+    agents.rsl_rl_cfg.G1InstinctNavPPOAblationBevPhasedRunnerDevCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-Ablation-BEV-Static3000-Mixed50-OfficialParkour-Play-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_ABLATION_SRU_BEV_STATIC3000_MIXED50_PLAY,
+    agents.rsl_rl_cfg.G1InstinctNavPPOAblationBevPhasedRunnerCfg,
+)
+
+# Human-scale terrain calibration: the 30 m tile is retained, while topology is
+# densified from 15x15 at 2.0 m to 20x20 at 1.5 m and pit bridges use one cell.
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-Ablation-NoBEV-HumanScale20-OfficialParkour-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_ABLATION_SRU_NOBEV_HUMAN_SCALE20,
+    agents.rsl_rl_cfg.G1InstinctNavPPOAblationNoBevHumanScale20RunnerCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-Ablation-NoBEV-HumanScale20-OfficialParkour-Dev-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_ABLATION_SRU_NOBEV_HUMAN_SCALE20_DEV,
+    agents.rsl_rl_cfg.G1InstinctNavPPOAblationNoBevHumanScale20RunnerDevCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-Ablation-NoBEV-HumanScale20-OfficialParkour-Play-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_ABLATION_SRU_NOBEV_HUMAN_SCALE20_PLAY,
+    agents.rsl_rl_cfg.G1InstinctNavPPOAblationNoBevHumanScale20RunnerCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-Ablation-BEV-HumanScale20-OfficialParkour-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_ABLATION_SRU_BEV_HUMAN_SCALE20,
+    agents.rsl_rl_cfg.G1InstinctNavPPOAblationBevHumanScale20RunnerCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-Ablation-BEV-HumanScale20-OfficialParkour-Dev-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_ABLATION_SRU_BEV_HUMAN_SCALE20_DEV,
+    agents.rsl_rl_cfg.G1InstinctNavPPOAblationBevHumanScale20RunnerDevCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-Ablation-BEV-HumanScale20-OfficialParkour-Play-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_ABLATION_SRU_BEV_HUMAN_SCALE20_PLAY,
+    agents.rsl_rl_cfg.G1InstinctNavPPOAblationBevHumanScale20RunnerCfg,
+)
+
+# HardEncounterV2 holds the environment schedule fixed across all three
+# observation ablations: 1000 static iterations, then 100% dynamic environments
+# with a recyclable 3/4-obstacle local conflict pool.
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-Ablation-NoBEV-HardEncounterV2-OfficialParkour-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_ABLATION_SRU_NOBEV_HARD_ENCOUNTER_V2,
+    agents.rsl_rl_cfg.G1InstinctNavPPOHardEncounterV2NoBevRunnerCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-Ablation-NoBEV-HardEncounterV2-OfficialParkour-Dev-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_ABLATION_SRU_NOBEV_HARD_ENCOUNTER_V2_DEV,
+    agents.rsl_rl_cfg.G1InstinctNavPPOHardEncounterV2NoBevRunnerDevCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-Ablation-NoBEV-HardEncounterV2-OfficialParkour-Play-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_ABLATION_SRU_NOBEV_HARD_ENCOUNTER_V2_PLAY,
+    agents.rsl_rl_cfg.G1InstinctNavPPOHardEncounterV2NoBevRunnerCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-Ablation-CurrentRiskBEV-HardEncounterV2-OfficialParkour-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_ABLATION_SRU_CURRENT_RISK_HARD_ENCOUNTER_V2,
+    agents.rsl_rl_cfg.G1InstinctNavPPOHardEncounterV2CurrentRiskRunnerCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-Ablation-CurrentRiskBEV-HardEncounterV2-OfficialParkour-Dev-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_ABLATION_SRU_CURRENT_RISK_HARD_ENCOUNTER_V2_DEV,
+    agents.rsl_rl_cfg.G1InstinctNavPPOHardEncounterV2CurrentRiskRunnerDevCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-Ablation-CurrentRiskBEV-HardEncounterV2-OfficialParkour-Play-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_ABLATION_SRU_CURRENT_RISK_HARD_ENCOUNTER_V2_PLAY,
+    agents.rsl_rl_cfg.G1InstinctNavPPOHardEncounterV2CurrentRiskRunnerCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-Ablation-SectorRiskBEV-HardEncounterV2-OfficialParkour-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_ABLATION_SRU_SECTOR_RISK_HARD_ENCOUNTER_V2,
+    agents.rsl_rl_cfg.G1InstinctNavPPOHardEncounterV2SectorRiskRunnerCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-Ablation-SectorRiskBEV-HardEncounterV2-OfficialParkour-Dev-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_ABLATION_SRU_SECTOR_RISK_HARD_ENCOUNTER_V2_DEV,
+    agents.rsl_rl_cfg.G1InstinctNavPPOHardEncounterV2SectorRiskRunnerDevCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-Ablation-SectorRiskBEV-HardEncounterV2-OfficialParkour-Play-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_ABLATION_SRU_SECTOR_RISK_HARD_ENCOUNTER_V2_PLAY,
+    agents.rsl_rl_cfg.G1InstinctNavPPOHardEncounterV2SectorRiskRunnerCfg,
+)
+
+# HardEncounterV3 keeps the V2 schedule but uses human-scale cylinders. The
+# paired tasks isolate learned temporal-BEV query fusion from the environment.
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-Ablation-NoBEV-HardEncounterV3Cylinder-OfficialParkour-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_ABLATION_SRU_NOBEV_HARD_ENCOUNTER_V3_CYLINDER,
+    agents.rsl_rl_cfg.G1InstinctNavPPOHardEncounterV3CylinderNoBevRunnerCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-Ablation-NoBEV-HardEncounterV3Cylinder-OfficialParkour-Dev-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_ABLATION_SRU_NOBEV_HARD_ENCOUNTER_V3_CYLINDER_DEV,
+    agents.rsl_rl_cfg.G1InstinctNavPPOHardEncounterV3CylinderNoBevRunnerDevCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-Ablation-NoBEV-HardEncounterV3Cylinder-OfficialParkour-Play-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_ABLATION_SRU_NOBEV_HARD_ENCOUNTER_V3_CYLINDER_PLAY,
+    agents.rsl_rl_cfg.G1InstinctNavPPOHardEncounterV3CylinderNoBevRunnerCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-LearnedBEVQuery-HardEncounterV3Cylinder-OfficialParkour-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_LEARNED_BEV_QUERY_HARD_ENCOUNTER_V3_CYLINDER,
+    agents.rsl_rl_cfg.G1InstinctNavPPOLearnedBevQueryHardEncounterV3CylinderRunnerCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-LearnedBEVQuery-HardEncounterV3Cylinder-OfficialParkour-Dev-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_LEARNED_BEV_QUERY_HARD_ENCOUNTER_V3_CYLINDER_DEV,
+    agents.rsl_rl_cfg.G1InstinctNavPPOLearnedBevQueryHardEncounterV3CylinderRunnerDevCfg,
+)
+_register_navigation_task(
+    "Instinct-Nav-G1-SRU-LearnedBEVQuery-HardEncounterV3Cylinder-OfficialParkour-Play-v0",
+    navigation_env_cfg.G1InstinctNavigationEnvCfg_LEARNED_BEV_QUERY_HARD_ENCOUNTER_V3_CYLINDER_PLAY,
+    agents.rsl_rl_cfg.G1InstinctNavPPOLearnedBevQueryHardEncounterV3CylinderRunnerCfg,
+)
+
+for suffix, env_type, runner_type in (
+    ("v0", navigation_env_cfg.G1InstinctNavigationEnvCfg_MOTION_BEV_QUERY_HARD_V3,
+     agents.rsl_rl_cfg.G1InstinctNavPPOMotionBevQueryHardV3RunnerCfg),
+    ("Dev-v0", navigation_env_cfg.G1InstinctNavigationEnvCfg_MOTION_BEV_QUERY_HARD_V3_DEV,
+     agents.rsl_rl_cfg.G1InstinctNavPPOMotionBevQueryHardV3RunnerDevCfg),
+    ("Play-v0", navigation_env_cfg.G1InstinctNavigationEnvCfg_MOTION_BEV_QUERY_HARD_V3_PLAY,
+     agents.rsl_rl_cfg.G1InstinctNavPPOMotionBevQueryHardV3RunnerCfg),
+):
+    _register_navigation_task(f"Instinct-Nav-G1-SRU-MotionBEVQuery-HardV3-OfficialParkour-{suffix}", env_type, runner_type)
+
+for suffix, env_type, runner_type in (
+    ("v0", navigation_env_cfg.G1InstinctNavigationEnvCfg_NOBEV_REWARD_MATCHED_HARD_V3,
+     agents.rsl_rl_cfg.G1InstinctNavPPONoBevRewardMatchedHardV3RunnerCfg),
+    ("Dev-v0", navigation_env_cfg.G1InstinctNavigationEnvCfg_NOBEV_REWARD_MATCHED_HARD_V3_DEV,
+     agents.rsl_rl_cfg.G1InstinctNavPPONoBevRewardMatchedHardV3RunnerDevCfg),
+    ("Play-v0", navigation_env_cfg.G1InstinctNavigationEnvCfg_NOBEV_REWARD_MATCHED_HARD_V3_PLAY,
+     agents.rsl_rl_cfg.G1InstinctNavPPONoBevRewardMatchedHardV3RunnerCfg),
+):
+    _register_navigation_task(f"Instinct-Nav-G1-SRU-NoBEVRewardMatched-HardV3-OfficialParkour-{suffix}", env_type, runner_type)
+
+for suffix, env_type, runner_type in (
+    ("v0", navigation_env_cfg.G1InstinctNavigationEnvCfg_MOTION_BEV_FUTURE_HARD_V3,
+     agents.rsl_rl_cfg.G1InstinctNavPPOMotionBevFutureHardV3RunnerCfg),
+    ("Dev-v0", navigation_env_cfg.G1InstinctNavigationEnvCfg_MOTION_BEV_FUTURE_HARD_V3_DEV,
+     agents.rsl_rl_cfg.G1InstinctNavPPOMotionBevFutureHardV3RunnerDevCfg),
+    ("Play-v0", navigation_env_cfg.G1InstinctNavigationEnvCfg_MOTION_BEV_FUTURE_HARD_V3_PLAY,
+     agents.rsl_rl_cfg.G1InstinctNavPPOMotionBevFutureHardV3RunnerCfg),
+):
+    _register_navigation_task(f"Instinct-Nav-G1-SRU-MotionBEVFuture-HardV3-OfficialParkour-{suffix}", env_type, runner_type)
+
 # AvoidReact-Banks + dynamic-obstacle segmentation mask head (raw delayed depth -> mask
+for suffix, env_type, runner_type in (
+    ("v0", navigation_env_cfg.G1InstinctNavigationEnvCfg_MOTION_BEV_CONVLSTM_HARD_V3,
+     agents.rsl_rl_cfg.G1InstinctNavPPOMotionBevConvLSTMHardV3RunnerCfg),
+    ("Dev-v0", navigation_env_cfg.G1InstinctNavigationEnvCfg_MOTION_BEV_CONVLSTM_HARD_V3_DEV,
+     agents.rsl_rl_cfg.G1InstinctNavPPOMotionBevConvLSTMHardV3RunnerDevCfg),
+    ("Play-v0", navigation_env_cfg.G1InstinctNavigationEnvCfg_MOTION_BEV_CONVLSTM_HARD_V3_PLAY,
+     agents.rsl_rl_cfg.G1InstinctNavPPOMotionBevConvLSTMHardV3RunnerCfg),
+):
+    _register_navigation_task(f"Instinct-Nav-G1-SRU-MotionBEVConvLSTM-HardV3-OfficialParkour-{suffix}", env_type, runner_type)
+
 # CNN -> SRU feature) trained with an auxiliary BCE+Dice mask loss. Uses the dedicated
 # DynamicMask runner cfg (use_dynamic_mask=True, lambda_mask=0.2).
 _register_navigation_task(

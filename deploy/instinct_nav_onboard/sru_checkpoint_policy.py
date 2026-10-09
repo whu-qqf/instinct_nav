@@ -45,6 +45,8 @@ class SceneTokenSruPolicyConfig:
     scene_token_feature_dim: int = 64
     scene_token_query_num_heads: int = 4
     use_dynamic_map_cross_attention: bool = False
+    use_dynamic_scene_recurrent_fusion: bool = False
+    dynamic_scene_recurrent_feature_dim: int = 64
 
 
 class SceneTokenSruCheckpointPolicy(torch.nn.Module):
@@ -67,12 +69,27 @@ class SceneTokenSruCheckpointPolicy(torch.nn.Module):
         if cfg is None:
             cfg = SceneTokenSruPolicyConfig()
             if any("history_map_projector" in key for key in state_dict):
+                current_weight = state_dict.get("current_map_projector.0.weight")
+                if current_weight is None:
+                    raise RuntimeError("DynamicMapCross checkpoint is missing current_map_projector.0.weight")
+                scene_token_dim = int(current_weight.shape[1]) + 1
+                recurrent_fusion = any("dynamic_scene_recurrent_projector" in key for key in state_dict)
+                recurrent_feature_dim = 64
+                if recurrent_fusion:
+                    recurrent_weight = state_dict.get("dynamic_scene_recurrent_projector.0.weight")
+                    if recurrent_weight is None:
+                        raise RuntimeError(
+                            "Recurrent-fusion checkpoint is missing dynamic_scene_recurrent_projector.0.weight"
+                        )
+                    recurrent_feature_dim = int(recurrent_weight.shape[0])
                 cfg = replace(
                     cfg,
-                    num_actor_obs=16 + 64 * 5 * 8 + 64 * 5,
-                    num_critic_obs=16 + 64 * 7 * 7 + 64 * 5 * 8 + 64 * 5 + 1,
-                    scene_token_dim=5,
+                    num_actor_obs=16 + 64 * 5 * 8 + 64 * scene_token_dim,
+                    num_critic_obs=16 + 64 * 7 * 7 + 64 * 5 * 8 + 64 * scene_token_dim + 1,
+                    scene_token_dim=scene_token_dim,
                     use_dynamic_map_cross_attention=True,
+                    use_dynamic_scene_recurrent_fusion=recurrent_fusion,
+                    dynamic_scene_recurrent_feature_dim=recurrent_feature_dim,
                 )
         self.cfg = cfg
         self.device = torch.device(device)
@@ -102,6 +119,8 @@ class SceneTokenSruCheckpointPolicy(torch.nn.Module):
             scene_token_feature_dim=self.cfg.scene_token_feature_dim,
             scene_token_query_num_heads=self.cfg.scene_token_query_num_heads,
             use_dynamic_map_cross_attention=self.cfg.use_dynamic_map_cross_attention,
+            use_dynamic_scene_recurrent_fusion=self.cfg.use_dynamic_scene_recurrent_fusion,
+            dynamic_scene_recurrent_feature_dim=self.cfg.dynamic_scene_recurrent_feature_dim,
         )
         missing, unexpected = self.actor_critic.load_state_dict(state_dict, strict=False)
         if missing or unexpected:

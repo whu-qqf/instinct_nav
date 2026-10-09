@@ -10,6 +10,7 @@ import numpy as np
 import onnxruntime as ort
 
 from .config import OnboardConfig
+from .dynamic_mask import DynamicMaskProvider, resize_binary_mask
 from .packets import SensorPacket, VelocityCommand
 
 
@@ -24,6 +25,8 @@ class OnnxPolicyContract:
     scene_token_features_total: int | None = None
     encoded_depth_dim: int | None = None
     proprio_dim: int | None = None
+    scene_token_layout: str | None = None
+
 
 @dataclass(frozen=True)
 class OnnxDebugDumpConfig:
@@ -45,6 +48,7 @@ class OnnxHighLevelRuntime:
         providers: list[str] | None = None,
         debug_dump_config: OnnxDebugDumpConfig | None = None,
         manifest_path: str | Path | None = None,
+        dynamic_mask_provider: DynamicMaskProvider | None = None,
     ):
         manifest = (
             _read_manifest(manifest_path)
@@ -62,15 +66,21 @@ class OnnxHighLevelRuntime:
                     scene_token_feature_dim=token_dim,
                     scene_token_dim=token_num * token_dim,
                 ),
+                scene_token_layout=str(manifest.get("scene_token_layout", cfg.scene_token_layout)),
+                visibility_decay=float(manifest.get("visibility_decay", cfg.visibility_decay)),
             )
         self.cfg = cfg
         self.command_sink = command_sink
+        self.dynamic_mask_provider = dynamic_mask_provider
         self.providers = providers or ort.get_available_providers()
         self.policy_onnx_path = Path(policy_onnx_path).expanduser()
         self.depth_encoder_onnx_path = Path(depth_encoder_onnx_path).expanduser()
         self.policy_session = ort.InferenceSession(str(self.policy_onnx_path), providers=self.providers)
         self.depth_session = ort.InferenceSession(str(self.depth_encoder_onnx_path), providers=self.providers)
         self.contract = self._load_and_validate_contract(manifest_path)
+        self.scene_token_layout = self.contract.scene_token_layout or self.cfg.scene_token_layout
+        if self.scene_token_layout == "dynamic_map_mask" and self.dynamic_mask_provider is None:
+            raise ValueError("dynamic_map_mask policy requires a dynamic mask provider")
         self.h = np.zeros((self.contract.rnn_num_layers, 1, self.contract.rnn_hidden_size), dtype=np.float32)
         self.c = np.zeros((self.contract.rnn_num_layers, 1, self.contract.rnn_hidden_size), dtype=np.float32)
         self.last_action = np.zeros(3, dtype=np.float32)
@@ -99,15 +109,23 @@ class OnnxHighLevelRuntime:
             self.reset()
         depth = np.asarray(packet.depth_m, dtype=np.float32).reshape(1, 1, 36, 64)
         encoded_depth, filtered_depth = self.depth_session.run(None, {"depth_m": depth})
+        dynamic_mask = None
+        if self.scene_token_layout == "dynamic_map_mask":
+            if packet.color_rgb is None:
+                raise ValueError("dynamic_map_mask policy requires a registered RGB frame")
+            dynamic_mask = self.dynamic_mask_provider.predict(packet.color_rgb)
         scene_tokens = self.build_scene_tokens(
-            depth.reshape(36, 64), base_pos_w=packet.base_pos_w, base_yaw_w=packet.base_yaw_w
+            depth.reshape(36, 64),
+            base_pos_w=packet.base_pos_w,
+            base_yaw_w=packet.base_yaw_w,
+            dynamic_mask=dynamic_mask,
         )
         obs = self.build_actor_obs(packet, encoded_depth.reshape(1, -1), scene_tokens.reshape(1, -1))
         actions, self.h, self.c = self.policy_session.run(None, {"obs": obs, "h_in": self.h, "c_in": self.c})
         action = np.asarray(actions, dtype=np.float32).reshape(-1)[:3]
         self.last_action = action.copy()
         command = self._action_to_command(action, packet.timestamp_s)
-        self._maybe_dump(packet, encoded_depth, filtered_depth, scene_tokens, obs, action, command)
+        self._maybe_dump(packet, encoded_depth, filtered_depth, scene_tokens, obs, action, command, dynamic_mask)
         return command
 
 
@@ -137,6 +155,7 @@ class OnnxHighLevelRuntime:
                 scene_token_features_total=int(manifest["scene_token_features_total"]) if manifest.get("scene_token_features_total") is not None else None,
                 encoded_depth_dim=int(manifest["encoded_depth_dim"]) if manifest.get("encoded_depth_dim") is not None else None,
                 proprio_dim=int(manifest["proprio_dim"]) if manifest.get("proprio_dim") is not None else None,
+                scene_token_layout=manifest.get("scene_token_layout"),
             )
             mismatches = []
             for field in ("obs_dim", "num_actions", "rnn_num_layers", "rnn_hidden_size"):
@@ -183,6 +202,7 @@ class OnnxHighLevelRuntime:
             scene_token_features_total=self.cfg.layout.scene_token_dim,
             encoded_depth_dim=self.cfg.layout.encoded_depth_dim,
             proprio_dim=self.cfg.layout.proprio_dim,
+            scene_token_layout=self.cfg.scene_token_layout,
         )
 
     def build_actor_obs(self, packet: SensorPacket, encoded_depth: np.ndarray, scene_tokens: np.ndarray) -> np.ndarray:
@@ -207,6 +227,7 @@ class OnnxHighLevelRuntime:
         *,
         base_pos_w: np.ndarray | None = None,
         base_yaw_w: float | None = None,
+        dynamic_mask: np.ndarray | None = None,
     ) -> np.ndarray:
         token_grid = 8
         grid_size = 64
@@ -222,6 +243,18 @@ class OnnxHighLevelRuntime:
                 float(base_yaw_w),
                 size_m=size_m,
                 grid_size=grid_size,
+            )
+        layout = getattr(self, "scene_token_layout", self.cfg.scene_token_layout)
+        if layout in {"dynamic_map_cross", "dynamic_map_mask"}:
+            return self._build_dynamic_map_tokens(
+                depth,
+                valid,
+                dynamic_mask=dynamic_mask,
+                size_m=size_m,
+                grid_size=grid_size,
+                token_grid=token_grid,
+                depth_min_m=depth_min_m,
+                depth_max_m=depth_max_m,
             )
         current_visibility = self._depth_to_current_visibility(depth, valid, size_m=size_m, grid_size=grid_size)
         if self.cfg.visibility_decay < 1.0:
@@ -265,6 +298,126 @@ class OnnxHighLevelRuntime:
 
         tokens = np.stack([x_center, y_center, vis, depth_mean, depth_edge, frontier], axis=-1)
         return tokens.reshape(1, -1).astype(np.float32)
+
+    def _build_dynamic_map_tokens(
+        self,
+        depth: np.ndarray,
+        valid: np.ndarray,
+        *,
+        dynamic_mask: np.ndarray | None,
+        size_m: float,
+        grid_size: int,
+        token_grid: int,
+        depth_min_m: float,
+        depth_max_m: float,
+    ) -> np.ndarray:
+        layout = getattr(self, "scene_token_layout", self.cfg.scene_token_layout)
+        expects_mask = layout == "dynamic_map_mask"
+        if expects_mask != (dynamic_mask is not None):
+            raise ValueError(f"{layout} received incompatible dynamic mask input")
+
+        history = self.visibility.copy()
+        current_hit, current_depth, dynamic_hit = self._project_depth_components(
+            depth,
+            valid,
+            pixel_mask=dynamic_mask,
+            size_m=size_m,
+            grid_size=grid_size,
+            depth_min_m=depth_min_m,
+            depth_max_m=depth_max_m,
+        )
+        if self.cfg.visibility_decay < 1.0:
+            self.visibility *= self.cfg.visibility_decay
+            self.visibility += self.cfg.visibility_score_alpha_up * current_hit * (1.0 - self.visibility)
+            np.clip(self.visibility, 0.0, 1.0, out=self.visibility)
+        else:
+            self.visibility = np.maximum(self.visibility, current_hit)
+
+        patch = grid_size // token_grid
+        patch_shape = (1, 1, token_grid, patch, token_grid, patch)
+        history_score = history.reshape(patch_shape).mean(axis=(3, 5)).reshape(1, -1)
+        hit = current_hit.reshape(patch_shape).mean(axis=(3, 5)).reshape(1, -1)
+        depth_sum = (current_depth * current_hit).reshape(patch_shape).mean(axis=(3, 5)).reshape(1, -1)
+        depth_mean = np.where(hit > 0.0, depth_sum / np.maximum(hit, 1.0e-6), 1.0)
+        edge_source = np.where(current_hit > 0.0, current_depth, 1.0)[0, 0]
+        grad_x = np.pad(np.abs(edge_source[:, 1:] - edge_source[:, :-1]), ((0, 0), (0, 1)))
+        grad_y = np.pad(np.abs(edge_source[1:, :] - edge_source[:-1, :]), ((0, 1), (0, 0)))
+        edge = np.clip(grad_x + grad_y, 0.0, 1.0).reshape(
+            token_grid, patch, token_grid, patch
+        ).mean(axis=(1, 3)).reshape(1, -1)
+        channels = [history_score, hit, depth_mean, edge, np.clip(hit - history_score, -1.0, 1.0)]
+        if dynamic_hit is not None:
+            dynamic_presence = dynamic_hit.reshape(patch_shape).max(axis=(3, 5)).reshape(1, -1)
+            channels.append(dynamic_presence)
+        return np.stack(channels, axis=-1).reshape(1, -1).astype(np.float32)
+
+    def _project_depth_components(
+        self,
+        depth: np.ndarray,
+        valid: np.ndarray,
+        *,
+        pixel_mask: np.ndarray | None,
+        size_m: float,
+        grid_size: int,
+        depth_min_m: float,
+        depth_max_m: float,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
+        height, width = depth.shape
+        stride = 2
+        rows = np.arange(0, height, stride, dtype=np.float32)
+        cols = np.arange(0, width, stride, dtype=np.float32)
+        row_grid, col_grid = np.meshgrid(rows, cols, indexing="ij")
+        depth_sub = depth[::stride, ::stride]
+        valid_sub = valid[::stride, ::stride]
+        mask_sub = None
+        if pixel_mask is not None:
+            mask_sub = resize_binary_mask(pixel_mask, (height, width))[::stride, ::stride]
+
+        h_fov = np.deg2rad(self.cfg.camera.horizontal_fov_deg)
+        v_fov = np.deg2rad(self.cfg.camera.vertical_fov_deg)
+        fx = (width * 0.5) / np.tan(h_fov * 0.5)
+        fy = (height * 0.5) / np.tan(v_fov * 0.5)
+        cx = (width - 1) * 0.5
+        cy = (height - 1) * 0.5
+        points_camera = np.stack(
+            (depth_sub, -((col_grid - cx) / fx) * depth_sub, -((row_grid - cy) / fy) * depth_sub),
+            axis=-1,
+        )
+        rotation = _quat_wxyz_to_matrix(np.asarray(self.cfg.camera.offset_quat_wxyz, dtype=np.float32))
+        points_body = points_camera @ rotation.T
+        points_body += np.asarray(self.cfg.camera.offset_pos_xyz, dtype=np.float32).reshape(1, 1, 3)
+        half_size = size_m * 0.5
+        cell_size = size_m / float(grid_size)
+        row = np.floor((half_size - points_body[..., 0]) / cell_size).astype(np.int64)
+        col = np.floor((half_size - points_body[..., 1]) / cell_size).astype(np.int64)
+        in_grid = (
+            valid_sub
+            & np.isfinite(points_body).all(axis=-1)
+            & (row >= 0)
+            & (row < grid_size)
+            & (col >= 0)
+            & (col < grid_size)
+        )
+
+        current_hit = np.zeros((1, 1, grid_size, grid_size), dtype=np.float32)
+        current_depth = np.zeros_like(current_hit)
+        linear = row[in_grid] * grid_size + col[in_grid]
+        current_hit.reshape(-1)[linear] = 1.0
+        normalized_depth = np.clip(
+            (depth_sub - depth_min_m) / (depth_max_m - depth_min_m), 0.0, 1.0
+        )
+        depth_flat = np.full(grid_size * grid_size, np.inf, dtype=np.float32)
+        np.minimum.at(depth_flat, linear, normalized_depth[in_grid])
+        finite = np.isfinite(depth_flat)
+        current_depth.reshape(-1)[finite] = depth_flat[finite]
+
+        dynamic_hit = None
+        if mask_sub is not None:
+            dynamic_hit = np.zeros_like(current_hit)
+            dynamic_valid = in_grid & (mask_sub >= 0.5)
+            dynamic_linear = row[dynamic_valid] * grid_size + col[dynamic_valid]
+            dynamic_hit.reshape(-1)[dynamic_linear] = 1.0
+        return current_hit, current_depth, dynamic_hit
 
     def _warp_visibility_to_current_pose(
         self,
@@ -362,7 +515,9 @@ class OnnxHighLevelRuntime:
         command = mins + 0.5 * (normalized + 1.0) * (maxs - mins)
         return VelocityCommand(float(command[0]), float(command[1]), float(command[2]), timestamp_s=timestamp_s)
 
-    def _maybe_dump(self, packet, encoded_depth, filtered_depth, scene_tokens, actor_obs, raw_action, command) -> None:
+    def _maybe_dump(
+        self, packet, encoded_depth, filtered_depth, scene_tokens, actor_obs, raw_action, command, dynamic_mask
+    ) -> None:
         if self.debug_cfg is None:
             return
         self.step_count += 1
@@ -389,6 +544,7 @@ class OnnxHighLevelRuntime:
             "policy_saturation_mask": policy_saturation_mask.tolist(),
             "command_clip_mask": command_clip_mask.tolist(),
             "depth_stats": _stats(packet.depth_m),
+            "dynamic_mask_stats": _stats(dynamic_mask) if dynamic_mask is not None else None,
             "encoded_depth_stats": _stats(encoded_depth),
             "scene_token_stats": _stats(scene_tokens),
             "actor_obs_stats": _stats(actor_obs),
@@ -405,6 +561,14 @@ class OnnxHighLevelRuntime:
                 joint_pos=np.asarray(packet.joint_pos, dtype=np.float32),
                 joint_vel=np.asarray(packet.joint_vel, dtype=np.float32),
                 depth_m=np.asarray(packet.depth_m, dtype=np.float32),
+                color_rgb=(
+                    np.asarray(packet.color_rgb, dtype=np.uint8)
+                    if packet.color_rgb is not None else np.empty((0,), dtype=np.uint8)
+                ),
+                dynamic_mask=(
+                    np.asarray(dynamic_mask, dtype=np.float32)
+                    if dynamic_mask is not None else np.empty((0,), dtype=np.float32)
+                ),
                 filtered_depth=np.asarray(filtered_depth, dtype=np.float32),
                 goal_b=np.asarray(packet.goal_b, dtype=np.float32),
                 encoded_depth=np.asarray(encoded_depth, dtype=np.float32).reshape(-1),

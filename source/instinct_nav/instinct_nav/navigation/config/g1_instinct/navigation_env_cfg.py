@@ -21,8 +21,8 @@ from isaaclab.utils import configclass
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 
 import instinct_nav.navigation.mdp as nav_mdp
-from instinct_nav.navigation.navigation_env_cfg import NavigationEnvCfg
-from instinct_nav.terrains import RICH_MAZE_TERRAIN_CFG
+from instinct_nav.navigation.navigation_env_cfg import NavigationEnvCfg, RewardsCfg
+from instinct_nav.terrains import HUMAN_SCALE_RICH_MAZE_TERRAIN_CFG, RICH_MAZE_TERRAIN_CFG
 
 from .g1_asset_cfg import G1_WITH_SHOE_CFG, beyondmimic_action_scale
 from instinctlab.sensors import NoisyGroupedRayCasterCameraCfg
@@ -610,7 +610,12 @@ class G1InstinctNavigationEnvCfg_DYNAMIC_OFFICIAL(
     # robot. Obstacles are hidden (parked out of view) until this timer elapses, so they
     # appear mid-travel rather than existing at episode reset.
     obstacle_spawn_delay_range: tuple[float, float] = (2.0, 8.0)
+    # Zero preserves the legacy all-at-once spawn. Positive values stagger
+    # obstacle activation by this many seconds within each episode.
+    obstacle_spawn_interval_s: float = 0.0
+    obstacle_scale_count_with_difficulty: bool = True
     obstacle_half_height: float = 0.4
+    obstacle_collision_enabled: bool = False
     # Physical XY half-extent of the obstacle cube (size 0.5 -> half 0.25). Collision is
     # measured from the obstacle *surface*, i.e. robot-to-obstacle-center minus this half-extent.
     obstacle_body_half_extent: float = 0.25
@@ -632,6 +637,7 @@ class G1InstinctNavigationEnvCfg_DYNAMIC_OFFICIAL(
     # difficulty ratchets up (speed/distance/count/behavior/fraction) as the policy clears
     # obstacle_advance_success. Only the *-Avoid- ablation turns this on. ---
     obstacle_graded_curriculum: bool = False
+    obstacle_initial_difficulty: float = 0.0
     obstacle_difficulty_step: float = 0.2
     obstacle_advance_success: float = 0.75
     # 0.0 => monotonic-up curriculum (legacy). >0 enables demotion: difficulty drops one
@@ -651,9 +657,9 @@ class G1InstinctNavigationEnvCfg_DYNAMIC_OFFICIAL(
     #   reactive_spawn: obstacles enter at >= visible_spawn_dist and travel inward (visible
     #     approach) instead of materializing at close range; obstacle speed capped to
     #     max_closing_speed so the closing rate stays reactable at the 5 Hz control rate.
-    #   record_collision_failure: obstacle-collision terminations write 0.0 to the goal
-    #     success tracker (like fall/contact/pitch), making success_rate collision-aware and
-    #     the graded curriculum's enable/advance gates honest.
+    #   record_collision_failure: retained as a legacy configuration field. Episode
+    #     outcomes are now classified centrally before reset, so every physical
+    #     failure, including obstacle collision, is recorded exactly once.
     obstacle_reactive_spawn: bool = False
     obstacle_visible_spawn_dist: float = 5.0
     obstacle_max_closing_speed: float = 1.0
@@ -680,7 +686,7 @@ class G1InstinctNavigationEnvCfg_DYNAMIC_OFFICIAL(
                 RigidObjectCfg(
                     prim_path=f"{{ENV_REGEX_NS}}/Obstacle_{index}",
                     spawn=sim_utils.CuboidCfg(
-                        size=(0.5, 0.5, 0.8),
+                        size=(0.5, 0.5, 2.0 * self.obstacle_half_height),
                         rigid_props=sim_utils.RigidBodyPropertiesCfg(
                             max_depenetration_velocity=1.0,
                             disable_gravity=True,
@@ -690,7 +696,7 @@ class G1InstinctNavigationEnvCfg_DYNAMIC_OFFICIAL(
                         # physical contacts so scripted obstacles cannot shove the
                         # frozen parkour controller. Collision termination remains
                         # the explicit geometric check in dynamic_obstacles.py.
-                        collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=False),
+                        collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=self.obstacle_collision_enabled),
                         physics_material=sim_utils.RigidBodyMaterialCfg(),
                         visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.9, 0.35, 0.1)),
                     ),
@@ -720,12 +726,15 @@ class G1InstinctNavigationEnvCfg_DYNAMIC_OFFICIAL(
             "obstacle_half_height": self.obstacle_half_height,
             "body_half_extent": self.obstacle_body_half_extent,
             "spawn_delay_range": self.obstacle_spawn_delay_range,
+            "spawn_interval_s": self.obstacle_spawn_interval_s,
+            "scale_count_with_difficulty": self.obstacle_scale_count_with_difficulty,
             "curriculum_env_fraction": self.obstacle_curriculum_env_fraction,
             "auto_switch_success": self.obstacle_auto_switch_success,
             "max_switch_iteration": self.obstacle_max_switch_iteration,
             "env_steps_per_iteration": self.obstacle_env_steps_per_iteration,
             "switch_check_interval": self.obstacle_switch_check_interval,
             "graded_curriculum": self.obstacle_graded_curriculum,
+            "initial_difficulty": self.obstacle_initial_difficulty,
             "difficulty_step": self.obstacle_difficulty_step,
             "advance_success": self.obstacle_advance_success,
             "demote_success": self.obstacle_demote_success,
@@ -1359,6 +1368,1236 @@ def _apply_dynamic_mask_observations(cfg) -> None:
     cfg.observations.mask_label = _DynamicMaskLabelObsGroup()
 
 
+def _apply_dynamic_map_mask_observations(cfg) -> None:
+    """Use 6D DynamicMapCross tokens with current dynamic BEV presence."""
+
+    map_patch_term = ObsTerm(
+        func=nav_mdp.dynamic_map_patches_from_visibility_map,
+        params={
+            "sensor_cfg": SceneEntityCfg("camera"),
+            "size_m": 6.4,
+            "grid_size": 64,
+            "token_grid_size": 8,
+            "depth_min_m": 0.5,
+            "depth_max_m": 8.0,
+            "pixel_stride": 2,
+            "decay": 0.995,
+            "include_dynamic_mask": True,
+            "mask_frame_dropout_prob": 0.08,
+            "mask_pixel_dropout_prob": 0.05,
+            "mask_false_positive_prob": 0.001,
+            "mask_erode_prob": 0.10,
+            "mask_dilate_prob": 0.15,
+            "mask_max_shift_pixels": 3,
+        },
+    )
+    cfg.observations.policy.scene_tokens = map_patch_term
+    cfg.observations.critic.scene_tokens = map_patch_term
+
+
+def _apply_dynamic_map_mask_training_schedule(cfg) -> None:
+    """Start obstacle curriculum immediately and promote it at 90% success."""
+
+    cfg.rewards.stair_centerline.weight = 0.0
+    cfg.obstacle_auto_switch_success = 0.9
+    cfg.obstacle_max_switch_iteration = 0
+    cfg.obstacle_advance_success = 0.9
+    cfg.commands.robot_goal.terrain_bank_switch_interval = 1000
+    for event_name in ("dynamic_obstacles_reset", "dynamic_obstacles_update"):
+        event_cfg = getattr(cfg.events, event_name)
+        event_cfg.params["auto_switch_success"] = 0.9
+        event_cfg.params["max_switch_iteration"] = 0
+        event_cfg.params["advance_success"] = 0.9
+
+
+# AvoidReact-Banks + dynamic mask fused into each DynamicMapCross BEV token.
+# The sixth channel is current dynamic presence and is never persisted in the
+# visibility history channel.
+@configclass
+class G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_REACT_DYNAMIC_MAP_MASK_BANKS(
+    G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_REACT_BANKS
+):
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_dynamic_map_mask_observations(self)
+        _apply_dynamic_map_mask_training_schedule(self)
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_REACT_DYNAMIC_MAP_MASK_BANKS_DEV(
+    G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_REACT_BANKS_DEV
+):
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_dynamic_map_mask_observations(self)
+        _apply_dynamic_map_mask_training_schedule(self)
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_REACT_DYNAMIC_MAP_MASK_BANKS_PLAY(
+    G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_REACT_BANKS_PLAY
+):
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_dynamic_map_mask_observations(self)
+        _apply_dynamic_map_mask_training_schedule(self)
+
+
+# RecurrentFusion obstacle schedule: every participating environment receives
+# five obstacles at every difficulty, activated one-by-one during the episode.
+@configclass
+class G1InstinctNavigationEnvCfg_DYNAMIC_MAP_MASK_RECURRENT_FUSION_BANKS(
+    G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_REACT_DYNAMIC_MAP_MASK_BANKS
+):
+    num_obstacles: int = 5
+    obstacle_spawn_delay_range: tuple[float, float] = (1.0, 2.0)
+    obstacle_spawn_interval_s: float = 1.5
+    obstacle_scale_count_with_difficulty: bool = False
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_DYNAMIC_MAP_MASK_RECURRENT_FUSION_BANKS_DEV(
+    G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_REACT_DYNAMIC_MAP_MASK_BANKS_DEV
+):
+    num_obstacles: int = 5
+    obstacle_spawn_delay_range: tuple[float, float] = (1.0, 2.0)
+    obstacle_spawn_interval_s: float = 1.5
+    obstacle_scale_count_with_difficulty: bool = False
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_DYNAMIC_MAP_MASK_RECURRENT_FUSION_BANKS_PLAY(
+    G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_REACT_DYNAMIC_MAP_MASK_BANKS_PLAY
+):
+    num_obstacles: int = 5
+    obstacle_spawn_delay_range: tuple[float, float] = (1.0, 2.0)
+    obstacle_spawn_interval_s: float = 1.5
+    obstacle_scale_count_with_difficulty: bool = False
+
+
+def _apply_direct_mask_observations(cfg) -> None:
+    """Append a compact, YOLO-like dynamic-obstacle mask to actor and critic."""
+
+    params = {
+        "sensor_cfg": SceneEntityCfg("camera"),
+        "output_height": 9,
+        "output_width": 16,
+        "apply_corruption": True,
+        "frame_dropout_prob": 0.08,
+        "pixel_dropout_prob": 0.05,
+        "false_positive_prob": 0.001,
+        "erode_prob": 0.10,
+        "dilate_prob": 0.15,
+        "max_shift_pixels": 1,
+    }
+    cfg.observations.policy.dynamic_mask = ObsTerm(
+        func=nav_mdp.dynamic_obstacle_mask_observation, params=copy.deepcopy(params)
+    )
+    cfg.observations.critic.dynamic_mask = ObsTerm(
+        func=nav_mdp.dynamic_obstacle_mask_observation, params=copy.deepcopy(params)
+    )
+
+
+def _apply_encoded_mask_observations(cfg) -> None:
+    """Append full-resolution mask and aligned masked depth for the spatial encoder."""
+
+    params = {
+        "sensor_cfg": SceneEntityCfg("camera"),
+        "output_height": 36,
+        "output_width": 64,
+        "include_masked_depth": True,
+        "apply_corruption": True,
+        "frame_dropout_prob": 0.08,
+        "pixel_dropout_prob": 0.05,
+        "false_positive_prob": 0.001,
+        "erode_prob": 0.10,
+        "dilate_prob": 0.15,
+        "max_shift_pixels": 2,
+    }
+    cfg.observations.policy.dynamic_mask = ObsTerm(
+        func=nav_mdp.dynamic_obstacle_mask_observation, params=copy.deepcopy(params)
+    )
+    cfg.observations.critic.dynamic_mask = ObsTerm(
+        func=nav_mdp.dynamic_obstacle_mask_observation, params=copy.deepcopy(params)
+    )
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_MASK_CNN_OLD_BASELINE(
+    G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED
+):
+    """Baseline rewards plus mask CNN, with obstacles enabled from training start."""
+
+    obstacle_max_switch_iteration: int = 0
+
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_encoded_mask_observations(self)
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_MASK_CNN_OLD_BASELINE_DEV(
+    G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_DEV
+):
+    obstacle_max_switch_iteration: int = 0
+
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_encoded_mask_observations(self)
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_MASK_CNN_OLD_BASELINE_PLAY(
+    G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_PLAY
+):
+    obstacle_max_switch_iteration: int = 0
+
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_encoded_mask_observations(self)
+
+
+def _apply_mask_cnn_training_setup(cfg) -> None:
+    """Remove conservative shaping and retain only a mild predictive TTC cost."""
+
+    # Keep inherited 5D visibility patches; dynamic masks use a separate image stream.
+    cfg.rewards.stair_centerline = None
+    cfg.rewards.velocity_into_unobserved = None
+    cfg.rewards.obstacle_proximity = None
+    cfg.rewards.obstacle_approach_penalty = None
+    cfg.rewards.obstacle_time_to_collision.weight = -0.25
+    cfg.obstacle_auto_switch_success = 0.9
+    cfg.obstacle_max_switch_iteration = 0
+    cfg.obstacle_advance_success = 0.9
+    cfg.commands.robot_goal.terrain_bank_switch_interval = 1000
+    for event_name in ("dynamic_obstacles_reset", "dynamic_obstacles_update"):
+        event_cfg = getattr(cfg.events, event_name)
+        event_cfg.params["auto_switch_success"] = 0.9
+        event_cfg.params["max_switch_iteration"] = 0
+        event_cfg.params["advance_success"] = 0.9
+
+
+# AvoidReact-Banks + direct compact dynamic-obstacle mask input. The mask is
+# generated from simulation state, aligned with delayed depth, and corrupted to
+# approximate deployment-time YOLO segmentation. No auxiliary CNN/loss is used.
+@configclass
+class G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_REACT_DIRECT_MASK_BANKS(
+    G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_REACT_BANKS
+):
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_direct_mask_observations(self)
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_REACT_DIRECT_MASK_BANKS_DEV(
+    G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_REACT_BANKS_DEV
+):
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_direct_mask_observations(self)
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_REACT_DIRECT_MASK_BANKS_PLAY(
+    G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_REACT_BANKS_PLAY
+):
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_direct_mask_observations(self)
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_MASK_CNN_RICH_TERRAIN_AVOID_REACT_BANKS(
+    G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_REACT_BANKS
+):
+    """Visibility BEV and external mask CNN with encounter-gated obstacles."""
+
+    num_obstacles: int = 5
+    obstacle_encounter_spawn: bool = True
+    obstacle_spawn_delay_range: tuple[float, float] = (1.0, 2.0)
+    obstacle_spawn_interval_s: float = 1.5
+    obstacle_scale_count_with_difficulty: bool = False
+
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_encoded_mask_observations(self)
+        _apply_mask_cnn_training_setup(self)
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_MASK_CNN_RICH_TERRAIN_AVOID_REACT_BANKS_DEV(
+    G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_REACT_BANKS_DEV
+):
+    num_obstacles: int = 5
+    obstacle_encounter_spawn: bool = True
+    obstacle_spawn_delay_range: tuple[float, float] = (1.0, 2.0)
+    obstacle_spawn_interval_s: float = 1.5
+    obstacle_scale_count_with_difficulty: bool = False
+
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_encoded_mask_observations(self)
+        _apply_mask_cnn_training_setup(self)
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_MASK_CNN_RICH_TERRAIN_AVOID_REACT_BANKS_PLAY(
+    G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_AVOID_REACT_BANKS_PLAY
+):
+    num_obstacles: int = 5
+    obstacle_encounter_spawn: bool = True
+    obstacle_spawn_delay_range: tuple[float, float] = (1.0, 2.0)
+    obstacle_spawn_interval_s: float = 1.5
+    obstacle_scale_count_with_difficulty: bool = False
+
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_encoded_mask_observations(self)
+        _apply_mask_cnn_training_setup(self)
+
+
+def _restore_mask_cnn_navigation_rewards(cfg) -> None:
+    defaults = RewardsCfg()
+    cfg.rewards.stair_centerline = copy.deepcopy(defaults.stair_centerline)
+    cfg.rewards.stair_centerline.weight = 0.5
+    cfg.rewards.velocity_into_unobserved = copy.deepcopy(defaults.velocity_into_unobserved)
+    cfg.rewards.velocity_into_unobserved.weight = -0.2
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_MASK_CNN_ENCOUNTER_RESTORED_REWARDS(
+    G1InstinctNavigationEnvCfg_MASK_CNN_RICH_TERRAIN_AVOID_REACT_BANKS
+):
+    """Only restore navigation shaping; preserve the completed MaskCNN experiment."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        _restore_mask_cnn_navigation_rewards(self)
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_MASK_CNN_ENCOUNTER_RESTORED_REWARDS_DEV(
+    G1InstinctNavigationEnvCfg_MASK_CNN_RICH_TERRAIN_AVOID_REACT_BANKS_DEV
+):
+    def __post_init__(self):
+        super().__post_init__()
+        _restore_mask_cnn_navigation_rewards(self)
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_MASK_CNN_ENCOUNTER_RESTORED_REWARDS_PLAY(
+    G1InstinctNavigationEnvCfg_MASK_CNN_RICH_TERRAIN_AVOID_REACT_BANKS_PLAY
+):
+    def __post_init__(self):
+        super().__post_init__()
+        _restore_mask_cnn_navigation_rewards(self)
+
+
+# MaskCNN64 gated-add uses the hardest dynamic-obstacle tier from iteration 0 in
+# every environment. The obstacle count/timing remains the five-slot staggered
+# encounter schedule used by the completed restored-rewards comparison run.
+@configclass
+class G1InstinctNavigationEnvCfg_MASK_CNN64_GATED_ADD(
+    G1InstinctNavigationEnvCfg_MASK_CNN_ENCOUNTER_RESTORED_REWARDS
+):
+    obstacle_initial_difficulty: float = 1.0
+    obstacle_curriculum_env_fraction: float = 1.0
+    obstacle_fraction_range: tuple[float, float] = (1.0, 1.0)
+    obstacle_half_height: float = 0.8
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_MASK_CNN64_GATED_ADD_DEV(
+    G1InstinctNavigationEnvCfg_MASK_CNN_ENCOUNTER_RESTORED_REWARDS_DEV
+):
+    obstacle_initial_difficulty: float = 1.0
+    obstacle_curriculum_env_fraction: float = 1.0
+    obstacle_fraction_range: tuple[float, float] = (1.0, 1.0)
+    obstacle_half_height: float = 0.8
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_MASK_CNN64_GATED_ADD_PLAY(
+    G1InstinctNavigationEnvCfg_MASK_CNN_ENCOUNTER_RESTORED_REWARDS_PLAY
+):
+    obstacle_initial_difficulty: float = 1.0
+    obstacle_curriculum_env_fraction: float = 1.0
+    obstacle_fraction_range: tuple[float, float] = (1.0, 1.0)
+    obstacle_half_height: float = 0.8
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_MASK_CNN32_CONCAT(
+    G1InstinctNavigationEnvCfg_MASK_CNN64_GATED_ADD
+):
+    """Keep the hard obstacle setup while isolating 32D mask concatenation."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.commands.robot_goal.terrain_bank_switch_interval = 2000
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_MASK_CNN32_CONCAT_DEV(
+    G1InstinctNavigationEnvCfg_MASK_CNN64_GATED_ADD_DEV
+):
+    """Small-scale smoke variant of the hard 32D-concat task."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.commands.robot_goal.terrain_bank_switch_interval = 2000
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_MASK_CNN32_CONCAT_PLAY(
+    G1InstinctNavigationEnvCfg_MASK_CNN64_GATED_ADD_PLAY
+):
+    """Evaluation variant of the hard 32D-concat task."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.commands.robot_goal.terrain_bank_switch_interval = 2000
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_NOMASK_CONTROL(G1InstinctNavigationEnvCfg_MASK_CNN32_CONCAT):
+    """Match MaskCNN32 training conditions without the dynamic-mask observation."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.observations.policy.dynamic_mask = None
+        self.observations.critic.dynamic_mask = None
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_NOMASK_CONTROL_DEV(G1InstinctNavigationEnvCfg_MASK_CNN32_CONCAT_DEV):
+    def __post_init__(self):
+        super().__post_init__()
+        self.observations.policy.dynamic_mask = None
+        self.observations.critic.dynamic_mask = None
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_NOMASK_CONTROL_PLAY(G1InstinctNavigationEnvCfg_MASK_CNN32_CONCAT_PLAY):
+    def __post_init__(self):
+        super().__post_init__()
+        self.observations.policy.dynamic_mask = None
+        self.observations.critic.dynamic_mask = None
+
+
+def _apply_dynamic_risk_bev_observations(
+    cfg,
+    *,
+    exclude_dynamic_from_visibility_history: bool = False,
+    mask_false_positive_prob: float = 0.001,
+    dynamic_risk_mode: str = "occupancy",
+) -> None:
+    """Render delayed dynamic-mask projections as black cells in the 5D BEV."""
+
+    params = {
+        "sensor_cfg": SceneEntityCfg("camera"),
+        "size_m": 6.4,
+        "grid_size": 64,
+        "token_grid_size": 8,
+        "depth_min_m": 0.5,
+        "depth_max_m": 8.0,
+        "pixel_stride": 2,
+        "decay": 0.995,
+        "include_dynamic_mask": True,
+        "mask_frame_dropout_prob": 0.08,
+        "mask_pixel_dropout_prob": 0.05,
+        "mask_false_positive_prob": mask_false_positive_prob,
+        "mask_erode_prob": 0.10,
+        "mask_dilate_prob": 0.15,
+        "mask_max_shift_pixels": 2,
+        "merge_dynamic_as_risk": True,
+        # 0.3 m at 0.1 m/cell covers the obstacle boundary plus robot clearance.
+        "dynamic_risk_inflation_cells": 3,
+        "exclude_dynamic_from_visibility_history": exclude_dynamic_from_visibility_history,
+        "dynamic_risk_mode": dynamic_risk_mode,
+    }
+    if dynamic_risk_mode == "sector":
+        params.update(
+            {
+                "dynamic_risk_inflation_cells": 0,
+                "sector_horizon_s": 1.2,
+                "sector_clearance_m": 0.30,
+                "sector_sigma_long_m": 0.15,
+                "sector_sigma_lat_m": 0.12,
+                "sector_softness_m": 0.08,
+                "sector_stationary_speed_mps": 0.10,
+            }
+        )
+    term = ObsTerm(func=nav_mdp.dynamic_map_patches_from_visibility_map, params=params)
+    cfg.observations.policy.scene_tokens = term
+    cfg.observations.critic.scene_tokens = term
+
+
+def _apply_learned_dynamic_bev_observations(cfg) -> None:
+    """Append a compact temporal BEV image for learned query fusion."""
+    term = ObsTerm(
+        func=nav_mdp.learned_dynamic_bev_observation,
+        params={
+            "sensor_cfg": SceneEntityCfg("camera"),
+            "size_m": 6.4,
+            "grid_size": 64,
+            "output_grid_size": 32,
+            "depth_min_m": 0.5,
+            "depth_max_m": 8.0,
+            "pixel_stride": 2,
+            "decay": 0.995,
+            "mask_frame_dropout_prob": 0.08,
+            "mask_pixel_dropout_prob": 0.05,
+            "mask_false_positive_prob": 0.0,
+            "mask_erode_prob": 0.10,
+            "mask_dilate_prob": 0.15,
+            "mask_max_shift_pixels": 2,
+        },
+    )
+    cfg.observations.policy.visibility_map = term
+    cfg.observations.critic.visibility_map = term
+
+
+def _replace_dynamic_obstacles_with_cylinders(cfg) -> None:
+    """Use human-scale cylinders without changing V2 collision semantics."""
+    for index in range(cfg.num_obstacles):
+        obstacle_cfg = getattr(cfg.scene, f"obstacle_{index}")
+        obstacle_cfg.spawn = sim_utils.CylinderCfg(
+            radius=0.25,
+            height=2.0 * cfg.obstacle_half_height,
+            axis="Z",
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                max_depenetration_velocity=1.0,
+                disable_gravity=True,
+            ),
+            mass_props=sim_utils.MassPropertiesCfg(mass=8.0),
+            collision_props=sim_utils.CollisionPropertiesCfg(
+                collision_enabled=cfg.obstacle_collision_enabled
+            ),
+            physics_material=sim_utils.RigidBodyMaterialCfg(),
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.9, 0.75, 0.1)),
+        )
+
+
+def _apply_success_gated_terrain_banks(cfg) -> None:
+    """Keep the current bank until its full rolling window reaches 90% success."""
+
+    goal_cfg = cfg.commands.robot_goal
+    goal_cfg.terrain_bank_switch_interval = 0
+    goal_cfg.terrain_bank_advance_success = 0.90
+    goal_cfg.terrain_bank_success_check_interval = 100
+    goal_cfg.terrain_bank_success_min_full_fraction = 0.95
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_DYNAMIC_RISK_BEV_SUCCESS_BANKS(
+    G1InstinctNavigationEnvCfg_NOMASK_CONTROL
+):
+    """Old 5D SRU structure with dynamic masks merged into visibility risk."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_dynamic_risk_bev_observations(self)
+        _apply_success_gated_terrain_banks(self)
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_DYNAMIC_RISK_BEV_SUCCESS_BANKS_DEV(
+    G1InstinctNavigationEnvCfg_NOMASK_CONTROL_DEV
+):
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_dynamic_risk_bev_observations(self)
+        _apply_success_gated_terrain_banks(self)
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_DYNAMIC_RISK_BEV_SUCCESS_BANKS_PLAY(
+    G1InstinctNavigationEnvCfg_NOMASK_CONTROL_PLAY
+):
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_dynamic_risk_bev_observations(self)
+        _apply_success_gated_terrain_banks(self)
+
+
+def _remove_terrain_banks(cfg) -> None:
+    """Collapse a bank-derived config back to its single 30-column terrain set."""
+
+    goal_cfg = cfg.commands.robot_goal
+    terrain_cfg = cfg.scene.terrain.terrain_generator
+    base_cols = int(goal_cfg.terrain_bank_base_num_cols)
+    if base_cols <= 0:
+        base_cols = int(terrain_cfg.num_cols)
+    terrain_cfg.num_cols = base_cols
+    goal_cfg.terrain_bank_count = 1
+    goal_cfg.terrain_bank_base_num_cols = 0
+    goal_cfg.terrain_bank_switch_interval = 0
+    goal_cfg.terrain_bank_advance_success = 0.0
+
+
+def _apply_static5000_mixed50_schedule(cfg) -> None:
+    """Run one continuous policy: 5000 static iterations, then 50% dynamic."""
+
+    cfg.obstacle_auto_switch_success = 2.0
+    cfg.obstacle_max_switch_iteration = 5000
+    cfg.obstacle_initial_difficulty = 1.0
+    cfg.obstacle_advance_success = 2.0
+    cfg.obstacle_curriculum_env_fraction = 0.5
+    cfg.obstacle_fraction_range = (0.5, 0.5)
+    for event_name in ("dynamic_obstacles_reset", "dynamic_obstacles_update"):
+        event_cfg = getattr(cfg.events, event_name)
+        event_cfg.params["auto_switch_success"] = 2.0
+        event_cfg.params["max_switch_iteration"] = 5000
+        event_cfg.params["initial_difficulty"] = 1.0
+        event_cfg.params["advance_success"] = 2.0
+        event_cfg.params["curriculum_env_fraction"] = 0.5
+        event_cfg.params["fraction_range"] = (0.5, 0.5)
+    cfg.commands.robot_goal.report_dynamic_env_success = True
+    cfg.commands.robot_goal.reset_success_on_dynamic_enable = True
+
+
+def _apply_static3000_mixed50_schedule(cfg) -> None:
+    """Run one continuous policy: 3000 static iterations, then 50% dynamic."""
+
+    cfg.obstacle_auto_switch_success = 2.0
+    cfg.obstacle_max_switch_iteration = 3000
+    cfg.obstacle_initial_difficulty = 1.0
+    cfg.obstacle_advance_success = 2.0
+    cfg.obstacle_curriculum_env_fraction = 0.5
+    cfg.obstacle_fraction_range = (0.5, 0.5)
+    for event_name in ("dynamic_obstacles_reset", "dynamic_obstacles_update"):
+        event_cfg = getattr(cfg.events, event_name)
+        event_cfg.params["auto_switch_success"] = 2.0
+        event_cfg.params["max_switch_iteration"] = 3000
+        event_cfg.params["initial_difficulty"] = 1.0
+        event_cfg.params["advance_success"] = 2.0
+        event_cfg.params["curriculum_env_fraction"] = 0.5
+        event_cfg.params["exact_curriculum_env_fraction"] = True
+        event_cfg.params["fraction_range"] = (0.5, 0.5)
+    cfg.commands.robot_goal.report_dynamic_env_success = True
+    cfg.commands.robot_goal.reset_success_on_dynamic_enable = True
+
+
+def _apply_sru_ablation_common(cfg) -> None:
+    """Apply the environment controls shared by the NoBEV and BEV runs."""
+
+    cfg.observations.policy.dynamic_mask = None
+    cfg.observations.critic.dynamic_mask = None
+    _remove_terrain_banks(cfg)
+    _apply_static3000_mixed50_schedule(cfg)
+
+
+def _remove_scene_token_observations(cfg) -> None:
+    """Remove visibility-map observations for the pure-SRU control."""
+
+    cfg.observations.policy.scene_tokens = None
+    cfg.observations.critic.scene_tokens = None
+
+
+def _apply_human_scale_20x20_terrain(cfg) -> None:
+    """Replace only sub-terrain geometry, preserving train/dev/play tile counts."""
+
+    cfg.scene.terrain.terrain_generator.sub_terrains = copy.deepcopy(
+        HUMAN_SCALE_RICH_MAZE_TERRAIN_CFG.sub_terrains
+    )
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_ABLATION_SRU_NOBEV_STATIC3000_MIXED50(
+    G1InstinctNavigationEnvCfg_MASK_CNN64_GATED_ADD
+):
+    """Pure SRU control: no BEV or mask branch, with the phased obstacle schedule."""
+
+    obstacle_curriculum_env_fraction: float = 0.5
+    obstacle_fraction_range: tuple[float, float] = (0.5, 0.5)
+
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_sru_ablation_common(self)
+        _remove_scene_token_observations(self)
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_ABLATION_SRU_NOBEV_STATIC3000_MIXED50_DEV(
+    G1InstinctNavigationEnvCfg_MASK_CNN64_GATED_ADD_DEV
+):
+    obstacle_curriculum_env_fraction: float = 0.5
+    obstacle_fraction_range: tuple[float, float] = (0.5, 0.5)
+
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_sru_ablation_common(self)
+        _remove_scene_token_observations(self)
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_ABLATION_SRU_NOBEV_STATIC3000_MIXED50_PLAY(
+    G1InstinctNavigationEnvCfg_MASK_CNN64_GATED_ADD_PLAY
+):
+    obstacle_curriculum_env_fraction: float = 0.5
+    obstacle_fraction_range: tuple[float, float] = (0.5, 0.5)
+
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_sru_ablation_common(self)
+        _remove_scene_token_observations(self)
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_ABLATION_SRU_BEV_STATIC3000_MIXED50(
+    G1InstinctNavigationEnvCfg_MASK_CNN64_GATED_ADD
+):
+    """5D visibility BEV treatment with current-only dynamic-mask risk."""
+
+    obstacle_curriculum_env_fraction: float = 0.5
+    obstacle_fraction_range: tuple[float, float] = (0.5, 0.5)
+
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_sru_ablation_common(self)
+        _apply_dynamic_risk_bev_observations(
+            self,
+            exclude_dynamic_from_visibility_history=True,
+            mask_false_positive_prob=0.0,
+        )
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_ABLATION_SRU_BEV_STATIC3000_MIXED50_DEV(
+    G1InstinctNavigationEnvCfg_MASK_CNN64_GATED_ADD_DEV
+):
+    obstacle_curriculum_env_fraction: float = 0.5
+    obstacle_fraction_range: tuple[float, float] = (0.5, 0.5)
+
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_sru_ablation_common(self)
+        _apply_dynamic_risk_bev_observations(
+            self,
+            exclude_dynamic_from_visibility_history=True,
+            mask_false_positive_prob=0.0,
+        )
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_ABLATION_SRU_BEV_STATIC3000_MIXED50_PLAY(
+    G1InstinctNavigationEnvCfg_MASK_CNN64_GATED_ADD_PLAY
+):
+    obstacle_curriculum_env_fraction: float = 0.5
+    obstacle_fraction_range: tuple[float, float] = (0.5, 0.5)
+
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_sru_ablation_common(self)
+        _apply_dynamic_risk_bev_observations(
+            self,
+            exclude_dynamic_from_visibility_history=True,
+            mask_false_positive_prob=0.0,
+        )
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_ABLATION_SRU_NOBEV_HUMAN_SCALE20(
+    G1InstinctNavigationEnvCfg_ABLATION_SRU_NOBEV_STATIC3000_MIXED50
+):
+    """NoBEV control on the denser 20x20 human-scale terrain."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_human_scale_20x20_terrain(self)
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_ABLATION_SRU_NOBEV_HUMAN_SCALE20_DEV(
+    G1InstinctNavigationEnvCfg_ABLATION_SRU_NOBEV_STATIC3000_MIXED50_DEV
+):
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_human_scale_20x20_terrain(self)
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_ABLATION_SRU_NOBEV_HUMAN_SCALE20_PLAY(
+    G1InstinctNavigationEnvCfg_ABLATION_SRU_NOBEV_STATIC3000_MIXED50_PLAY
+):
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_human_scale_20x20_terrain(self)
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_ABLATION_SRU_BEV_HUMAN_SCALE20(
+    G1InstinctNavigationEnvCfg_ABLATION_SRU_BEV_STATIC3000_MIXED50
+):
+    """Visibility-BEV treatment on the denser 20x20 human-scale terrain."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_human_scale_20x20_terrain(self)
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_ABLATION_SRU_BEV_HUMAN_SCALE20_DEV(
+    G1InstinctNavigationEnvCfg_ABLATION_SRU_BEV_STATIC3000_MIXED50_DEV
+):
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_human_scale_20x20_terrain(self)
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_ABLATION_SRU_BEV_HUMAN_SCALE20_PLAY(
+    G1InstinctNavigationEnvCfg_ABLATION_SRU_BEV_STATIC3000_MIXED50_PLAY
+):
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_human_scale_20x20_terrain(self)
+
+
+def _apply_hard_encounter_v2(cfg, *, switch_iteration: int = 1000) -> None:
+    """Fixed 1000-static + 1500-mid + 2500-hard schedule for fair ablations."""
+    cfg.obstacle_hard_encounter_v2 = True
+    cfg.obstacle_hard_tier2_iteration = 2500
+    cfg.obstacle_hard_mid_active_count = 3
+    cfg.obstacle_hard_high_active_count = 4
+    cfg.obstacle_hard_mid_speed_range = (0.35, 0.75)
+    cfg.obstacle_hard_high_speed_range = (0.45, 1.0)
+    cfg.obstacle_hard_recycle_delay_range = (0.4, 0.8)
+    cfg.obstacle_encounter_spawn = True
+    cfg.obstacle_spawn_delay_range = (0.5, 1.0)
+    cfg.obstacle_spawn_interval_s = 0.0
+    cfg.obstacle_speed_range = (0.35, 1.0)
+    cfg.obstacle_scale_count_with_difficulty = False
+    cfg.obstacle_graded_curriculum = False
+    cfg.obstacle_auto_switch_success = 2.0
+    cfg.obstacle_max_switch_iteration = int(switch_iteration)
+    cfg.obstacle_curriculum_env_fraction = 1.0
+    cfg.obstacle_fraction_range = (1.0, 1.0)
+    cfg.obstacle_record_collision_failure = True
+    for event_name in ("dynamic_obstacles_reset", "dynamic_obstacles_update"):
+        event_cfg = getattr(cfg.events, event_name)
+        event_cfg.params["speed_range"] = (0.35, 1.0)
+        event_cfg.params["spawn_delay_range"] = (0.5, 1.0)
+        event_cfg.params["spawn_interval_s"] = 0.0
+        event_cfg.params["scale_count_with_difficulty"] = False
+        event_cfg.params["graded_curriculum"] = False
+        event_cfg.params["auto_switch_success"] = 2.0
+        event_cfg.params["max_switch_iteration"] = int(switch_iteration)
+        event_cfg.params["curriculum_env_fraction"] = 1.0
+        event_cfg.params["exact_curriculum_env_fraction"] = True
+        event_cfg.params["fraction_range"] = (1.0, 1.0)
+    cfg.commands.robot_goal.report_dynamic_env_success = True
+    cfg.commands.robot_goal.reset_success_on_dynamic_enable = True
+
+
+def _apply_hard_encounter_v3_schedule(
+    cfg, *, switch_iteration: int = 3000, dynamic_fraction: float = 0.5
+) -> None:
+    """Use 3000 static iterations, then one moderate 50% dynamic cohort."""
+    fraction = min(max(float(dynamic_fraction), 0.0), 1.0)
+    cfg.obstacle_max_switch_iteration = int(switch_iteration)
+    # V3 deliberately has no second/hard tier: G1 is substantially slower than
+    # the original wheeled quadruped reference, so 1.0 m/s encounters mostly
+    # measure reaction-rate limits rather than representation quality.
+    cfg.obstacle_hard_tier2_iteration = 2**31 - 1
+    cfg.obstacle_hard_mid_active_count = 3
+    cfg.obstacle_hard_high_active_count = 3
+    cfg.obstacle_hard_mid_speed_range = (0.20, 0.50)
+    cfg.obstacle_hard_high_speed_range = (0.20, 0.50)
+    cfg.obstacle_speed_range = (0.20, 0.50)
+    cfg.obstacle_curriculum_env_fraction = fraction
+    cfg.obstacle_fraction_range = (fraction, fraction)
+    for event_name in ("dynamic_obstacles_reset", "dynamic_obstacles_update"):
+        event_cfg = getattr(cfg.events, event_name)
+        event_cfg.params["speed_range"] = (0.20, 0.50)
+        event_cfg.params["max_switch_iteration"] = int(switch_iteration)
+        event_cfg.params["curriculum_env_fraction"] = fraction
+        event_cfg.params["exact_curriculum_env_fraction"] = True
+        event_cfg.params["fraction_range"] = (fraction, fraction)
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_ABLATION_SRU_NOBEV_HARD_ENCOUNTER_V2(
+    G1InstinctNavigationEnvCfg_ABLATION_SRU_NOBEV_HUMAN_SCALE20
+):
+    """Pure SRU on the conflict-conditioned recyclable obstacle pool."""
+
+    num_obstacles: int = 6
+    obstacle_half_height: float = 0.8
+    obstacle_hard_encounter_v2: bool = True
+    obstacle_hard_tier2_iteration: int = 2500
+    obstacle_hard_mid_active_count: int = 3
+    obstacle_hard_high_active_count: int = 4
+    obstacle_hard_mid_speed_range: tuple[float, float] = (0.35, 0.75)
+    obstacle_hard_high_speed_range: tuple[float, float] = (0.45, 1.0)
+    obstacle_hard_recycle_delay_range: tuple[float, float] = (0.4, 0.8)
+
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_hard_encounter_v2(self)
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_ABLATION_SRU_NOBEV_HARD_ENCOUNTER_V2_DEV(
+    G1InstinctNavigationEnvCfg_ABLATION_SRU_NOBEV_HUMAN_SCALE20_DEV
+):
+    num_obstacles: int = 6
+    obstacle_half_height: float = 0.8
+    obstacle_hard_encounter_v2: bool = True
+    obstacle_hard_tier2_iteration: int = 2500
+    obstacle_hard_mid_active_count: int = 3
+    obstacle_hard_high_active_count: int = 4
+    obstacle_hard_mid_speed_range: tuple[float, float] = (0.35, 0.75)
+    obstacle_hard_high_speed_range: tuple[float, float] = (0.45, 1.0)
+    obstacle_hard_recycle_delay_range: tuple[float, float] = (0.4, 0.8)
+
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_hard_encounter_v2(self, switch_iteration=0)
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_ABLATION_SRU_NOBEV_HARD_ENCOUNTER_V2_PLAY(
+    G1InstinctNavigationEnvCfg_ABLATION_SRU_NOBEV_HUMAN_SCALE20_PLAY
+):
+    num_obstacles: int = 6
+    obstacle_half_height: float = 0.8
+    obstacle_hard_encounter_v2: bool = True
+    obstacle_hard_tier2_iteration: int = 2500
+    obstacle_hard_mid_active_count: int = 3
+    obstacle_hard_high_active_count: int = 4
+    obstacle_hard_mid_speed_range: tuple[float, float] = (0.35, 0.75)
+    obstacle_hard_high_speed_range: tuple[float, float] = (0.45, 1.0)
+    obstacle_hard_recycle_delay_range: tuple[float, float] = (0.4, 0.8)
+
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_hard_encounter_v2(self, switch_iteration=0)
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_ABLATION_SRU_CURRENT_RISK_HARD_ENCOUNTER_V2(
+    G1InstinctNavigationEnvCfg_ABLATION_SRU_NOBEV_HARD_ENCOUNTER_V2
+):
+    """HardEncounterV2 with the current-mask occupancy BEV."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_dynamic_risk_bev_observations(
+            self, exclude_dynamic_from_visibility_history=True, mask_false_positive_prob=0.0
+        )
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_ABLATION_SRU_CURRENT_RISK_HARD_ENCOUNTER_V2_DEV(
+    G1InstinctNavigationEnvCfg_ABLATION_SRU_NOBEV_HARD_ENCOUNTER_V2_DEV
+):
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_dynamic_risk_bev_observations(
+            self, exclude_dynamic_from_visibility_history=True, mask_false_positive_prob=0.0
+        )
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_ABLATION_SRU_CURRENT_RISK_HARD_ENCOUNTER_V2_PLAY(
+    G1InstinctNavigationEnvCfg_ABLATION_SRU_NOBEV_HARD_ENCOUNTER_V2_PLAY
+):
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_dynamic_risk_bev_observations(
+            self, exclude_dynamic_from_visibility_history=True, mask_false_positive_prob=0.0
+        )
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_ABLATION_SRU_SECTOR_RISK_HARD_ENCOUNTER_V2(
+    G1InstinctNavigationEnvCfg_ABLATION_SRU_CURRENT_RISK_HARD_ENCOUNTER_V2
+):
+    """HardEncounterV2 with velocity-aware sector risk in the same 5D BEV."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_dynamic_risk_bev_observations(
+            self,
+            exclude_dynamic_from_visibility_history=True,
+            mask_false_positive_prob=0.0,
+            dynamic_risk_mode="sector",
+        )
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_ABLATION_SRU_SECTOR_RISK_HARD_ENCOUNTER_V2_DEV(
+    G1InstinctNavigationEnvCfg_ABLATION_SRU_CURRENT_RISK_HARD_ENCOUNTER_V2_DEV
+):
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_dynamic_risk_bev_observations(
+            self,
+            exclude_dynamic_from_visibility_history=True,
+            mask_false_positive_prob=0.0,
+            dynamic_risk_mode="sector",
+        )
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_ABLATION_SRU_SECTOR_RISK_HARD_ENCOUNTER_V2_PLAY(
+    G1InstinctNavigationEnvCfg_ABLATION_SRU_CURRENT_RISK_HARD_ENCOUNTER_V2_PLAY
+):
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_dynamic_risk_bev_observations(
+            self,
+            exclude_dynamic_from_visibility_history=True,
+            mask_false_positive_prob=0.0,
+            dynamic_risk_mode="sector",
+        )
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_ABLATION_SRU_NOBEV_HARD_ENCOUNTER_V3_CYLINDER(
+    G1InstinctNavigationEnvCfg_ABLATION_SRU_NOBEV_HARD_ENCOUNTER_V2
+):
+    """HardEncounterV2 schedule with 0.5 m diameter, 1.6 m tall cylinders."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_hard_encounter_v3_schedule(self)
+        _replace_dynamic_obstacles_with_cylinders(self)
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_ABLATION_SRU_NOBEV_HARD_ENCOUNTER_V3_CYLINDER_DEV(
+    G1InstinctNavigationEnvCfg_ABLATION_SRU_NOBEV_HARD_ENCOUNTER_V2_DEV
+):
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_hard_encounter_v3_schedule(self, switch_iteration=0)
+        _replace_dynamic_obstacles_with_cylinders(self)
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_ABLATION_SRU_NOBEV_HARD_ENCOUNTER_V3_CYLINDER_PLAY(
+    G1InstinctNavigationEnvCfg_ABLATION_SRU_NOBEV_HARD_ENCOUNTER_V2_PLAY
+):
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_hard_encounter_v3_schedule(self, switch_iteration=0)
+        _replace_dynamic_obstacles_with_cylinders(self)
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_LEARNED_BEV_QUERY_HARD_ENCOUNTER_V3_CYLINDER(
+    G1InstinctNavigationEnvCfg_ABLATION_SRU_NOBEV_HARD_ENCOUNTER_V3_CYLINDER
+):
+    """Temporal six-channel BEV encoded into learned spatial query tokens."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_learned_dynamic_bev_observations(self)
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_LEARNED_BEV_QUERY_HARD_ENCOUNTER_V3_CYLINDER_DEV(
+    G1InstinctNavigationEnvCfg_ABLATION_SRU_NOBEV_HARD_ENCOUNTER_V3_CYLINDER_DEV
+):
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_learned_dynamic_bev_observations(self)
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_LEARNED_BEV_QUERY_HARD_ENCOUNTER_V3_CYLINDER_PLAY(
+    G1InstinctNavigationEnvCfg_ABLATION_SRU_NOBEV_HARD_ENCOUNTER_V3_CYLINDER_PLAY
+):
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_learned_dynamic_bev_observations(self)
+
+
+@configclass
+class _FutureOccupancyTeacherGroup(ObsGroup):
+    state = ObsTerm(func=nav_mdp.future_occupancy_teacher_state)
+
+    def __post_init__(self):
+        self.enable_corruption = False
+        self.concatenate_terms = True
+
+
+def _apply_motion_bev_observations(cfg) -> None:
+    _apply_learned_dynamic_bev_observations(cfg)
+    cfg.observations.policy.visibility_map.params.update(
+        dynamic_history_offsets_s=(0.4, 0.8), dynamic_dilation_kernel=3,
+    )
+    cfg.rewards.velocity_into_unobserved = None
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_MOTION_BEV_QUERY_HARD_V3(
+    G1InstinctNavigationEnvCfg_LEARNED_BEV_QUERY_HARD_ENCOUNTER_V3_CYLINDER
+):
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_motion_bev_observations(self)
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_MOTION_BEV_QUERY_HARD_V3_DEV(
+    G1InstinctNavigationEnvCfg_LEARNED_BEV_QUERY_HARD_ENCOUNTER_V3_CYLINDER_DEV
+):
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_motion_bev_observations(self)
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_MOTION_BEV_QUERY_HARD_V3_PLAY(
+    G1InstinctNavigationEnvCfg_LEARNED_BEV_QUERY_HARD_ENCOUNTER_V3_CYLINDER_PLAY
+):
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_motion_bev_observations(self)
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_MOTION_BEV_FUTURE_HARD_V3(
+    G1InstinctNavigationEnvCfg_MOTION_BEV_QUERY_HARD_V3
+):
+    def __post_init__(self):
+        super().__post_init__()
+        self.observations.future_teacher = _FutureOccupancyTeacherGroup()
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_MOTION_BEV_FUTURE_HARD_V3_DEV(
+    G1InstinctNavigationEnvCfg_MOTION_BEV_QUERY_HARD_V3_DEV
+):
+    def __post_init__(self):
+        super().__post_init__()
+        self.observations.future_teacher = _FutureOccupancyTeacherGroup()
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_MOTION_BEV_FUTURE_HARD_V3_PLAY(
+    G1InstinctNavigationEnvCfg_MOTION_BEV_QUERY_HARD_V3_PLAY
+):
+    def __post_init__(self):
+        super().__post_init__()
+        self.observations.future_teacher = _FutureOccupancyTeacherGroup()
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_MOTION_BEV_CONVLSTM_HARD_V3(G1InstinctNavigationEnvCfg_MOTION_BEV_FUTURE_HARD_V3):
+    def __post_init__(self):
+        super().__post_init__()
+        self.observations.policy.bev_odometry = ObsTerm(func=nav_mdp.bev_odometry_pose)
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_MOTION_BEV_CONVLSTM_HARD_V3_DEV(G1InstinctNavigationEnvCfg_MOTION_BEV_FUTURE_HARD_V3_DEV):
+    def __post_init__(self):
+        super().__post_init__()
+        self.observations.policy.bev_odometry = ObsTerm(func=nav_mdp.bev_odometry_pose)
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_MOTION_BEV_CONVLSTM_HARD_V3_PLAY(G1InstinctNavigationEnvCfg_MOTION_BEV_FUTURE_HARD_V3_PLAY):
+    def __post_init__(self):
+        super().__post_init__()
+        self.observations.policy.bev_odometry = ObsTerm(func=nav_mdp.bev_odometry_pose)
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_NOBEV_REWARD_MATCHED_HARD_V3(
+    G1InstinctNavigationEnvCfg_ABLATION_SRU_NOBEV_HARD_ENCOUNTER_V3_CYLINDER
+):
+    def __post_init__(self):
+        super().__post_init__()
+        self.rewards.velocity_into_unobserved = None
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_NOBEV_REWARD_MATCHED_HARD_V3_DEV(
+    G1InstinctNavigationEnvCfg_ABLATION_SRU_NOBEV_HARD_ENCOUNTER_V3_CYLINDER_DEV
+):
+    def __post_init__(self):
+        super().__post_init__()
+        self.rewards.velocity_into_unobserved = None
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_NOBEV_REWARD_MATCHED_HARD_V3_PLAY(
+    G1InstinctNavigationEnvCfg_ABLATION_SRU_NOBEV_HARD_ENCOUNTER_V3_CYLINDER_PLAY
+):
+    def __post_init__(self):
+        super().__post_init__()
+        self.rewards.velocity_into_unobserved = None
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_DYNAMIC_RISK_BEV_STATIC5000_MIXED50_SINGLE_TERRAIN(
+    G1InstinctNavigationEnvCfg_MASK_CNN64_GATED_ADD
+):
+    """5D baseline network with always-on mask-to-BEV preprocessing and phased obstacles."""
+
+    obstacle_curriculum_env_fraction: float = 0.5
+    obstacle_fraction_range: tuple[float, float] = (0.5, 0.5)
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.observations.policy.dynamic_mask = None
+        self.observations.critic.dynamic_mask = None
+        _remove_terrain_banks(self)
+        _apply_static5000_mixed50_schedule(self)
+        _apply_dynamic_risk_bev_observations(
+            self,
+            exclude_dynamic_from_visibility_history=True,
+            mask_false_positive_prob=0.0,
+        )
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_DYNAMIC_RISK_BEV_STATIC5000_MIXED50_SINGLE_TERRAIN_DEV(
+    G1InstinctNavigationEnvCfg_MASK_CNN64_GATED_ADD_DEV
+):
+    obstacle_curriculum_env_fraction: float = 0.5
+    obstacle_fraction_range: tuple[float, float] = (0.5, 0.5)
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.observations.policy.dynamic_mask = None
+        self.observations.critic.dynamic_mask = None
+        _remove_terrain_banks(self)
+        _apply_static5000_mixed50_schedule(self)
+        _apply_dynamic_risk_bev_observations(
+            self,
+            exclude_dynamic_from_visibility_history=True,
+            mask_false_positive_prob=0.0,
+        )
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_DYNAMIC_RISK_BEV_STATIC5000_MIXED50_SINGLE_TERRAIN_PLAY(
+    G1InstinctNavigationEnvCfg_MASK_CNN64_GATED_ADD_PLAY
+):
+    obstacle_curriculum_env_fraction: float = 0.5
+    obstacle_fraction_range: tuple[float, float] = (0.5, 0.5)
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.observations.policy.dynamic_mask = None
+        self.observations.critic.dynamic_mask = None
+        _remove_terrain_banks(self)
+        _apply_static5000_mixed50_schedule(self)
+        _apply_dynamic_risk_bev_observations(
+            self,
+            exclude_dynamic_from_visibility_history=True,
+            mask_false_positive_prob=0.0,
+        )
+
+
 # AvoidReact-Banks + dynamic-obstacle segmentation mask head: the actor/critic
 # observations gain a raw delayed depth block (feeding the mask head), and the
 # training-time ground-truth obstacle mask label is exposed as an auxiliary obs
@@ -1390,3 +2629,71 @@ class G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERL
     def __post_init__(self):
         super().__post_init__()
         _apply_dynamic_mask_observations(self)
+
+
+def _apply_dynamic_eval_obstacles(cfg) -> None:
+    """Match the current training's dynamic-obstacle generation logic on a v3
+    (DynamicMapCross-BEV) network, for dynamic-scene evaluation: 5 obstacles,
+    1.6 m tall, full difficulty, 100% envs, staggered patrol, reactive >= 5 m."""
+    cfg.obstacle_spawn_delay_range = (1.0, 2.0)
+    cfg.obstacle_spawn_interval_s = 1.5
+    cfg.obstacle_scale_count_with_difficulty = False
+    cfg.obstacle_reactive_spawn = True
+    cfg.obstacle_visible_spawn_dist = 5.0
+    cfg.obstacle_graded_curriculum = True
+    cfg.obstacle_auto_switch_success = 2.0
+    cfg.obstacle_max_switch_iteration = 0
+    cfg.obstacle_initial_difficulty = 1.0
+    cfg.obstacle_advance_success = 2.0
+    cfg.obstacle_curriculum_env_fraction = 1.0
+    cfg.obstacle_fraction_range = (1.0, 1.0)
+    for event_name in ("dynamic_obstacles_reset", "dynamic_obstacles_update"):
+        event_cfg = getattr(cfg.events, event_name)
+        event_cfg.params["spawn_delay_range"] = (1.0, 2.0)
+        event_cfg.params["spawn_interval_s"] = 1.5
+        event_cfg.params["scale_count_with_difficulty"] = False
+        event_cfg.params["reactive_spawn"] = True
+        event_cfg.params["visible_spawn_dist"] = 5.0
+        event_cfg.params["graded_curriculum"] = True
+        event_cfg.params["auto_switch_success"] = 2.0
+        event_cfg.params["max_switch_iteration"] = 0
+        event_cfg.params["initial_difficulty"] = 1.0
+        event_cfg.params["advance_success"] = 2.0
+        event_cfg.params["curriculum_env_fraction"] = 1.0
+        event_cfg.params["fraction_range"] = (1.0, 1.0)
+        event_cfg.params["exact_curriculum_env_fraction"] = True
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_DYNAMIC_EVAL(
+    G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED
+):
+    """v3 DynamicMapCross-BEV network + current dynamic-obstacle generation logic."""
+
+    num_obstacles: int = 5
+    obstacle_half_height: float = 0.8
+
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_dynamic_eval_obstacles(self)
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_DYNAMIC_EVAL_PLAY(
+    G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_PLAY
+):
+    num_obstacles: int = 5
+    obstacle_half_height: float = 0.8
+
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_dynamic_eval_obstacles(self)
+
+
+@configclass
+class G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_DYNAMIC_EVAL_PHYSICAL_PLAY(
+    G1InstinctNavigationEnvCfg_DYNAMIC_MAP_CROSS_RICH_TERRAIN_OFFICIAL_CENTERLINE_UNOBSERVED_DYNAMIC_EVAL_PLAY
+):
+    """DynamicEval with physical obstacle collision (obstacles actually push the robot)."""
+
+    obstacle_collision_enabled: bool = True

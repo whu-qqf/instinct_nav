@@ -93,8 +93,9 @@ class LegacyRslRlVecEnvWrapper(RslRlVecEnvWrapper):
         critic_obs = obs["critic"] if "critic" in obs.keys() else policy_obs
         legacy = {"critic": critic_obs}
         # Pass through auxiliary observation groups (e.g. the training-only mask label).
-        if "mask_label" in obs.keys():
-            legacy["mask_label"] = obs["mask_label"]
+        for name in ("mask_label", "future_teacher"):
+            if name in obs.keys():
+                legacy[name] = obs[name]
         return policy_obs, {"observations": legacy}
 
     def reset(self):
@@ -193,6 +194,10 @@ def main():
     if args_cli.num_envs is not None:
         env_cfg.scene.num_envs = args_cli.num_envs
     if args_cli.seed is not None:
+        env_cfg.seed = args_cli.seed
+        terrain_generator = getattr(getattr(env_cfg.scene, "terrain", None), "terrain_generator", None)
+        if terrain_generator is not None:
+            terrain_generator.seed = args_cli.seed
         agent_cfg.seed = args_cli.seed
     if args_cli.max_iterations is not None:
         agent_cfg.max_iterations = args_cli.max_iterations

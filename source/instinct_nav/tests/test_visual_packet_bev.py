@@ -105,3 +105,145 @@ def test_visibility_manager_returns_preupdate_history_and_current_bev():
 
     assert torch.allclose(second_history_before, updated)
     assert torch.equal(second_current_hits, current_hits)
+
+
+def test_visibility_dynamic_risk_is_current_only_black_overlay():
+    manager = observations.LocalVisibilityMapManager(
+        num_envs=1,
+        device="cpu",
+        size_m=6.4,
+        grid_size=64,
+    )
+    manager.map.fill_(1.0)
+    manager.current_dynamic_risk[:, :, 30:34, 30:34] = 1.0
+
+    effective = manager.risk_adjusted_map
+    assert torch.all(effective[:, :, 30:34, 30:34] == 0.0)
+    assert torch.all(manager.map == 1.0)
+
+    manager.reset(torch.tensor([0]))
+    assert torch.count_nonzero(manager.current_dynamic_risk) == 0
+
+
+def test_masked_depth_is_excluded_from_persistent_visibility():
+    manager = observations.LocalVisibilityMapManager(
+        num_envs=1,
+        device="cpu",
+        size_m=6.4,
+        grid_size=64,
+        depth_min_m=0.5,
+        depth_max_m=8.0,
+        pixel_stride=1,
+        decay=0.995,
+    )
+    depth = torch.ones(1, 1, 4, 4)
+    dynamic_mask = torch.ones_like(depth)
+    camera_pos = torch.zeros(1, 3)
+    identity_quat = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
+    intrinsics = torch.tensor([[[2.0, 0.0, 1.5], [0.0, 2.0, 1.5], [0.0, 0.0, 1.0]]])
+
+    updated, _, current_hits, _, dynamic_hits = manager.update(
+        depth,
+        camera_pos,
+        identity_quat,
+        intrinsics,
+        torch.zeros(1, 3),
+        identity_quat,
+        return_components=True,
+        pixel_mask=dynamic_mask,
+        exclude_masked_pixels_from_visibility=True,
+    )
+
+    assert torch.count_nonzero(updated) == 0
+    assert torch.count_nonzero(current_hits) == 0
+    assert torch.count_nonzero(dynamic_hits) > 0
+
+
+def test_dynamic_mask_projection_uses_spawned_obstacle_dimensions(monkeypatch):
+    intrinsics = torch.tensor([[[40.0, 0.0, 32.0], [0.0, 40.0, 32.0], [0.0, 0.0, 1.0]]])
+    packet = {
+        "depth": torch.full((1, 1, 64, 64), 10.0),
+        "intrinsics": intrinsics,
+        "camera_pos_w": torch.zeros(1, 3),
+        "camera_quat_w": torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+    }
+    monkeypatch.setattr(observations, "_get_delayed_visual_packet", lambda env, sensor_cfg: packet)
+    manager = SimpleNamespace(
+        positions_w=torch.tensor([[[2.0, 0.0, 0.8]]]),
+        spawned_obstacles=torch.ones(1, 1, dtype=torch.bool),
+        curriculum_envs=torch.ones(1, dtype=torch.bool),
+        body_half_extent=0.25,
+        obstacle_half_height=0.4,
+    )
+    env = SimpleNamespace(device="cpu", _dynamic_obstacle_manager=manager, delay_manager=None)
+    sensor_cfg = SimpleNamespace(name="camera")
+
+    short_mask = observations.dynamic_obstacle_mask_label(env, sensor_cfg).reshape(64, 64)
+    manager.obstacle_half_height = 0.8
+    tall_mask = observations.dynamic_obstacle_mask_label(env, sensor_cfg).reshape(64, 64)
+
+    assert short_mask[30, 32] == 0
+    assert tall_mask[30, 32] == 1
+    assert tall_mask.sum() > short_mask.sum()
+    assert torch.equal(
+        short_mask,
+        observations.dynamic_obstacle_mask_label(env, sensor_cfg, half_height_m=0.4).reshape(64, 64),
+    )
+
+    manager.body_half_extent = 0.5
+    wide_mask = observations.dynamic_obstacle_mask_label(env, sensor_cfg).reshape(64, 64)
+    assert wide_mask.sum() > tall_mask.sum()
+
+
+def test_dynamic_sector_risk_extends_along_velocity():
+    positions = torch.tensor([[[1.0, 0.0, 0.8]]])
+    velocities = torch.tensor([[[1.0, 0.0]]])
+    active = torch.ones(1, 1, dtype=torch.bool)
+    visible = torch.ones_like(active)
+    root_pos = torch.zeros(1, 3)
+    root_quat = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
+
+    risk = observations._render_dynamic_sector_risk(
+        positions,
+        velocities,
+        active,
+        visible,
+        root_pos,
+        root_quat,
+        size_m=6.4,
+        grid_size=64,
+        body_half_extent_m=0.25,
+        clearance_m=0.30,
+        horizon_s=1.2,
+        sigma_long_m=0.15,
+        sigma_lat_m=0.12,
+        softness_m=0.08,
+        stationary_speed_mps=0.10,
+    )[0, 0]
+
+    # Grid row 17 is x ~= +1.45 m (ahead of the obstacle); row 37 is
+    # x ~= -0.55 m (behind it). The predicted sector must point forward.
+    assert risk[17, 31] > 0.8
+    assert risk[37, 31] < 0.1
+
+
+def test_dynamic_sector_risk_requires_visibility():
+    risk = observations._render_dynamic_sector_risk(
+        torch.tensor([[[1.0, 0.0, 0.8]]]),
+        torch.tensor([[[1.0, 0.0]]]),
+        torch.ones(1, 1, dtype=torch.bool),
+        torch.zeros(1, 1, dtype=torch.bool),
+        torch.zeros(1, 3),
+        torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+        size_m=6.4,
+        grid_size=64,
+        body_half_extent_m=0.25,
+        clearance_m=0.30,
+        horizon_s=1.2,
+        sigma_long_m=0.15,
+        sigma_lat_m=0.12,
+        softness_m=0.08,
+        stationary_speed_mps=0.10,
+    )
+
+    assert torch.count_nonzero(risk) == 0

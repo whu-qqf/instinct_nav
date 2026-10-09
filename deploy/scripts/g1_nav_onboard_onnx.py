@@ -11,6 +11,7 @@ import rclpy
 
 from instinct_nav_onboard.bridges import SensorSource
 from instinct_nav_onboard.config import OnboardConfig
+from instinct_nav_onboard.dynamic_mask import Yolo11Segmentation
 from instinct_nav_onboard.onnx_high_level_runtime import OnnxDebugDumpConfig, OnnxHighLevelRuntime
 from instinct_nav_onboard.packets import SensorPacket
 from instinct_nav_onboard.safety import FallSafetyMonitor, PersistentSafetyLogger, projected_gravity_tilt_deg
@@ -37,6 +38,9 @@ class G1NodeSensorSource(SensorSource):
         if depth is None:
             depth = np.full((36, 64), 2.5, dtype=np.float32)
         depth = self._resize_depth_to_training_shape(depth)
+        color_rgb = self.node.get_color_image()
+        if color_rgb is not None:
+            color_rgb = np.asarray(color_rgb, dtype=np.uint8).copy()
         return SensorPacket(
             timestamp_s=time.monotonic(),
             base_lin_vel_b=self.node.base_lin_vel_b.astype(np.float32),
@@ -46,6 +50,7 @@ class G1NodeSensorSource(SensorSource):
             joint_vel=self.node._get_joint_vel_obs().astype(np.float32),
             depth_m=depth,
             goal_b=self.node.nav_goal_b.astype(np.float32),
+            color_rgb=color_rgb,
             reset=bool(self.node.nav_reset_requested),
             base_pos_w=self.node.base_pos_w.astype(np.float32),
             base_yaw_w=float(self.node.base_yaw_w),
@@ -88,6 +93,16 @@ class G1NavOnboardOnnxNode(RealsenseMPCamera, UnitreeNode):
         command_slew_rate: tuple[float, float, float] = (0.4, 0.3, 0.6),
         command_lowpass_alpha: float = 0.5,
         visibility_decay: float = 1.0,
+        scene_token_layout: str = "scene_risk",
+        dynamic_mask_backend: str = "none",
+        yolo11_seg_weights: str | None = None,
+        yolo_dynamic_class_ids: tuple[int, ...] | None = None,
+        yolo_confidence: float = 0.25,
+        yolo_iou: float = 0.45,
+        yolo_image_size: int = 640,
+        yolo_device: str = "0",
+        yolo_half: bool = True,
+        yolo_max_detections: int = 20,
         fall_tilt_threshold_deg: float = 55.0,
         fall_tilt_duration_s: float = 0.15,
         safety_log_dir: str | None = None,
@@ -165,18 +180,40 @@ class G1NavOnboardOnnxNode(RealsenseMPCamera, UnitreeNode):
                 f"ONNX SRU debug dump enabled: dir={debug_cfg.dump_dir}, every_steps={debug_cfg.every_steps}, "
                 f"max_steps={debug_cfg.max_steps}, save_arrays={debug_cfg.save_arrays}."
             )
+        dynamic_mask_provider = None
+        if dynamic_mask_backend == "yolo11_seg":
+            if yolo11_seg_weights is None:
+                raise ValueError("yolo11_seg requires segmentation weights")
+            dynamic_mask_provider = Yolo11Segmentation(
+                yolo11_seg_weights,
+                class_ids=yolo_dynamic_class_ids,
+                confidence=yolo_confidence,
+                iou=yolo_iou,
+                image_size=yolo_image_size,
+                device=yolo_device,
+                half=yolo_half,
+                max_detections=yolo_max_detections,
+            )
+            self.get_logger().info(
+                f"Loaded YOLO11-seg dynamic-mask backend; weights={yolo11_seg_weights}, "
+                f"classes={yolo_dynamic_class_ids}."
+            )
+        elif dynamic_mask_backend != "none":
+            raise ValueError(f"unsupported dynamic mask backend: {dynamic_mask_backend}")
         self.sru_runtime = OnnxHighLevelRuntime(
             cfg=OnboardConfig(
                 high_level_hz=float(sru_high_level_hz),
                 command_min=self._command_min,
                 command_max=self._command_max,
                 visibility_decay=float(visibility_decay),
+                scene_token_layout=str(scene_token_layout),
             ),
             policy_onnx_path=sru_policy_onnx_path,
             depth_encoder_onnx_path=sru_depth_encoder_onnx_path,
             command_sink=None,
             debug_dump_config=debug_cfg,
             manifest_path=deploy_manifest_path,
+            dynamic_mask_provider=dynamic_mask_provider,
         )
         self.get_logger().info(f"Loaded high-level SRU ONNX policy from {sru_policy_onnx_path}")
         self.get_logger().info(f"Loaded high-level SRU depth encoder ONNX from {sru_depth_encoder_onnx_path}")
@@ -604,10 +641,20 @@ def _rotate_world_to_body(vec_w: np.ndarray, quat_xyzw: np.ndarray) -> np.ndarra
 def main(args: argparse.Namespace) -> None:
     if args.nodryrun and (args.safety_log_dir is None or not args.safety_log_dir.strip()):
         raise ValueError("--safety_log_dir is required with --nodryrun so incident telemetry survives process exit")
+    if args.nodryrun and args.dynamic_mask_backend == "yolo11_seg":
+        raise ValueError(
+            "The YOLO11-seg backend is synchronous and has not been validated inside the 50 Hz control loop; "
+            "it is restricted to dry-run until perception is isolated or its deadline is verified on target hardware."
+        )
     rclpy.init()
     node = G1NavOnboardOnnxNode(
         depth_resolution=(480, 270),
+        color_resolution=(480, 270) if args.dynamic_mask_backend != "none" else None,
+        color_stream_resolution=(
+            tuple(args.color_stream_resolution) if args.dynamic_mask_backend != "none" else None
+        ),
         depth_fps=60,
+        color_fps=30,
         joint_pos_protect_ratio=2.0,
         robot_class_name="G1_29Dof_TorsoBase",
         dryrun=not args.nodryrun,
@@ -634,6 +681,16 @@ def main(args: argparse.Namespace) -> None:
         command_slew_rate=tuple(args.command_slew_rate),
         command_lowpass_alpha=args.command_lowpass_alpha,
         visibility_decay=args.visibility_decay,
+        scene_token_layout=args.scene_token_layout,
+        dynamic_mask_backend=args.dynamic_mask_backend,
+        yolo11_seg_weights=args.yolo11_seg_weights,
+        yolo_dynamic_class_ids=tuple(args.yolo_dynamic_class_ids) if args.yolo_dynamic_class_ids else None,
+        yolo_confidence=args.yolo_confidence,
+        yolo_iou=args.yolo_iou,
+        yolo_image_size=args.yolo_image_size,
+        yolo_device=args.yolo_device,
+        yolo_half=not args.yolo_disable_half,
+        yolo_max_detections=args.yolo_max_detections,
         fall_tilt_threshold_deg=args.fall_tilt_threshold_deg,
         fall_tilt_duration_s=args.fall_tilt_duration_s,
         safety_log_dir=args.safety_log_dir,
@@ -686,6 +743,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sru_high_level_hz", type=float, default=5.0)
     parser.add_argument("--camera_frame_timeout_s", type=float, default=0.25)
     parser.add_argument("--visibility_decay", type=float, default=1.0)
+    parser.add_argument(
+        "--scene_token_layout",
+        choices=("scene_risk", "dynamic_map_cross", "dynamic_map_mask"),
+        default="scene_risk",
+        help="Used when the deploy manifest does not specify scene_token_layout.",
+    )
+    repo_root = Path(__file__).resolve().parents[2]
+    model_root = repo_root / "artifacts/deploy_models/yolo11_seg"
+    parser.add_argument("--dynamic_mask_backend", choices=("none", "yolo11_seg"), default="none")
+    parser.add_argument("--yolo11_seg_weights", type=str, default=str(model_root / "yolo11s-seg.pt"))
+    parser.add_argument("--yolo_dynamic_class_ids", type=int, nargs="+", default=None)
+    parser.add_argument("--yolo_confidence", type=float, default=0.25)
+    parser.add_argument("--yolo_iou", type=float, default=0.45)
+    parser.add_argument("--yolo_image_size", type=int, default=640)
+    parser.add_argument("--yolo_device", type=str, default="0")
+    parser.add_argument("--yolo_disable_half", action="store_true", default=False)
+    parser.add_argument("--yolo_max_detections", type=int, default=20)
+    parser.add_argument(
+        "--color_stream_resolution", type=int, nargs=2, default=(640, 480), metavar=("WIDTH", "HEIGHT")
+    )
     parser.add_argument("--startup_step_size", type=float, default=0.2)
     parser.add_argument("--kpkd_factor", type=float, default=2.0)
     parser.add_argument("--depth_vis", action="store_true", default=False)

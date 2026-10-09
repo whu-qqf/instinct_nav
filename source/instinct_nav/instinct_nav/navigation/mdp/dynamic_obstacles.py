@@ -92,8 +92,12 @@ class DynamicObstacleManager:
         obstacle_half_height: float = 0.4,
         body_half_extent: float = 0.25,
         spawn_delay_range: tuple[float, float] = (2.0, 8.0),
+        spawn_interval_s: float = 0.0,
+        scale_count_with_difficulty: bool = True,
         curriculum_env_fraction: float = 0.5,
+        exact_curriculum_env_fraction: bool = False,
         graded_curriculum: bool = False,
+        initial_difficulty: float = 0.0,
         difficulty_step: float = 0.2,
         advance_success: float = 0.75,
         demote_success: float = 0.0,
@@ -123,7 +127,10 @@ class DynamicObstacleManager:
         self.obstacle_half_height = float(obstacle_half_height)
         self.body_half_extent = float(body_half_extent)
         self.spawn_delay_range = (float(spawn_delay_range[0]), float(spawn_delay_range[1]))
+        self.spawn_interval_s = max(0.0, float(spawn_interval_s))
+        self.scale_count_with_difficulty = bool(scale_count_with_difficulty)
         self.curriculum_env_fraction = min(max(float(curriculum_env_fraction), 0.0), 1.0)
+        self.exact_curriculum_env_fraction = bool(exact_curriculum_env_fraction)
         # --- Graded (capability-driven) curriculum knobs. When disabled (default) the
         # manager behaves exactly like the legacy binary iteration switch. ---
         self.graded_curriculum = bool(graded_curriculum)
@@ -145,19 +152,46 @@ class DynamicObstacleManager:
         self.reactive_spawn = bool(reactive_spawn)
         self.visible_spawn_dist = float(visible_spawn_dist)
         self.max_closing_speed = float(max_closing_speed)
+        # HardEncounterV2 is opt-in through a dedicated task config. Keep all
+        # legacy tasks byte-for-byte on the old spawning and patrol path.
+        self.hard_encounter_v2 = bool(getattr(env.cfg, "obstacle_hard_encounter_v2", False))
+        self.hard_tier2_iteration = int(
+            getattr(env.cfg, "obstacle_hard_tier2_iteration", 2500)
+        )
+        self.hard_mid_active_count = int(
+            getattr(env.cfg, "obstacle_hard_mid_active_count", 3)
+        )
+        self.hard_high_active_count = int(
+            getattr(env.cfg, "obstacle_hard_high_active_count", 4)
+        )
+        self.hard_mid_speed_range = tuple(
+            getattr(env.cfg, "obstacle_hard_mid_speed_range", (0.35, 0.75))
+        )
+        self.hard_high_speed_range = tuple(
+            getattr(env.cfg, "obstacle_hard_high_speed_range", (0.45, 1.0))
+        )
+        self.hard_recycle_delay_range = tuple(
+            getattr(env.cfg, "obstacle_hard_recycle_delay_range", (0.4, 0.8))
+        )
         # Rolling mean of the most recent spawn distances (diagnostics only).
         self._last_spawn_dist_mean = 40.0
-        # Difficulty in [0, 1]; 0 == easiest tier (slow, far, single obstacle, gentle
-        # behaviors), 1 == full configured difficulty. Only moves when graded.
-        self.difficulty = 0.0
+        # Difficulty in [0, 1]; by default the easiest tier uses one obstacle and
+        # the hardest uses all configured obstacles. Named ablations may keep the
+        # count fixed while still grading speed, distance, behavior, and env fraction.
+        self.difficulty = min(max(float(initial_difficulty), 0.0), 1.0)
         self._last_advance_check = -1
+        self._last_gate_success_rate = 0.0
+        self._last_gate_check_step = -1
+        self._last_gate_decision = 0.0
         # Fixed per-env random draw. The curriculum-env mask is derived from it against
         # the current fraction, so annealing the fraction upward monotonically ADDS envs
         # (a fixed draw < a growing threshold) instead of reshuffling the subset.
         self._env_rand = torch.rand(self.num_envs, device=self.device)
+        self._env_rank = torch.empty(self.num_envs, device=self.device, dtype=torch.long)
+        self._env_rank[torch.argsort(self._env_rand)] = torch.arange(self.num_envs, device=self.device)
         # Fixed random subset of envs that join the dynamic-obstacle curriculum (sampled once
         # at startup, not per episode), so the rest keep training plain static navigation.
-        self.curriculum_envs = self._env_rand < self._current_fraction()
+        self.curriculum_envs = self._curriculum_mask(self._current_fraction())
         self.terrain_lookup = _build_terrain_lookup(env)
 
         # In-run curriculum state: obstacles stay parked until the fixed PPO
@@ -180,16 +214,24 @@ class DynamicObstacleManager:
         self.ends = torch.zeros(self.num_envs, self.num_obstacles, 2, device=self.device)
         self.behaviors = torch.zeros(self.num_envs, self.num_obstacles, device=self.device, dtype=torch.long)
         self.paused = torch.zeros(self.num_envs, self.num_obstacles, device=self.device, dtype=torch.bool)
-        # Sudden-spawn state: per-env flag + delay before obstacles pop in mid-travel.
+        # Keep the legacy per-env flag for rewards/terminations and an exact
+        # per-obstacle mask for staggered spawning and delayed mask labels.
         self.spawned = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
-        self.spawn_timers = torch.zeros(self.num_envs, device=self.device)
+        self.spawned_obstacles = torch.zeros(
+            self.num_envs, self.num_obstacles, device=self.device, dtype=torch.bool
+        )
+        self.spawn_timers = torch.zeros(self.num_envs, self.num_obstacles, device=self.device)
+        self.trajectories_ready = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
 
-        # Short state history for delayed label alignment: positions_w + spawned are
-        # recorded once per env step so the mask label can index the obstacle state at
-        # the same lag as the delayed visual packet (max_delay_depth + 1 entries).
-        self._history_max_len = 3
+        # Derive history capacity from the visual delay configuration so changing
+        # max_delay_depth cannot silently make mask labels use the wrong frame.
+        delay_cfg = getattr(getattr(env, "delay_manager", None), "cfg", None)
+        max_depth_delay = max(0, int(getattr(delay_cfg, "max_delay_depth", 0)))
+        self._history_max_len = max_depth_delay + 1
         self._positions_history: list[torch.Tensor] = []
         self._spawned_history: list[torch.Tensor] = []
+        self._curriculum_envs_history: list[torch.Tensor] = []
+        self._velocities_history: list[torch.Tensor] = []
 
     # ------------------------------------------------------------------
     # graded-curriculum difficulty schedule
@@ -204,7 +246,15 @@ class DynamicObstacleManager:
 
     def _refresh_curriculum_envs(self) -> None:
         """Recompute the obstacle-env mask from the fixed per-env draw and current fraction."""
-        self.curriculum_envs = self._env_rand < self._current_fraction()
+        self.curriculum_envs = self._curriculum_mask(self._current_fraction())
+
+    def _curriculum_mask(self, fraction: float) -> torch.Tensor:
+        """Return a fixed monotonic cohort, optionally with an exact env count."""
+        fraction = min(max(float(fraction), 0.0), 1.0)
+        if not self.exact_curriculum_env_fraction:
+            return self._env_rand < fraction
+        count = min(max(int(round(fraction * self.num_envs)), 0), self.num_envs)
+        return self._env_rank < count
 
     def _effective_speed_range(self) -> tuple[float, float]:
         if not self.graded_curriculum:
@@ -224,10 +274,22 @@ class DynamicObstacleManager:
 
     def _effective_active_k(self) -> int:
         """Number of obstacles that actually spawn per env (rest stay parked)."""
-        if not self.graded_curriculum:
+        if not self.graded_curriculum or not self.scale_count_with_difficulty:
             return self.num_obstacles
         k = math.ceil(1 + self.difficulty * (self.num_obstacles - 1))
         return max(1, min(self.num_obstacles, int(k)))
+
+    def _hard_stage(self) -> int:
+        iteration = int(self.env.common_step_counter) // max(1, int(self.env_steps_per_iteration))
+        return 1 if iteration < self.hard_tier2_iteration else 2
+
+    def _hard_local_capacity(self) -> int:
+        count = self.hard_mid_active_count if self._hard_stage() == 1 else self.hard_high_active_count
+        return max(1, min(self.num_obstacles, count))
+
+    def _hard_current_speed_range(self) -> tuple[float, float]:
+        values = self.hard_mid_speed_range if self._hard_stage() == 1 else self.hard_high_speed_range
+        return float(values[0]), float(values[1])
 
     def _behavior_weights(self) -> torch.Tensor:
         """Sampling weights for [cross, head-on, same-dir, merge, stop-and-go].
@@ -336,7 +398,11 @@ class DynamicObstacleManager:
         for k, obstacle in enumerate(self.obstacles):
             obstacle.write_root_pose_to_sim(pose[:, k], env_ids=env_ids)
 
-        active_speed = self.speeds[env_ids] * (~self.paused[env_ids]).to(self.speeds.dtype)
+        active_speed = (
+            self.speeds[env_ids]
+            * (~self.paused[env_ids]).to(self.speeds.dtype)
+            * self.spawned_obstacles[env_ids].to(self.speeds.dtype)
+        )
         lin_vel = torch.cat([self.dirs[env_ids] * active_speed.unsqueeze(-1), torch.zeros_like(positions[:, :, :1])], dim=-1)
         ang_vel = torch.zeros_like(lin_vel)
         velocity = torch.cat([lin_vel, ang_vel], dim=-1)  # [n, K, 6]
@@ -363,12 +429,19 @@ class DynamicObstacleManager:
             + torch.tensor([[-self.park_offset_m, 0.0]], device=self.device)
         ).expand(n, self.num_obstacles, 2)
 
-        if self.enabled:
-            self.spawned[env_ids] = False
-            self.spawn_timers[env_ids] = (
-                torch.rand(n, device=self.device) * (self.spawn_delay_range[1] - self.spawn_delay_range[0])
-                + self.spawn_delay_range[0]
-            )
+        self.spawned[env_ids] = False
+        self.spawned_obstacles[env_ids] = False
+        self.trajectories_ready[env_ids] = False
+        first_delay = (
+            torch.rand(n, 1, device=self.device) * (self.spawn_delay_range[1] - self.spawn_delay_range[0])
+            + self.spawn_delay_range[0]
+        )
+        stagger = torch.arange(self.num_obstacles, device=self.device, dtype=torch.float32).unsqueeze(0)
+        self.spawn_timers[env_ids] = first_delay + stagger * self.spawn_interval_s
+        if self.hard_encounter_v2:
+            # Fill the local pool quickly after the static warm-up. Subsequent
+            # obstacles are recycled with randomized delays in update().
+            self.spawn_timers[env_ids] = first_delay + stagger * 0.55
 
         positions = torch.zeros(n, self.num_obstacles, 3, device=self.device)
         positions[:, :, :2] = center
@@ -399,15 +472,29 @@ class DynamicObstacleManager:
         # --- Sudden spawn: obstacles pop in ahead of the robot once their per-env
         #     delay elapses (mid-travel), not at episode reset. Only curriculum envs
         #     ever spawn; the rest stay parked (plain static navigation). ---
-        unspawned = (~self.spawned) & self.curriculum_envs
+        active_k = self.num_obstacles if self.hard_encounter_v2 else self._effective_active_k()
+        eligible = (
+            torch.arange(self.num_obstacles, device=self.device).unsqueeze(0) < active_k
+        )
+        unspawned = (~self.spawned_obstacles) & self.curriculum_envs.unsqueeze(1) & eligible
         if bool(unspawned.any().item()):
             self.spawn_timers = torch.where(unspawned, self.spawn_timers - dt, self.spawn_timers)
             due = unspawned & (self.spawn_timers <= 0.0)
             if bool(due.any().item()):
-                self._spawn_envs(torch.nonzero(due, as_tuple=False).reshape(-1))
+                if self.hard_encounter_v2:
+                    self._spawn_hard_encounters(due)
+                elif getattr(self.env.cfg, "obstacle_encounter_spawn", False):
+                    self._spawn_encounters(due)
+                elif self.spawn_interval_s <= 0.0:
+                    self._spawn_envs(torch.nonzero(due.any(dim=1), as_tuple=False).reshape(-1))
+                else:
+                    prepare = due.any(dim=1) & ~self.trajectories_ready
+                    if bool(prepare.any().item()):
+                        self._prepare_trajectories(torch.nonzero(prepare, as_tuple=False).reshape(-1))
+                    self._activate_obstacles(due)
 
         # --- Only spawned obstacles move; the rest stay parked. ---
-        spawned_mask = self.spawned.unsqueeze(1).expand(self.num_envs, self.num_obstacles)
+        spawned_mask = self.spawned_obstacles
 
         # Stop-and-go trajectories pause for 0.5--1.5 s, then resume.
         stop_go = (self.behaviors == 4) & spawned_mask
@@ -429,8 +516,30 @@ class DynamicObstacleManager:
         reached = (
             torch.sum((target - self.positions_w[:, :, :2]) * self.dirs, dim=-1) <= 0.0
         ) & spawned_mask
-        self.positions_w[:, :, :2] = torch.where(reached.unsqueeze(-1), target, self.positions_w[:, :, :2])
-        self.dirs = torch.where(reached.unsqueeze(-1), -self.dirs, self.dirs)
+        if self.hard_encounter_v2 and bool(reached.any().item()):
+            # Recycle completed trajectories instead of bouncing forever. This
+            # keeps encounter density stable without tethering paths to the robot.
+            self.spawned_obstacles[reached] = False
+            self.paused[reached] = False
+            self.speeds[reached] = 0.0
+            self.dirs[reached] = 0.0
+            recycle_delay = torch.rand_like(self.spawn_timers)
+            lo, hi = self.hard_recycle_delay_range
+            recycle_delay = recycle_delay * (float(hi) - float(lo)) + float(lo)
+            self.spawn_timers = torch.where(reached, recycle_delay, self.spawn_timers)
+            park_xy = self.env.scene.env_origins[:, :2] + torch.tensor(
+                [-self.park_offset_m, 0.0], device=self.device
+            )
+            parked = park_xy.unsqueeze(1).expand(-1, self.num_obstacles, -1)
+            self.positions_w[:, :, :2] = torch.where(
+                reached.unsqueeze(-1), parked, self.positions_w[:, :, :2]
+            )
+            self.spawned = self.spawned_obstacles.any(dim=1)
+        else:
+            self.positions_w[:, :, :2] = torch.where(
+                reached.unsqueeze(-1), target, self.positions_w[:, :, :2]
+            )
+            self.dirs = torch.where(reached.unsqueeze(-1), -self.dirs, self.dirs)
 
         # Refresh z so spawned obstacles track terrain height; parked ones keep their z.
         all_ids = torch.arange(self.num_envs, device=self.device, dtype=torch.long)
@@ -448,23 +557,29 @@ class DynamicObstacleManager:
     def _record_state_history(self) -> None:
         """Append the current obstacle state to the delayed-label history.
 
-        Keeps the most recent ``_history_max_len`` positions_w + spawned snapshots
-        (one per env step) so the mask label can index the obstacle state at the
-        same lag as the delayed visual packet.
+        Keeps the most recent ``_history_max_len`` position and activation snapshots
+        so the mask label can index the state at the same lag as the visual packet.
         """
         self._positions_history.append(self.positions_w.clone())
-        self._spawned_history.append(self.spawned.clone())
+        self._spawned_history.append(self.spawned_obstacles.clone())
+        self._curriculum_envs_history.append(self.curriculum_envs.clone())
+        effective_velocity = self.dirs * (
+            self.speeds
+            * (~self.paused).to(self.speeds.dtype)
+            * self.spawned_obstacles.to(self.speeds.dtype)
+        ).unsqueeze(-1)
+        self._velocities_history.append(effective_velocity.clone())
         if len(self._positions_history) > self._history_max_len:
             self._positions_history.pop(0)
             self._spawned_history.pop(0)
+            self._curriculum_envs_history.pop(0)
+            self._velocities_history.pop(0)
 
-    def _spawn_envs(self, env_ids: torch.Tensor):
-        """Pop obstacles in ahead of the robot for the given envs (sudden appearance).
-
-        Samples trajectories against the robot's *current* pose/heading, so obstacles
-        materialize in front of where the robot is now, mid-travel.
-        """
+    def _prepare_trajectories(self, env_ids: torch.Tensor) -> None:
+        """Sample one episode's obstacle trajectories from the robot's current pose."""
         n = env_ids.numel()
+        if n == 0:
+            return
         starts, ends, behaviors = self._sample_trajectories(env_ids)
         speed_lo, speed_hi = self._effective_speed_range()
 
@@ -512,24 +627,225 @@ class DynamicObstacleManager:
         self.dirs[env_ids] = dirs
         self.paused[env_ids] = False
         self.timers[env_ids] = torch.rand(n, self.num_obstacles, device=self.device) * 3.0 + 1.0
+        self.trajectories_ready[env_ids] = True
 
-        positions = torch.zeros(n, self.num_obstacles, 3, device=self.device)
-        positions[:, :, :2] = starts
-        flat_pos = positions.reshape(-1, 3)
-        flat_ids = env_ids.repeat_interleave(self.num_obstacles)
-        z = _terrain_z_at(self.env, self.terrain_lookup, flat_pos, flat_ids).reshape(n, self.num_obstacles)
-        positions[:, :, 2] = z + self.obstacle_half_height
+    def _spawn_encounters(self, due: torch.Tensor) -> None:
+        """Activate one visible crossing per env, conditioned on a broad flat corridor.
 
-        self.positions_w[env_ids] = positions
-        self.spawned[env_ids] = True
-        self._set_pose_and_velocity(env_ids, positions)
+        Five slots remain available, but a timer alone cannot force an unsafe
+        spawn. Rejected candidates stay parked and are retried on later steps.
+        Paths are fixed at activation; no pursuit or trajectory retargeting occurs.
+        """
+        robot = self.env.scene["robot"]
+        nearby_count = ((torch.norm(self.positions_w[..., :2] - robot.data.root_pos_w[:, None, :2], dim=-1) < 6.0)
+                        & self.spawned_obstacles).sum(1)
+        capacity = 1 if self.difficulty < 0.6 else 2
+        eligible = due.any(1) & (nearby_count < capacity)
+        ids = torch.nonzero(eligible, as_tuple=False).flatten()
+        if ids.numel() == 0:
+            return
+        slots = due[ids].long().argmax(1)
+        root = robot.data.root_pos_w[ids]
+        q = robot.data.root_quat_w[ids]
+        forward = torch.stack((1 - 2 * (q[:, 2] ** 2 + q[:, 3] ** 2),
+                               2 * (q[:, 1] * q[:, 2] + q[:, 0] * q[:, 3])), -1)
+        forward = torch.nn.functional.normalize(forward, dim=-1)
+        lateral = torch.stack((-forward[:, 1], forward[:, 0]), -1)
+        velocity = (robot.data.root_lin_vel_w[ids, :2] * forward).sum(-1)
+        lo, hi = self._effective_speed_range()
+        speed = lo + torch.rand_like(velocity) * (hi - lo)
+        # Match the crossing midpoint to a constant-velocity robot prediction.
+        distance = torch.full_like(velocity, self.visible_spawn_dist)
+        encounter_time = distance / velocity.clamp_min(0.3)
+        span = speed * encounter_time
+        side = torch.where(torch.rand_like(speed) < 0.5, -1.0, 1.0)
+        anchor = root[:, :2] + forward * distance[:, None]
+        start = anchor + lateral * (side * span)[:, None]
+        end = anchor - lateral * (side * span)[:, None]
+        goal = self.env.command_manager._terms["robot_goal"].goal_position_world[ids, :2]
+        valid = (velocity > 0.3) & (span >= 0.7) & (span <= 2.0)
+        valid &= (torch.norm(goal - anchor, dim=-1) > self.goal_clearance_m + 1.0)
+        # Conservative height-field screen: accept only broad, locally flat areas.
+        offsets = torch.tensor([-2.0, -1.0, 0.0, 1.0, 2.0], device=self.device)
+        corridor = anchor[:, None, :] + lateral[:, None, :] * offsets[None, :, None]
+        points = torch.cat((corridor, start[:, None], end[:, None]), dim=1)
+        xyz = torch.cat((points, torch.zeros_like(points[..., :1])), dim=-1)
+        heights = _terrain_z_at(self.env, self.terrain_lookup, xyz.flatten(0, 1), ids.repeat_interleave(7)).reshape(-1, 7)
+        valid &= torch.isfinite(heights).all(1) & ((heights.max(1).values - heights.min(1).values) < 0.15)
+        ids, slots = ids[valid], slots[valid]
+        if ids.numel() == 0:
+            return
+        self.starts[ids, slots] = start[valid]
+        self.ends[ids, slots] = end[valid]
+        self.speeds[ids, slots] = speed[valid]
+        self.dirs[ids, slots] = torch.nn.functional.normalize(end[valid] - start[valid], dim=-1)
+        self.behaviors[ids, slots] = 0
+        self.paused[ids, slots] = False
+        activate = torch.zeros_like(due)
+        activate[ids, slots] = True
+        self._activate_obstacles(activate)
+        remaining = ~self.spawned_obstacles[ids]
+        self.spawn_timers[ids] = torch.where(remaining, self.spawn_timers[ids].clamp_min(self.spawn_interval_s), self.spawn_timers[ids])
 
-        # Diagnostics: mean XY spawn distance of the active obstacles from the robot,
-        # so the reactive-spawn standoff (>= visible_spawn_dist) is observable in logs.
-        robot_xy_diag = self.env.scene["robot"].data.root_pos_w[env_ids, :2].unsqueeze(1)
-        spawn_dist = torch.norm(starts[:, :active_k] - robot_xy_diag, dim=-1)
+    def _spawn_hard_encounters(self, due: torch.Tensor) -> None:
+        """Spawn one conflict-conditioned trajectory per eligible environment.
+
+        The pool is local and recyclable: many slots may exist, but only the
+        configured 3/4 obstacles can be within 6.5 m simultaneously. Candidate
+        paths are fixed in world coordinates after activation and never pursue
+        the robot.
+        """
+        robot = self.env.scene["robot"]
+        root_xy_all = robot.data.root_pos_w[:, :2]
+        nearby = torch.norm(self.positions_w[..., :2] - root_xy_all[:, None], dim=-1) < 6.5
+        nearby_count = (nearby & self.spawned_obstacles).sum(dim=1)
+        eligible = due.any(dim=1) & (nearby_count < self._hard_local_capacity())
+        ids = torch.nonzero(eligible, as_tuple=False).flatten()
+        if ids.numel() == 0:
+            return
+
+        slots = due[ids].long().argmax(dim=1)
+        root = robot.data.root_pos_w[ids]
+        quat = robot.data.root_quat_w[ids]
+        forward = torch.stack(
+            (
+                1.0 - 2.0 * (quat[:, 2].square() + quat[:, 3].square()),
+                2.0 * (quat[:, 1] * quat[:, 2] + quat[:, 0] * quat[:, 3]),
+            ),
+            dim=-1,
+        )
+        forward = torch.nn.functional.normalize(forward, dim=-1)
+        lateral = torch.stack((-forward[:, 1], forward[:, 0]), dim=-1)
+        side = torch.where(torch.rand(ids.numel(), device=self.device) < 0.5, -1.0, 1.0)
+
+        speed_lo, speed_hi = self._hard_current_speed_range()
+        speed = speed_lo + torch.rand(ids.numel(), device=self.device) * (speed_hi - speed_lo)
+        weights = torch.tensor([0.30, 0.25, 0.10, 0.20, 0.10, 0.05], device=self.device)
+        mode = torch.multinomial(weights, ids.numel(), replacement=True)
+
+        anchor_dist = 2.4 + torch.rand_like(speed) * 1.6
+        anchor = root[:, :2] + forward * anchor_dist[:, None]
+        travel_time = 2.0 + torch.rand_like(speed) * 1.5
+        span = (speed * travel_time).clamp(1.4, 3.5)
+
+        cross_start = anchor + lateral * (side * span)[:, None]
+        cross_end = anchor - lateral * (side * span)[:, None]
+
+        head_dist = 4.5 + torch.rand_like(speed) * 1.5
+        head_start = root[:, :2] + forward * head_dist[:, None] + lateral * (side * 0.25)[:, None]
+        head_end = root[:, :2] + forward * 0.6 - lateral * (side * 0.25)[:, None]
+
+        same_start = root[:, :2] + forward * (3.2 + torch.rand_like(speed))[:, None]
+        same_start = same_start + lateral * (side * 0.55)[:, None]
+        same_end = same_start + forward * (3.5 + torch.rand_like(speed) * 1.5)[:, None]
+
+        merge_start = anchor + lateral * (side * span)[:, None] + forward * 0.8
+        merge_end = anchor - lateral * (side * 0.35)[:, None] + forward * 1.5
+
+        # Mode 4 reuses a crossing path with stop-and-go timing. Mode 5 uses a
+        # shallow diagonal whose repeated recycle yields a curved/sweeping mix
+        # without per-step pursuit or retargeting.
+        sweep_start = anchor + lateral * (side * span)[:, None] - forward * 0.8
+        sweep_end = anchor - lateral * (side * 0.7)[:, None] + forward * 2.0
+
+        start = cross_start
+        end = cross_end
+        start = torch.where((mode == 1)[:, None], head_start, start)
+        end = torch.where((mode == 1)[:, None], head_end, end)
+        start = torch.where((mode == 2)[:, None], same_start, start)
+        end = torch.where((mode == 2)[:, None], same_end, end)
+        start = torch.where((mode == 3)[:, None], merge_start, start)
+        end = torch.where((mode == 3)[:, None], merge_end, end)
+        start = torch.where((mode == 5)[:, None], sweep_start, start)
+        end = torch.where((mode == 5)[:, None], sweep_end, end)
+
+        # Guarantee a visible approach without creating unavoidable close-range
+        # pop-ins. Moving the start outward leaves the conflict point unchanged.
+        start_offset = start - root[:, :2]
+        start_distance = torch.norm(start_offset, dim=-1).clamp_min(1.0e-3)
+        min_spawn = 4.0
+        start = root[:, :2] + start_offset * (
+            start_distance.clamp_min(min_spawn) / start_distance
+        )[:, None]
+
+        goal = self.env.command_manager._terms["robot_goal"].goal_position_world[ids, :2]
+        valid = torch.norm(goal - anchor, dim=-1) > self.goal_clearance_m + 0.8
+        valid &= torch.norm(end - start, dim=-1) > 1.0
+
+        # Only spawn on a broad, locally flat corridor. Invalid candidates retry
+        # on a later update instead of being forced into stairs or gaps.
+        offsets = torch.tensor([-1.5, -0.75, 0.0, 0.75, 1.5], device=self.device)
+        corridor = anchor[:, None] + lateral[:, None] * offsets[None, :, None]
+        points = torch.cat((corridor, start[:, None], end[:, None]), dim=1)
+        xyz = torch.cat((points, torch.zeros_like(points[..., :1])), dim=-1)
+        point_count = points.shape[1]
+        heights = _terrain_z_at(
+            self.env,
+            self.terrain_lookup,
+            xyz.flatten(0, 1),
+            ids.repeat_interleave(point_count),
+        ).reshape(-1, point_count)
+        valid &= torch.isfinite(heights).all(dim=1)
+        valid &= heights.max(dim=1).values - heights.min(dim=1).values < 0.15
+
+        valid_ids = ids[valid]
+        valid_slots = slots[valid]
+        if valid_ids.numel() == 0:
+            return
+        self.starts[valid_ids, valid_slots] = start[valid]
+        self.ends[valid_ids, valid_slots] = end[valid]
+        self.speeds[valid_ids, valid_slots] = speed[valid]
+        self.dirs[valid_ids, valid_slots] = torch.nn.functional.normalize(
+            end[valid] - start[valid], dim=-1
+        )
+        self.behaviors[valid_ids, valid_slots] = mode[valid]
+        self.paused[valid_ids, valid_slots] = False
+        self.timers[valid_ids, valid_slots] = torch.rand(valid_ids.numel(), device=self.device) * 1.5 + 1.5
+        activate = torch.zeros_like(due)
+        activate[valid_ids, valid_slots] = True
+        self._activate_obstacles(activate)
+
+        # Stagger the remaining slots independently. Rejected candidates retry
+        # promptly; accepted environments wait before admitting another conflict.
+        lo, hi = self.hard_recycle_delay_range
+        retry = torch.rand_like(self.spawn_timers[ids]) * (float(hi) - float(lo)) + float(lo)
+        remaining = ~self.spawned_obstacles[ids]
+        self.spawn_timers[ids] = torch.where(remaining, retry, self.spawn_timers[ids])
+
+    def _activate_obstacles(self, due: torch.Tensor) -> None:
+        """Move the selected per-env obstacle slots from parking onto their paths."""
+        pairs = torch.nonzero(due, as_tuple=False)
+        if pairs.numel() == 0:
+            return
+        env_ids = pairs[:, 0]
+        obstacle_ids = pairs[:, 1]
+        starts = self.starts[env_ids, obstacle_ids]
+
+        positions = torch.zeros(pairs.shape[0], 3, device=self.device)
+        positions[:, :2] = starts
+        positions[:, 2] = _terrain_z_at(self.env, self.terrain_lookup, positions, env_ids) + self.obstacle_half_height
+        self.positions_w[env_ids, obstacle_ids] = positions
+        self.spawned_obstacles[env_ids, obstacle_ids] = True
+        self.spawned = self.spawned_obstacles.any(dim=1)
+        unique_env_ids = torch.unique(env_ids)
+        self._set_pose_and_velocity(unique_env_ids, self.positions_w[unique_env_ids])
+
+        robot_xy = self.env.scene["robot"].data.root_pos_w[env_ids, :2]
+        spawn_dist = torch.norm(starts - robot_xy, dim=-1)
         if spawn_dist.numel() > 0:
             self._last_spawn_dist_mean = float(spawn_dist.mean().item())
+
+    def _spawn_envs(self, env_ids: torch.Tensor) -> None:
+        """Prepare and activate every difficulty-eligible obstacle at once."""
+        if env_ids.numel() == 0:
+            return
+        self._prepare_trajectories(env_ids)
+        active_k = self._effective_active_k()
+        due = torch.zeros(
+            self.num_envs, self.num_obstacles, device=self.device, dtype=torch.bool
+        )
+        due[env_ids, :active_k] = True
+        self._activate_obstacles(due)
 
     def enable(self, env_ids: Sequence[int] | torch.Tensor | slice | None = None):
         """Switch the curriculum on: place obstacles into the action ring and start motion."""
@@ -550,10 +866,43 @@ class DynamicObstacleManager:
         log = extras.setdefault("log", {})
         log["Metrics/dynamic_obstacles/enabled"] = float(self.enabled)
         log["Metrics/dynamic_obstacles/difficulty"] = float(self.difficulty)
+        log["Metrics/dynamic_obstacles/gate_success_rate"] = float(self._last_gate_success_rate)
+        log["Metrics/dynamic_obstacles/gate_success_threshold"] = float(self.advance_success)
+        log["Metrics/dynamic_obstacles/gate_check_step"] = float(self._last_gate_check_step)
+        log["Metrics/dynamic_obstacles/gate_decision"] = float(self._last_gate_decision)
+        goal_cmd = getattr(getattr(self.env, "command_manager", None), "_terms", {}).get("robot_goal", None)
+        tracker = getattr(goal_cmd, "success_tracker", None)
+        if tracker is not None:
+            filled = (tracker.buffer >= 0).sum(dim=1)
+            log["Metrics/dynamic_obstacles/success_window_fill_mean"] = float(filled.float().mean().item())
+            log["Metrics/dynamic_obstacles/success_window_full_fraction"] = float(
+                (filled >= tracker.buffer_size).float().mean().item()
+            )
         log["Metrics/dynamic_obstacles/curriculum_env_frac"] = float(
             self.curriculum_envs.float().mean().item()
         )
         log["Metrics/dynamic_obstacles/spawn_dist_mean"] = float(self._last_spawn_dist_mean)
+        log["Metrics/dynamic_obstacles/active_count_mean"] = float(
+            self.spawned_obstacles.float().sum(dim=1)[self.curriculum_envs].mean().item()
+        ) if bool(self.curriculum_envs.any().item()) else 0.0
+        clean_mask_rate = getattr(self, "_last_direct_mask_clean_positive_rate", None)
+        input_mask_rate = getattr(self, "_last_direct_mask_input_positive_rate", None)
+        bev_token_rate = getattr(self, "_last_dynamic_bev_token_positive_rate", None)
+        if clean_mask_rate is not None:
+            log["Metrics/dynamic_mask/clean_positive_rate"] = float(clean_mask_rate.item())
+        if input_mask_rate is not None:
+            log["Metrics/dynamic_mask/input_positive_rate"] = float(input_mask_rate.item())
+        if bev_token_rate is not None:
+            log["Metrics/dynamic_mask/bev_token_positive_rate"] = float(bev_token_rate.item())
+        sector_rate = getattr(self, "_last_dynamic_sector_risk_rate", None)
+        visible_instances = getattr(self, "_last_dynamic_visible_instances", None)
+        if sector_rate is not None:
+            log["Metrics/dynamic_risk/sector_positive_rate"] = float(sector_rate.item())
+        if visible_instances is not None:
+            log["Metrics/dynamic_risk/visible_instances"] = float(visible_instances.item())
+        if self.hard_encounter_v2:
+            log["Metrics/dynamic_obstacles/local_capacity"] = float(self._hard_local_capacity())
+            log["Metrics/dynamic_obstacles/hard_stage"] = float(self._hard_stage())
         spawned = self.spawned
         if bool(spawned.any().item()):
             log["Metrics/dynamic_obstacles/min_dist_mean"] = float(
@@ -636,8 +985,12 @@ class DynamicObstacleManager:
             return
         self._last_advance_check = step
         success = self._mean_success_rate()
+        self._last_gate_success_rate = success
+        self._last_gate_check_step = step
+        self._last_gate_decision = 0.0
         if success >= self.advance_success and self.difficulty < 1.0:
             self.difficulty = min(1.0, self.difficulty + self.difficulty_step)
+            self._last_gate_decision = 1.0
             self._refresh_curriculum_envs()
             print(
                 f"[DynamicObstacleManager] Difficulty advanced to {self.difficulty:.2f} "
@@ -645,6 +998,7 @@ class DynamicObstacleManager:
             )
         elif self.demote_success > 0.0 and success < self.demote_success and self.difficulty > 0.0:
             self.difficulty = max(0.0, self.difficulty - self.difficulty_step)
+            self._last_gate_decision = -1.0
             self._refresh_curriculum_envs()
             print(
                 f"[DynamicObstacleManager] Difficulty demoted to {self.difficulty:.2f} "
@@ -656,6 +1010,7 @@ class DynamicObstacleManager:
         robot = self.env.scene["robot"]
         root_xy = robot.data.root_pos_w[:, :2].unsqueeze(1)  # [num_envs, 1, 2]
         dist = torch.norm(self.positions_w[:, :, :2] - root_xy, dim=-1)  # [num_envs, K]
+        dist = torch.where(self.spawned_obstacles, dist, torch.full_like(dist, float("inf")))
         return dist.min(dim=-1).values
 
     def closing_speed_to_robot(self) -> torch.Tensor:
@@ -680,6 +1035,7 @@ class DynamicObstacleManager:
         # closing speed = -d(dist)/dt = dot(robot_vel - obs_vel, unit); positive
         # when the obstacle is approaching (distance shrinking).
         closing = torch.sum((robot_vel - obs_vel) * unit, dim=-1)  # [num_envs, K]
+        closing = torch.where(self.spawned_obstacles, closing, torch.zeros_like(closing))
         return closing.clamp_min(0.0).max(dim=-1).values
 
 
@@ -695,12 +1051,16 @@ def _get_or_create_dynamic_obstacle_manager(
     obstacle_half_height: float = 0.4,
     body_half_extent: float = 0.25,
     spawn_delay_range: tuple[float, float] = (2.0, 8.0),
+    spawn_interval_s: float = 0.0,
+    scale_count_with_difficulty: bool = True,
     curriculum_env_fraction: float = 0.5,
+    exact_curriculum_env_fraction: bool = False,
     auto_switch_success: float = 0.9,
     max_switch_iteration: int = 4504,
     env_steps_per_iteration: int = 16,
     switch_check_interval: int = 100,
     graded_curriculum: bool = False,
+    initial_difficulty: float = 0.0,
     difficulty_step: float = 0.2,
     advance_success: float = 0.75,
     demote_success: float = 0.0,
@@ -726,8 +1086,12 @@ def _get_or_create_dynamic_obstacle_manager(
             obstacle_half_height=obstacle_half_height,
             body_half_extent=body_half_extent,
             spawn_delay_range=spawn_delay_range,
+            spawn_interval_s=spawn_interval_s,
+            scale_count_with_difficulty=scale_count_with_difficulty,
             curriculum_env_fraction=curriculum_env_fraction,
+            exact_curriculum_env_fraction=exact_curriculum_env_fraction,
             graded_curriculum=graded_curriculum,
+            initial_difficulty=initial_difficulty,
             difficulty_step=difficulty_step,
             advance_success=advance_success,
             demote_success=demote_success,
@@ -765,12 +1129,16 @@ def reset_dynamic_obstacles(
     obstacle_half_height: float = 0.4,
     body_half_extent: float = 0.25,
     spawn_delay_range: tuple[float, float] = (2.0, 8.0),
+    spawn_interval_s: float = 0.0,
+    scale_count_with_difficulty: bool = True,
     curriculum_env_fraction: float = 0.5,
+    exact_curriculum_env_fraction: bool = False,
     auto_switch_success: float = 0.9,
     max_switch_iteration: int = 4504,
     env_steps_per_iteration: int = 16,
     switch_check_interval: int = 100,
     graded_curriculum: bool = False,
+    initial_difficulty: float = 0.0,
     difficulty_step: float = 0.2,
     advance_success: float = 0.75,
     demote_success: float = 0.0,
@@ -797,12 +1165,16 @@ def reset_dynamic_obstacles(
         obstacle_half_height=obstacle_half_height,
         body_half_extent=body_half_extent,
         spawn_delay_range=spawn_delay_range,
+        spawn_interval_s=spawn_interval_s,
+        scale_count_with_difficulty=scale_count_with_difficulty,
         curriculum_env_fraction=curriculum_env_fraction,
+        exact_curriculum_env_fraction=exact_curriculum_env_fraction,
         auto_switch_success=auto_switch_success,
         max_switch_iteration=max_switch_iteration,
         env_steps_per_iteration=env_steps_per_iteration,
         switch_check_interval=switch_check_interval,
         graded_curriculum=graded_curriculum,
+        initial_difficulty=initial_difficulty,
         difficulty_step=difficulty_step,
         advance_success=advance_success,
         demote_success=demote_success,
@@ -830,12 +1202,16 @@ def update_dynamic_obstacles(
     obstacle_half_height: float = 0.4,
     body_half_extent: float = 0.25,
     spawn_delay_range: tuple[float, float] = (2.0, 8.0),
+    spawn_interval_s: float = 0.0,
+    scale_count_with_difficulty: bool = True,
     curriculum_env_fraction: float = 0.5,
+    exact_curriculum_env_fraction: bool = False,
     auto_switch_success: float = 0.9,
     max_switch_iteration: int = 4504,
     env_steps_per_iteration: int = 16,
     switch_check_interval: int = 100,
     graded_curriculum: bool = False,
+    initial_difficulty: float = 0.0,
     difficulty_step: float = 0.2,
     advance_success: float = 0.75,
     demote_success: float = 0.0,
@@ -862,12 +1238,16 @@ def update_dynamic_obstacles(
         obstacle_half_height=obstacle_half_height,
         body_half_extent=body_half_extent,
         spawn_delay_range=spawn_delay_range,
+        spawn_interval_s=spawn_interval_s,
+        scale_count_with_difficulty=scale_count_with_difficulty,
         curriculum_env_fraction=curriculum_env_fraction,
+        exact_curriculum_env_fraction=exact_curriculum_env_fraction,
         auto_switch_success=auto_switch_success,
         max_switch_iteration=max_switch_iteration,
         env_steps_per_iteration=env_steps_per_iteration,
         switch_check_interval=switch_check_interval,
         graded_curriculum=graded_curriculum,
+        initial_difficulty=initial_difficulty,
         difficulty_step=difficulty_step,
         advance_success=advance_success,
         demote_success=demote_success,
@@ -945,14 +1325,9 @@ def obstacle_collision(
     radius at which physical contact is declared — matching the visual size of the
     obstacle cube rather than a generous center-to-center margin.
 
-    When ``record_failure`` is set, colliding episodes are recorded as failures
-    (0.0) in the robot-goal success tracker — mirroring how ``terrain_fall`` /
-    ``illegal_contact`` / ``large_angle`` terminations already write 0.0. This makes
-    ``success_rate`` a true (collision-aware) success rate and, because the graded
-    curriculum's enable/advance gates read that same tracker, stops difficulty from
-    ratcheting up while the policy is still colliding. Default off => legacy behavior
-    (obstacle-collision terminations write nothing, so they are excluded from the
-    success denominator), keeping every existing task byte-identical.
+    When ``record_failure`` is set, colliding episodes are written as failures to
+    the legacy SRU success tracker. NavigationEnv records the strict outcome
+    separately.
     """
     if not obstacle_names:
         return torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)

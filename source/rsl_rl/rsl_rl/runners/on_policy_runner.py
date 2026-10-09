@@ -17,7 +17,7 @@ from torch.utils.tensorboard import SummaryWriter as TensorboardSummaryWriter
 import rsl_rl
 from rsl_rl.algorithms import MDPO, PPO, SPO
 from rsl_rl.env import VecEnv
-from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, ActorCriticSRU, EmpiricalNormalization
+from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, ActorCriticSRU, ActorCriticBEVConvLSTM, EmpiricalNormalization
 from rsl_rl.utils import store_code_state, VideoRecorder
 
 
@@ -83,6 +83,9 @@ class OnPolicyRunner:
             self.critic_obs_normalizer = torch.nn.Identity()
 
         # init storage and model
+        future_teacher_shape = None
+        if "future_teacher" in extras["observations"]:
+            future_teacher_shape = list(extras["observations"]["future_teacher"].shape[1:])
         self.alg.init_storage(
             self.env.num_envs,
             self.num_steps_per_env,
@@ -90,6 +93,7 @@ class OnPolicyRunner:
             [num_critic_obs],
             [self.env.num_actions],
             mask_label_shape=mask_label_shape,
+            **({"future_teacher_shape": future_teacher_shape} if future_teacher_shape is not None else {}),
         )
 
         # Log
@@ -134,6 +138,7 @@ class OnPolicyRunner:
         obs, extras = self.env.get_observations()
         critic_obs = extras["observations"].get("critic", obs)
         mask_labels = extras["observations"].get("mask_label", None)
+        future_teacher = extras["observations"].get("future_teacher", None)
         obs, critic_obs = obs.to(self.device), critic_obs.to(self.device)
         if mask_labels is not None:
             mask_labels = mask_labels.to(self.device)
@@ -167,6 +172,8 @@ class OnPolicyRunner:
                 for i in range(self.num_steps_per_env):
                     actions = self.alg.act(obs, critic_obs)
                     self.alg.transition.mask_labels = mask_labels
+                    if future_teacher is not None:
+                        self.alg.transition.future_teacher = future_teacher.to(self.device).detach().clone()
                     obs, rewards, dones, infos = self.env.step(actions)
 
                     # Capture video frame if recording
@@ -185,6 +192,7 @@ class OnPolicyRunner:
                         critic_obs = obs
                     if "mask_label" in infos["observations"]:
                         mask_labels = infos["observations"]["mask_label"].to(self.device)
+                    future_teacher = infos["observations"].get("future_teacher", None)
                     obs, critic_obs, rewards, dones = (
                         obs.to(self.device),
                         critic_obs.to(self.device),
@@ -229,8 +237,18 @@ class OnPolicyRunner:
                 mean_mask_loss = 0.0
                 mean_mask_dice_loss = 0.0
                 mean_mask_positive_rate = 0.0
+                mean_mask_pred_positive_rate = 0.0
+                mean_mask_soft_iou = 0.0
             else:
-                mean_value_loss, mean_surrogate_loss, mean_mask_loss, mean_mask_dice_loss, mean_mask_positive_rate = update_result
+                (
+                    mean_value_loss,
+                    mean_surrogate_loss,
+                    mean_mask_loss,
+                    mean_mask_dice_loss,
+                    mean_mask_positive_rate,
+                    mean_mask_pred_positive_rate,
+                    mean_mask_soft_iou,
+                ) = update_result
                 mean_kl_divergence = None
 
             stop = time.time()
@@ -286,9 +304,10 @@ class OnPolicyRunner:
 
         # Get action std from appropriate actor-critic
         if self.is_mdpo:
-            mean_std = self.alg.actor_critic_1.action_std.mean()
+            actor_critic = self.alg.actor_critic_1
         else:
-            mean_std = self.alg.actor_critic.action_std.mean()
+            actor_critic = self.alg.actor_critic
+        mean_std = actor_critic.action_std.mean()
 
         fps = int(self.num_steps_per_env * self.env.num_envs / (locs["collection_time"] + locs["learn_time"]))
 
@@ -297,10 +316,23 @@ class OnPolicyRunner:
         self.writer.add_scalar("Loss/mask", locs["mean_mask_loss"], locs["it"])
         self.writer.add_scalar("Loss/mask_dice_loss", locs["mean_mask_dice_loss"], locs["it"])
         self.writer.add_scalar("Loss/mask_positive_rate", locs["mean_mask_positive_rate"], locs["it"])
+        self.writer.add_scalar(
+            "Loss/mask_pred_positive_rate", locs["mean_mask_pred_positive_rate"], locs["it"]
+        )
+        self.writer.add_scalar("Loss/mask_soft_iou", locs["mean_mask_soft_iou"], locs["it"])
+        for tag, value in getattr(self.alg, "last_future_metrics", {}).items():
+            self.writer.add_scalar(tag, value, locs["it"])
         if self.is_mdpo and locs["mean_kl_divergence"] is not None:
             self.writer.add_scalar("Loss/kl_divergence", locs["mean_kl_divergence"], locs["it"])
         self.writer.add_scalar("Loss/learning_rate", self.alg.learning_rate, locs["it"])
         self.writer.add_scalar("Policy/mean_noise_std", mean_std.item(), locs["it"])
+        for attribute, tag in (
+            ("_last_actor_mask_gate_mean", "Policy/mask_gate_actor"),
+            ("_last_critic_mask_gate_mean", "Policy/mask_gate_critic"),
+        ):
+            value = getattr(actor_critic, attribute, None)
+            if value is not None:
+                self.writer.add_scalar(tag, float(value.item()), locs["it"])
         self.writer.add_scalar("Perf/total_fps", fps, locs["it"])
         self.writer.add_scalar("Perf/collection time", locs["collection_time"], locs["it"])
         self.writer.add_scalar("Perf/learning_time", locs["learn_time"], locs["it"])
@@ -322,7 +354,9 @@ class OnPolicyRunner:
                 f"""{'Computation:':>{pad}} {fps:.0f} steps/s (collection: {locs['collection_time']:.3f}s, learning {locs['learn_time']:.3f}s)\n"""
                 f"""{'Value function loss:':>{pad}} {locs['mean_value_loss']:.4f}\n"""
                 f"""{'Surrogate loss:':>{pad}} {locs['mean_surrogate_loss']:.4f}\n"""
-                f"""{'Mask loss:':>{pad}} {locs['mean_mask_loss']:.4f} (dice {locs['mean_mask_dice_loss']:.4f}, pos {locs['mean_mask_positive_rate']:.4f})\n"""
+                f"""{'Mask loss:':>{pad}} {locs['mean_mask_loss']:.4f} """
+                f"""(dice {locs['mean_mask_dice_loss']:.4f}, label pos {locs['mean_mask_positive_rate']:.4f}, """
+                f"""pred pos {locs['mean_mask_pred_positive_rate']:.4f}, IoU {locs['mean_mask_soft_iou']:.4f})\n"""
             )
             if self.is_mdpo and locs["mean_kl_divergence"] is not None:
                 log_string += f"""{'KL divergence:':>{pad}} {locs['mean_kl_divergence']:.4f}\n"""
@@ -338,7 +372,9 @@ class OnPolicyRunner:
                 f"""{'Computation:':>{pad}} {fps:.0f} steps/s (collection: {locs['collection_time']:.3f}s, learning {locs['learn_time']:.3f}s)\n"""
                 f"""{'Value function loss:':>{pad}} {locs['mean_value_loss']:.4f}\n"""
                 f"""{'Surrogate loss:':>{pad}} {locs['mean_surrogate_loss']:.4f}\n"""
-                f"""{'Mask loss:':>{pad}} {locs['mean_mask_loss']:.4f} (dice {locs['mean_mask_dice_loss']:.4f}, pos {locs['mean_mask_positive_rate']:.4f})\n"""
+                f"""{'Mask loss:':>{pad}} {locs['mean_mask_loss']:.4f} """
+                f"""(dice {locs['mean_mask_dice_loss']:.4f}, label pos {locs['mean_mask_positive_rate']:.4f}, """
+                f"""pred pos {locs['mean_mask_pred_positive_rate']:.4f}, IoU {locs['mean_mask_soft_iou']:.4f})\n"""
                 f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n"""
             )
 

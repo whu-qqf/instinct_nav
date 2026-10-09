@@ -163,7 +163,9 @@ def reset_and_randomize_delay_buffer(
     for cache_name in (
         "_nav_delayed_visual_packet_cache",
         "_instinct_nav_dynamic_map_patch_cache",
+        "_instinct_nav_learned_bev_cache",
         "_instinct_nav_scene_token_cache",
+        "_instinct_nav_direct_mask_cache",
     ):
         cache = getattr(env, cache_name, None)
         if cache is not None:

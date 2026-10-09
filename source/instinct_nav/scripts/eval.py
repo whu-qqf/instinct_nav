@@ -48,12 +48,26 @@ parser.add_argument("--checkpoint", type=str, default=None, help="Path to checkp
 parser.add_argument("--num_envs", type=int, default=None, help="Number of parallel environments.")
 parser.add_argument("--num_episodes", type=int, default=200, help="Number of finished episodes to aggregate.")
 parser.add_argument("--seed", type=int, default=None, help="Seed for evaluation.")
-parser.add_argument(
+parser.add_argument("--terrain_seed", type=int, default=None, help="Independent terrain generation seed.")
+success_metric_group = parser.add_mutually_exclusive_group()
+success_metric_group.add_argument(
+    "--sru_ref_success",
     "--legacy_tracker_success",
+    dest="legacy_tracker_success",
     action="store_true",
+    default=True,
     help=(
-        "Compute headline success from the latest SuccessRateTracker entry, matching the legacy "
-        "sru_ref evaluator. Termination and episode-outcome diagnostics are still reported."
+        "Compute headline success from the latest SuccessRateTracker entry, matching the "
+        "sru_ref evaluator (default). Termination and episode-outcome diagnostics are still reported."
+    ),
+)
+success_metric_group.add_argument(
+    "--exclusive_outcome_success",
+    dest="legacy_tracker_success",
+    action="store_false",
+    help=(
+        "Use physical-failure-priority episode outcomes for the headline success rate. "
+        "This is an audit metric and does not match the sru_ref paper evaluator."
     ),
 )
 parser.add_argument(
@@ -389,9 +403,21 @@ parser.add_argument(
     help=(
         "When --force_dynamic_obstacles is set, pin the graded-curriculum difficulty to this "
         "value (e.g. 1.0) for the whole evaluation. Default None leaves difficulty at its "
-        "initial 0.0 (easiest tier: 1 obstacle, slow speed, far spawn), which understates the "
-        "full-difficulty collision rate reached during training."
+        "task's configured initial difficulty. Applied before environment creation so the "
+        "first obstacle reset uses the requested tier."
     ),
+)
+parser.add_argument(
+    "--obstacle_env_fraction",
+    type=float,
+    default=None,
+    help="Evaluation-only fraction of environments with dynamic obstacles; fixes both graded-curriculum endpoints.",
+)
+parser.add_argument(
+    "--obstacle_height_m",
+    type=float,
+    default=None,
+    help="Evaluation-only full cuboid height in meters, including camera geometry and reset placement.",
 )
 parser.add_argument(
     "--disable_dynamic_obstacles",
@@ -518,11 +544,20 @@ parser.add_argument(
     help="JSON summary path for the second checkpoint when --compare_checkpoint is used.",
 )
 
+parser.add_argument("--live_diagnostic_dir", type=str, default=None)
+parser.add_argument("--live_diagnostic_env_id", type=int, default=870)
+parser.add_argument("--live_diagnostic_steps", type=int, default=60)
+parser.add_argument(
+    "--zero_dynamic_mask_input",
+    action="store_true",
+    help="Ablation: replace policy/critic dynamic-mask observations with zeros without changing shape.",
+)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
 
 if (
-    args_cli.failure_rgb_dir is not None
+    args_cli.live_diagnostic_dir is not None
+    or args_cli.failure_rgb_dir is not None
     or args_cli.compare_failure_rgb_dir is not None
     or args_cli.failure_rgb_limit > 0
     or (args_cli.failure_rgb_success_limit is not None and args_cli.failure_rgb_success_limit > 0)
@@ -812,6 +847,22 @@ def load_checkpoint_dict(checkpoint_path: str) -> dict:
     return torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
 
+def disable_future_training_supervision(env_cfg, agent_cfg):
+    """Keep forecast checkpoint parameters, but require no teacher at inference."""
+    if getattr(agent_cfg.algorithm, "lambda_future", 0.0) > 0.0:
+        agent_cfg.algorithm.lambda_future = 0.0
+        if hasattr(env_cfg.observations, "future_teacher"):
+            env_cfg.observations.future_teacher = None
+
+
+def apply_eval_terrain_seed(env_cfg, seed):
+    if seed is not None:
+        generator = getattr(getattr(env_cfg.scene, "terrain", None), "terrain_generator", None)
+        if generator is None:
+            raise ValueError("--terrain_seed requires a generated terrain")
+        generator.seed = seed
+
+
 def maybe_apply_legacy_checkpoint_policy_overrides(
     env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg, checkpoint_dict: dict
 ):
@@ -849,6 +900,34 @@ def maybe_apply_eval_overrides(env_cfg: ManagerBasedRLEnvCfg):
         for event_name in ("push_robot", "base_external_force_torque"):
             if hasattr(env_cfg.events, event_name):
                 setattr(env_cfg.events, event_name, None)
+
+
+def dynamic_obstacle_eval_conditions(env) -> dict[str, object]:
+    """Record the actual obstacle conditions alongside every evaluation result."""
+    unwrapped = env.unwrapped
+    manager = getattr(unwrapped, "_dynamic_obstacle_manager", None)
+    cfg = unwrapped.cfg
+    if manager is None:
+        return {"available": False}
+    spawn = getattr(cfg.scene, manager.obstacle_names[0]).spawn
+    size = getattr(spawn, "size", None)
+    geometry = {"shape": type(spawn).__name__}
+    if size is not None:
+        geometry["cuboid_size_m"] = list(size)
+    elif hasattr(spawn, "radius") and hasattr(spawn, "height"):
+        geometry.update(radius_m=float(spawn.radius), height_m=float(spawn.height))
+    return {
+        "available": True,
+        "enabled": bool(manager.enabled),
+        "difficulty": float(manager.difficulty),
+        "curriculum_env_fraction": float(manager.curriculum_envs.float().mean().item()),
+        "height_m": 2.0 * float(manager.obstacle_half_height),
+        "cuboid_size_m": list(size) if size is not None else None,
+        "geometry": geometry,
+        "obstacle_slots_per_env": int(manager.num_obstacles),
+        "spawn_delay_range_s": list(map(float, manager.spawn_delay_range)),
+        "spawn_interval_s": float(manager.spawn_interval_s),
+    }
 
 
 def compute_bucket_sizes(num_cols: int, proportions: list[float]) -> list[int]:
@@ -1959,6 +2038,15 @@ def _resolve_depth_visualization_sensor_cfg(env) -> SceneEntityCfg | None:
     return None
 
 
+def needs_observation_frame_cache(args, rgb_camera, local_terrain_map):
+    """Render observation panels only when a visual output consumes them."""
+    return (
+        local_terrain_map is not None
+        or (rgb_camera is not None and args.failure_rgb_include_observations)
+        or (bool(args.observation_gif_dir) and args.observation_gif_limit != 0)
+    )
+
+
 def _capture_observation_frame_cache(
     env, local_terrain_map: DepthPoseLocalTerrainMap | None = None
 ) -> dict[str, list[np.ndarray | None]]:
@@ -1991,22 +2079,9 @@ def _capture_observation_frame_cache(
             elif noisy_depth.dim() != 4:
                 raise ValueError(f"unexpected noisy depth shape {tuple(noisy_depth.shape)}")
 
-            noisy_history = getattr(_capture_observation_frame_cache, "_noisy_depth_history", None)
-            if noisy_history is None:
-                noisy_history = deque(maxlen=max(1, int(args_cli.failure_rgb_history_frames)))
-                _capture_observation_frame_cache._noisy_depth_history = noisy_history
-            noisy_history.append(noisy_depth.detach().clone())
-
-            depth_lags = None
-            delay_manager = getattr(env.unwrapped, "delay_manager", None)
-            if delay_manager is not None and getattr(delay_manager, "enabled", False):
-                depth_buffers = getattr(delay_manager, "_delay_depth_buffers", {})
-                depth_state = depth_buffers.get(depth_sensor_name) if depth_sensor_name is not None and hasattr(depth_buffers, "get") else None
-                if depth_state is None and hasattr(depth_buffers, "__len__") and len(depth_buffers) == 1:
-                    depth_state = next(iter(depth_buffers.values()))
-                if depth_state is not None and hasattr(depth_state, "time_lags"):
-                    depth_lags = depth_state.time_lags
-            display_depth_tensor = select_delayed_depth_frames(noisy_history, depth_lags)
+            # This shared visual packet is already delayed by the observation
+            # pipeline. Applying a second history delay would mislabel the GIF.
+            display_depth_tensor = noisy_depth
         except Exception as exc:
             if not getattr(_capture_observation_frame_cache, "_warned_noisy_depth_fallback", False):
                 print(f"[WARN] Falling back to raw depth visualization; noisy/delayed depth unavailable: {exc}")
@@ -2059,6 +2134,21 @@ def _capture_observation_frame_cache(
         policy_obs_cfg = getattr(env.unwrapped.cfg.observations, "policy", None)
         scene_tokens_term = getattr(policy_obs_cfg, "scene_tokens", None)
         token_func_name = getattr(getattr(scene_tokens_term, "func", None), "__name__", "")
+        visibility_term = getattr(policy_obs_cfg, "visibility_map", None)
+        visibility_func_name = getattr(getattr(visibility_term, "func", None), "__name__", "")
+        if visibility_func_name == "learned_dynamic_bev_observation":
+            # Read the exact policy cache without advancing visibility/history.
+            bev_cache = getattr(env.unwrapped, "_instinct_nav_learned_bev_cache", None)
+            if bev_cache is not None:
+                params = visibility_term.params
+                side = int(params.get("output_grid_size", 32))
+                bev = bev_cache["bev"].detach().cpu().view(num_envs, 6, side, side).numpy()
+                for env_id in range(num_envs):
+                    cached_frames["visibility_obs"][env_id] = _learned_bev_to_rgb(bev[env_id])
+            return cached_frames
+        if scene_tokens_term is None and visibility_term is None:
+            # NoBEV policies have no map input; do not invent one in visualization.
+            return cached_frames
         term_params = getattr(scene_tokens_term, "params", None) or {}
         try:
             decay = float(term_params.get("decay", 1.0))
@@ -2198,6 +2288,12 @@ def capture_failure_observation_gifs(
         current_joint_pos = robot.data.joint_pos[env_id_tensor].detach().clone()
         current_joint_vel = robot.data.joint_vel[env_id_tensor].detach().clone()
 
+        current_obstacle_states = {
+            name: obstacle.data.root_state_w[env_id_tensor].detach().clone()
+            for name, obstacle in env.unwrapped.scene.rigid_objects.items()
+            if name.startswith("obstacle_")
+        }
+
         terrain_type_index = int(pre_step_snapshot["terrain_types"][env_id].item()) if "terrain_types" in pre_step_snapshot else -1
         terrain_level = int(pre_step_snapshot["terrain_levels"][env_id].item()) if "terrain_levels" in pre_step_snapshot else -1
         terrain_name = _terrain_name_from_metadata(terrain_lookup, terrain_type_index)
@@ -2251,6 +2347,12 @@ def capture_failure_observation_gifs(
 
         rendered_combined_frames: list[np.ndarray] = []
         for history_index, history_snapshot in enumerate(selected_snapshots):
+            for name in current_obstacle_states:
+                state = history_snapshot.get(f"obstacle_state/{name}")
+                if state is not None:
+                    obstacle = env.unwrapped.scene.rigid_objects[name]
+                    obstacle.write_root_state_to_sim(state[env_id_tensor], env_ids=env_id_tensor)
+                    obstacle.write_data_to_sim()
             hist_root_pose = torch.cat(
                 (
                     history_snapshot["root_pos_w"][env_id_tensor],
@@ -2346,6 +2448,10 @@ def capture_failure_observation_gifs(
         robot.write_root_pose_to_sim(current_root_pose, env_ids=env_id_tensor)
         robot.write_root_velocity_to_sim(current_root_velocity, env_ids=env_id_tensor)
         robot.write_joint_state_to_sim(current_joint_pos, current_joint_vel, env_ids=env_id_tensor)
+        for name, state in current_obstacle_states.items():
+            obstacle = env.unwrapped.scene.rigid_objects[name]
+            obstacle.write_root_state_to_sim(state, env_ids=env_id_tensor)
+            obstacle.write_data_to_sim()
         robot.set_joint_position_target(current_joint_pos, env_ids=env_id_tensor)
         robot.set_joint_velocity_target(current_joint_vel, env_ids=env_id_tensor)
         robot.write_data_to_sim()
@@ -2523,6 +2629,11 @@ def capture_failure_rgb_screenshots(
         ).detach().clone()
         current_joint_pos = robot.data.joint_pos[env_id_tensor].detach().clone()
         current_joint_vel = robot.data.joint_vel[env_id_tensor].detach().clone()
+        current_obstacle_states = {
+            name: obstacle.data.root_state_w[env_id_tensor].detach().clone()
+            for name, obstacle in env.unwrapped.scene.rigid_objects.items()
+            if name.startswith("obstacle_")
+        }
 
         root_pos = root_pos_w[batch_index].detach().cpu().numpy()
         collision_record = collision_lookup.get(finished_episode_index)
@@ -2636,6 +2747,12 @@ def capture_failure_rgb_screenshots(
 
         rendered_rgb_frames: list[np.ndarray] = []
         for history_index, history_snapshot in enumerate(selected_snapshots):
+            for name in current_obstacle_states:
+                state = history_snapshot.get(f"obstacle_state/{name}")
+                if state is not None:
+                    obstacle = env.unwrapped.scene.rigid_objects[name]
+                    obstacle.write_root_state_to_sim(state[env_id_tensor], env_ids=env_id_tensor)
+                    obstacle.write_data_to_sim()
             hist_root_pose = torch.cat(
                 (
                     history_snapshot["root_pos_w"][env_id_tensor],
@@ -2784,6 +2901,10 @@ def capture_failure_rgb_screenshots(
             else:
                 rendered_failure_cases += 1
 
+        for name, state in current_obstacle_states.items():
+            obstacle = env.unwrapped.scene.rigid_objects[name]
+            obstacle.write_root_state_to_sim(state, env_ids=env_id_tensor)
+            obstacle.write_data_to_sim()
         robot.write_root_pose_to_sim(current_root_pose, env_ids=env_id_tensor)
         robot.write_root_velocity_to_sim(current_root_velocity, env_ids=env_id_tensor)
         robot.write_joint_state_to_sim(current_joint_pos, current_joint_vel, env_ids=env_id_tensor)
@@ -2963,6 +3084,19 @@ def _label_rgb_frame(frame: np.ndarray, label: str) -> np.ndarray:
     draw.rectangle((0, 0, text_w + 2 * pad_x, text_h + 2 * pad_y), fill=(0, 0, 0))
     draw.text((pad_x, pad_y), label, fill=(255, 255, 255))
     return np.asarray(image, dtype=np.uint8)
+
+
+def _learned_bev_to_rgb(bev: np.ndarray) -> np.ndarray:
+    """Display all six policy channels, including current and past dynamics."""
+    names = ("S0 history", "S1 hits", "S2 depth", "D0 current", "D1 previous", "D2 previous2")
+    panels = []
+    for index, name in enumerate(names):
+        values = np.clip(bev[index], 0.0, 1.0)
+        rgb = np.repeat(values[..., None], 3, axis=-1)
+        if index >= 3:
+            rgb *= np.array((1.0, 0.15, 0.1), dtype=np.float32)
+        panels.append(_label_rgb_frame(_resize_rgb_frame((rgb * 255).astype(np.uint8), 128), name))
+    return np.concatenate((np.concatenate(panels[:3], axis=1), np.concatenate(panels[3:], axis=1)), axis=0)
 
 
 def _compose_observation_triptych(
@@ -3224,6 +3358,9 @@ def capture_base_contact_snapshot(env, base_contact_context: dict | None) -> dic
         "joint_vel": robot.data.joint_vel.detach().clone(),
         "body_state_w": robot.data.body_state_w.detach().clone(),
     }
+    for name, obstacle in env.unwrapped.scene.rigid_objects.items():
+        if name.startswith("obstacle_"):
+            snapshot[f"obstacle_state/{name}"] = obstacle.data.root_state_w.detach().clone()
 
     if terrain is not None and hasattr(terrain, "terrain_types"):
         snapshot["terrain_types"] = terrain.terrain_types.detach().clone()
@@ -3454,6 +3591,60 @@ class EvalDebugDumper:
         robot_state = _capture_eval_robot_state(env, env_id)
         goal_b = _capture_eval_goal_b(env, obs_env)
 
+        perception = {}
+        perception_arrays = {}
+        sensors = env.unwrapped.scene.sensors
+        sensor = sensors.get("camera")
+        if (sensor is not None and hasattr(sensor, "_mesh_wp_ids")
+                and sensor._mesh_wp_ids.numel() <= np.iinfo(np.int16).max):
+            from instinctlab.utils.warp.raycast import raycast_mesh_grouped
+
+            transforms, inverse_transforms = sensor._get_mesh_transforms_and_inv_transforms()
+            mesh = next(iter(sensor.meshes.values()))
+            _, _, _, _, mesh_ids = raycast_mesh_grouped(
+                mesh_wp_device=mesh.device, mesh_wp_ids=sensor._mesh_wp_ids,
+                mesh_transforms=transforms, mesh_inv_transforms=inverse_transforms,
+                ray_group_ids=sensor._ray_collision_groups,
+                mesh_idxs_for_group=sensor._mesh_idxs_for_group,
+                meah_idxs_slice_for_group=sensor._meah_idxs_slice_for_group,
+                ray_starts=sensor._ray_starts_w, ray_directions=sensor._ray_directions_w,
+                max_dist=sensor.cfg.max_distance * 2, min_dist=sensor.cfg.min_distance,
+                return_mesh_id=True,
+            )
+            # Grouped raycast returns indices in the flattened per-env mesh table.
+            mesh_ids = mesh_ids.long()
+            local_mesh_ids = mesh_ids.remainder(sensor._mesh_positions_w.shape[1])
+            offset = 0
+            obstacle_indices = []
+            for target in sensor._raycast_targets_cfg:
+                count = sensor._num_meshes_per_env[target.prim_expr]
+                if "/Obstacle_" in target.prim_expr:
+                    obstacle_indices.extend(range(offset, offset + count))
+                offset += count
+            hit = torch.zeros_like(mesh_ids, dtype=torch.bool)
+            for index in obstacle_indices:
+                hit |= (mesh_ids >= 0) & (local_mesh_ids == index)
+            hit = hit.view(env.unwrapped.num_envs, *sensor.image_shape)
+            hits_per_env = hit.flatten(1).sum(1)
+            perception["camera_obstacle_hit_envs"] = int((hits_per_env > 0).sum().item())
+            perception["camera_obstacle_pixels_max"] = int(hits_per_env.max().item())
+            perception["camera_obstacle_pixels_env"] = int(hits_per_env[env_id].item())
+            perception_arrays["camera_obstacle_hit_mask"] = _tensor_env_np(hit, env_id)
+        elif sensor is not None:
+            perception["camera_hit_id_unavailable"] = "Unsupported sensor or grouped int16 mesh index limit"
+        bev_cache = getattr(env.unwrapped, "_instinct_nav_learned_bev_cache", None)
+        if bev_cache is not None:
+            params = env.unwrapped.cfg.observations.policy.visibility_map.params
+            side = int(params.get("output_grid_size", 32))
+            bev = bev_cache["bev"].view(env.unwrapped.num_envs, 6, side, side)
+            dynamic = bev[:, 3].flatten(1).sum(1)
+            perception["dynamic_bev_nonzero_envs"] = int((dynamic > 0).sum().item())
+            perception["dynamic_bev_cells_max"] = float(dynamic.max().item())
+            perception_arrays["policy_bev"] = _tensor_env_np(bev, env_id)
+        packet_cache = getattr(env.unwrapped, "_nav_delayed_visual_packet_cache", {})
+        if "camera" in packet_cache:
+            perception_arrays["policy_depth_m"] = _tensor_env_np(packet_cache["camera"]["packet"]["depth"], env_id)
+
         record = {
             "step": self.step_count,
             "saved_index": self.saved_count,
@@ -3470,6 +3661,7 @@ class EvalDebugDumper:
             "encoded_depth_stats": _np_stats(encoded_depth),
             "scene_token_stats": _np_stats(scene_tokens),
             "actor_obs_stats": _np_stats(obs_env),
+            "perception": perception,
         }
 
         if self.save_arrays:
@@ -3487,6 +3679,7 @@ class EvalDebugDumper:
                 actor_obs=obs_env,
                 raw_action=action_env,
                 command=action_env,
+                **perception_arrays,
             )
 
         with self.index_path.open("a", encoding="utf-8") as f:
@@ -3697,6 +3890,8 @@ def _run_eval_pass(
 
     goal_term = env.unwrapped.command_manager._terms["robot_goal"]
     success_tracker = goal_term.success_tracker
+    from eval_tracker_audit import TrackerAudit
+    tracker_audit = TrackerAudit(success_tracker)
     termination_manager = env.unwrapped.termination_manager
     termination_terms = list(termination_manager.active_terms)
     terrain_lookup = build_terrain_type_lookup(env)
@@ -3749,6 +3944,7 @@ def _run_eval_pass(
         )
 
     total_episodes = 0
+    last_progress_episodes = 0
     total_successes = 0
     termination_counts = {name: 0 for name in termination_terms}
     outcome_counts = {
@@ -3803,7 +3999,7 @@ def _run_eval_pass(
             pre_step_snapshot_history.append(pre_step_snapshot)
             if local_terrain_map is not None:
                 local_terrain_map.update(env)
-            if args_cli.failure_rgb_include_observations or local_terrain_map is not None:
+            if needs_observation_frame_cache(args_cli, failure_rgb_camera, local_terrain_map):
                 pre_step_observation_history.append(_capture_observation_frame_cache(env, local_terrain_map))
         with torch.no_grad():
             if using_torchscript_policy:
@@ -3849,6 +4045,7 @@ def _run_eval_pass(
             termination_counts[term_name] += int(term_values.sum().item())
 
         successes, outcome_batch = classify_episode_outcomes(done_term_values)
+        tracker_audit.record(done_ids, successes)
         if args_cli.legacy_tracker_success:
             latest_indices = (success_tracker.write_index[done_ids] - 1) % success_tracker.buffer_size
             successes = success_tracker.buffer[done_ids, latest_indices] > 0.0
@@ -3941,7 +4138,11 @@ def _run_eval_pass(
 
         episode_ids[raw_done_ids] += 1
 
-        if args_cli.print_every > 0 and total_episodes % args_cli.print_every == 0:
+        if args_cli.print_every > 0 and (
+            total_episodes >= last_progress_episodes + args_cli.print_every
+            or total_episodes >= args_cli.num_episodes
+        ):
+            last_progress_episodes = total_episodes
             print(
                 f"[INFO] Progress {label}: {total_episodes}/{args_cli.num_episodes} episodes, "
                 f"success_rate={summarize_rates(total_successes, total_episodes):.4f}"
@@ -3958,12 +4159,14 @@ def _run_eval_pass(
             "stats_only": bool(not debug_dumper.save_arrays),
         },
         "num_envs": int(env.unwrapped.num_envs),
+        "dynamic_obstacle_conditions": dynamic_obstacle_eval_conditions(env),
         "episodes": total_episodes,
         "successes": total_successes,
         "success_rate": summarize_rates(total_successes, total_episodes),
         "success_metric": (
-            "legacy_success_tracker_latest" if args_cli.legacy_tracker_success else "exclusive_episode_outcome"
+            "sru_ref_success_tracker_latest" if args_cli.legacy_tracker_success else "exclusive_episode_outcome"
         ),
+        "tracker_audit": tracker_audit.summary(),
         "action_stats": action_stats.summarize(),
         "termination_rates": {
             term_name: {"count": count, "rate": summarize_rates(count, total_episodes)}
@@ -4097,6 +4300,8 @@ def main():
 
     env_cfg = load_cfg_from_registry(args_cli.task, "env_cfg_entry_point")
     agent_cfg: RslRlOnPolicyRunnerCfg = load_cfg_from_registry(args_cli.task, "rsl_rl_cfg_entry_point")
+    disable_future_training_supervision(env_cfg, agent_cfg)
+    apply_eval_terrain_seed(env_cfg, args_cli.terrain_seed)
 
     if args_cli.num_envs is not None:
         env_cfg.scene.num_envs = args_cli.num_envs
@@ -4107,8 +4312,29 @@ def main():
     if args_cli.seed is not None:
         env_cfg.seed = args_cli.seed
         agent_cfg.seed = args_cli.seed
+    from eval_obstacle_overrides import apply_obstacle_eval_overrides
+
+    apply_obstacle_eval_overrides(
+        env_cfg,
+        difficulty=args_cli.force_obstacle_difficulty,
+        env_fraction=args_cli.obstacle_env_fraction,
+        height_m=args_cli.obstacle_height_m,
+    )
     if not args_cli.disable_eval_overrides:
         maybe_apply_eval_overrides(env_cfg)
+    if args_cli.zero_dynamic_mask_input:
+        changed = []
+        for group_name in ("policy", "critic"):
+            group = getattr(env_cfg.observations, group_name, None)
+            term = getattr(group, "dynamic_mask", None) if group is not None else None
+            if term is not None:
+                term.params["force_zero"] = True
+                changed.append(group_name)
+        if not changed:
+            raise ValueError("--zero_dynamic_mask_input requires a task with dynamic_mask observations")
+        print(f"[INFO] Dynamic-mask zero-input ablation enabled for: {', '.join(changed)}")
+    if args_cli.live_diagnostic_dir is not None:
+        env_cfg.sim.enable_scene_query_support = True
     project_root = Path(__file__).resolve().parents[3]
     showcase_asset_root = None
     if args_cli.showcase_scene == "rivermark":
@@ -4255,6 +4481,8 @@ def main():
 
     goal_term = env.unwrapped.command_manager._terms["robot_goal"]
     success_tracker = goal_term.success_tracker
+    from eval_tracker_audit import TrackerAudit
+    tracker_audit = TrackerAudit(success_tracker)
     termination_manager = env.unwrapped.termination_manager
     termination_terms = list(termination_manager.active_terms)
     terrain_lookup = build_terrain_type_lookup(env)
@@ -4326,6 +4554,7 @@ def main():
         os.makedirs(topdown_output_dir, exist_ok=True)
 
     total_episodes = 0
+    last_progress_episodes = 0
     total_successes = 0
     termination_counts = {name: 0 for name in termination_terms}
     outcome_counts = {
@@ -4377,12 +4606,36 @@ def main():
     )
     action_stats = EvalActionStats()
 
+    live_diagnostic = None
+    if args_cli.live_diagnostic_dir is not None:
+        from live_episode_diagnostic import LiveEpisodeDiagnostic
+
+        live_diagnostic = LiveEpisodeDiagnostic(
+            args_cli.live_diagnostic_dir, args_cli.live_diagnostic_env_id,
+            create_failure_rgb_camera(env),
+        )
+        print("[INFO] Live diagnostic enabled; this shortened run is NOT a benchmark evaluation.")
+
+    original_debug_dump = debug_dumper.maybe_dump
+
+    def dump_with_live_diagnostic(env, obs, actions):
+        original_debug_dump(env, obs, actions)
+        if live_diagnostic is not None:
+            live_diagnostic.capture(env, actions)
+
+    if live_diagnostic is not None:
+        debug_dumper.maybe_dump = dump_with_live_diagnostic
+
     print(
         f"[INFO] Starting evaluation: task={args_cli.task}, num_envs={env.unwrapped.num_envs}, "
         f"target_episodes={args_cli.num_episodes}"
     )
 
     while simulation_app.is_running() and total_episodes < args_cli.num_episodes:
+        if live_diagnostic is not None and live_diagnostic.step >= args_cli.live_diagnostic_steps:
+            print("[INFO] Live diagnostic frame budget reached; exiting without benchmark summary.")
+            env.close()
+            return
         pre_step_snapshot = capture_base_contact_snapshot(env, base_contact_context)
         pre_step_delay_snapshot = _capture_observation_delay_snapshot(env)
         if pre_step_snapshot is not None:
@@ -4390,7 +4643,7 @@ def main():
             pre_step_snapshot_history.append(pre_step_snapshot)
             if local_terrain_map is not None:
                 local_terrain_map.update(env)
-            if args_cli.failure_rgb_include_observations or local_terrain_map is not None:
+            if needs_observation_frame_cache(args_cli, failure_rgb_camera, local_terrain_map):
                 pre_step_observation_history.append(_capture_observation_frame_cache(env, local_terrain_map))
         with torch.no_grad():
             if using_torchscript_policy:
@@ -4437,6 +4690,7 @@ def main():
             termination_counts[term_name] += int(term_values.sum().item())
 
         successes, outcome_batch = classify_episode_outcomes(done_term_values)
+        tracker_audit.record(done_ids, successes)
         if args_cli.legacy_tracker_success:
             latest_indices = (success_tracker.write_index[done_ids] - 1) % success_tracker.buffer_size
             successes = success_tracker.buffer[done_ids, latest_indices] > 0.0
@@ -4569,7 +4823,11 @@ def main():
 
         episode_ids[raw_done_ids] += 1
 
-        if args_cli.print_every > 0 and total_episodes % args_cli.print_every == 0:
+        if args_cli.print_every > 0 and (
+            total_episodes >= last_progress_episodes + args_cli.print_every
+            or total_episodes >= args_cli.num_episodes
+        ):
+            last_progress_episodes = total_episodes
             print(
                 f"[INFO] Progress: {total_episodes}/{args_cli.num_episodes} episodes, "
                 f"success_rate={summarize_rates(total_successes, total_episodes):.4f}"
@@ -4586,12 +4844,14 @@ def main():
             "stats_only": bool(not debug_dumper.save_arrays),
         },
         "num_envs": int(env.unwrapped.num_envs),
+        "dynamic_obstacle_conditions": dynamic_obstacle_eval_conditions(env),
         "episodes": total_episodes,
         "successes": total_successes,
         "success_rate": summarize_rates(total_successes, total_episodes),
         "success_metric": (
-            "legacy_success_tracker_latest" if args_cli.legacy_tracker_success else "exclusive_episode_outcome"
+            "sru_ref_success_tracker_latest" if args_cli.legacy_tracker_success else "exclusive_episode_outcome"
         ),
+        "tracker_audit": tracker_audit.summary(),
         "action_stats": action_stats.summarize(),
         "termination_rates": {
             term_name: {

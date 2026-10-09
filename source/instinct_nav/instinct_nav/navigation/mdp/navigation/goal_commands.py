@@ -37,6 +37,7 @@ from isaaclab.markers.config import (
 from isaaclab.utils.math import subtract_frame_transforms, transform_points, yaw_quat
 
 from instinct_nav.navigation.mdp.math_utils import vec_to_quat
+from instinct_nav.navigation.success_tracking import should_advance_terrain_bank
 from instinct_nav.terrains.terrain_constants import VERTICAL_SCALE
 
 if TYPE_CHECKING:
@@ -304,8 +305,12 @@ class SuccessRateTracker:
         self.write_index = torch.zeros(num_envs, dtype=torch.long, device=device)
 
     def record_result(self, success: torch.Tensor, env_ids: torch.Tensor):
+        self.record_values(success[env_ids], env_ids)
+
+    def record_values(self, success: torch.Tensor, env_ids: torch.Tensor):
+        """Record compact result values aligned one-to-one with ``env_ids``."""
         indices = self.write_index[env_ids] % self.buffer_size
-        self.buffer[env_ids, indices] = success[env_ids].float()
+        self.buffer[env_ids, indices] = success.float()
         self.write_index[env_ids] += 1
 
     def add(self, results: torch.Tensor, env_ids: torch.Tensor):
@@ -363,6 +368,12 @@ class RobotNavigationGoalCommand(CommandTerm):
         self._showcase_case_cursor = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
         self._terrain_bank_ids = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
         self._last_reported_terrain_bank = -1
+        self._scheduled_terrain_bank = 0
+        self._terrain_bank_tracker_bank = -1
+        self._terrain_bank_last_gate_check = -1
+        self._terrain_bank_gate_success_rate = 0.0
+        self._terrain_bank_gate_full_fraction = 0.0
+        self._last_dynamic_obstacles_enabled = False
 
     def _init_command_buffers(self):
         """Initialize command state buffers."""
@@ -395,6 +406,7 @@ class RobotNavigationGoalCommand(CommandTerm):
 
         self.goal_reach_count = torch.zeros(self.num_envs, device=self.device)
         self.success_tracker = SuccessRateTracker(self.num_envs, self.device, buffer_size=10)
+        self.strict_success_tracker = SuccessRateTracker(self.num_envs, self.device, buffer_size=10)
         self.success_rate_buffer = torch.full((self.num_envs, 10), -1.0, device=self.device)
 
     def _init_metrics(self):
@@ -402,7 +414,17 @@ class RobotNavigationGoalCommand(CommandTerm):
         self.metrics["velocity_toward_goal"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["velocity_magnitude"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["success_rate"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["strict_success_rate"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["terrain_bank_id"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["terrain_bank_gate_success_rate"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["terrain_bank_gate_full_fraction"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["terrain_bank_scheduled_id"] = torch.zeros(self.num_envs, device=self.device)
+        if self.cfg.report_dynamic_env_success:
+            self.metrics["success_rate_static_envs"] = torch.zeros(self.num_envs, device=self.device)
+            self.metrics["success_rate_dynamic_envs"] = torch.zeros(self.num_envs, device=self.device)
+            self.metrics["strict_success_rate_static_envs"] = torch.zeros(self.num_envs, device=self.device)
+            self.metrics["strict_success_rate_dynamic_envs"] = torch.zeros(self.num_envs, device=self.device)
+            self.metrics["dynamic_env_fraction"] = torch.zeros(self.num_envs, device=self.device)
 
     # =========================================================================
     # Command Interface
@@ -516,10 +538,12 @@ class RobotNavigationGoalCommand(CommandTerm):
         base_cols = int(self.cfg.terrain_bank_base_num_cols)
         interval = int(self.cfg.terrain_bank_switch_interval)
         steps_per_iteration = int(self.cfg.terrain_bank_env_steps_per_iteration)
-        if base_cols <= 0 or interval <= 0 or steps_per_iteration <= 0:
+        advance_success = float(self.cfg.terrain_bank_advance_success)
+        success_gated = advance_success > 0.0
+        if base_cols <= 0 or (not success_gated and interval <= 0) or steps_per_iteration <= 0:
             raise ValueError(
-                "Terrain banks require positive base_num_cols, switch_interval, "
-                "and env_steps_per_iteration."
+                "Terrain banks require positive base_num_cols and env_steps_per_iteration; "
+                "fixed schedules also require a positive switch_interval."
             )
         expected_cols = base_cols * bank_count
         if self.num_terrain_cols != expected_cols:
@@ -529,7 +553,10 @@ class RobotNavigationGoalCommand(CommandTerm):
             )
 
         iteration = int(self.env.common_step_counter) // steps_per_iteration
-        target_bank = (iteration // interval) % bank_count
+        if success_gated:
+            target_bank = self._success_gated_terrain_bank(bank_count, advance_success)
+        else:
+            target_bank = (iteration // interval) % bank_count
         terrain = self.env.scene.terrain
         local_types = terrain.terrain_types[env_ids] % base_cols
         terrain.terrain_types[env_ids] = local_types + target_bank * base_cols
@@ -551,6 +578,56 @@ class RobotNavigationGoalCommand(CommandTerm):
                 f"at iteration {iteration}; environments switch on their next reset."
             )
             self._last_reported_terrain_bank = target_bank
+
+    def _success_gated_terrain_bank(self, bank_count: int, advance_success: float) -> int:
+        """Hold each terrain bank until its rolling success window clears the gate."""
+        target_bank = int(self._scheduled_terrain_bank)
+        all_on_target = bool(torch.all(self._terrain_bank_ids == target_bank).item())
+
+        # Once every environment has migrated, clear mixed-bank outcomes exactly
+        # once. The next gate decision then reflects only the current bank.
+        if all_on_target and self._terrain_bank_tracker_bank != target_bank:
+            all_env_ids = torch.arange(self.num_envs, device=self.device)
+            self.success_tracker.clear(all_env_ids)
+            self.strict_success_tracker.clear(all_env_ids)
+            self._terrain_bank_tracker_bank = target_bank
+            self._terrain_bank_gate_success_rate = 0.0
+            self._terrain_bank_gate_full_fraction = 0.0
+
+        if not all_on_target or target_bank >= bank_count - 1:
+            return target_bank
+
+        step = int(self.env.common_step_counter)
+        check_interval = max(1, int(self.cfg.terrain_bank_success_check_interval))
+        if step - self._terrain_bank_last_gate_check < check_interval:
+            return target_bank
+        self._terrain_bank_last_gate_check = step
+
+        filled = (self.success_tracker.buffer >= 0).sum(dim=1)
+        full_fraction = float(
+            (filled >= self.success_tracker.buffer_size).float().mean().item()
+        )
+        success_rate = float(self.success_tracker.get_success_rate().mean().item())
+        self._terrain_bank_gate_success_rate = success_rate
+        self._terrain_bank_gate_full_fraction = full_fraction
+        min_full_fraction = float(self.cfg.terrain_bank_success_min_full_fraction)
+        if should_advance_terrain_bank(
+            success_rate,
+            full_fraction,
+            advance_success,
+            min_full_fraction,
+            target_bank,
+            bank_count,
+        ):
+            self._scheduled_terrain_bank = target_bank + 1
+            self._terrain_bank_tracker_bank = -1
+            print(
+                f"[TerrainBank] Success gate advanced bank {target_bank} -> {target_bank + 1} "
+                f"at env step {step} (success={success_rate:.4f} >= {advance_success:.4f}, "
+                f"full_fraction={full_fraction:.4f})."
+            )
+            return int(self._scheduled_terrain_bank)
+        return target_bank
 
     # =========================================================================
     # Command Sampling and Update
@@ -717,6 +794,19 @@ class RobotNavigationGoalCommand(CommandTerm):
 
     def _update_metrics(self):
         """Update performance metrics."""
+        obstacle_manager = getattr(self.env, "_dynamic_obstacle_manager", None)
+        obstacles_enabled = bool(getattr(obstacle_manager, "enabled", False))
+        if (
+            self.cfg.reset_success_on_dynamic_enable
+            and obstacles_enabled
+            and not self._last_dynamic_obstacles_enabled
+        ):
+            all_env_ids = torch.arange(self.num_envs, device=self.device)
+            self.success_tracker.clear(all_env_ids)
+            self.strict_success_tracker.clear(all_env_ids)
+            print("[RobotGoal] Cleared success windows at dynamic-phase transition.")
+        self._last_dynamic_obstacles_enabled = obstacles_enabled
+
         position_error = self.goal_position_world - self.robot.data.root_pos_w[:, :3]
         position_error_2d = position_error[:, :2]
         velocity_2d = self.robot.data.root_state_w[:, 7:9]
@@ -726,7 +816,29 @@ class RobotNavigationGoalCommand(CommandTerm):
         direction_to_goal = position_error_2d / torch.clamp(torch.norm(position_error_2d, dim=1, keepdim=True), min=1e-6)
         self.metrics["velocity_toward_goal"] = (velocity_2d * direction_to_goal).sum(dim=1)
         self.metrics["success_rate"] = self.success_tracker.get_success_rate()
+        self.metrics["strict_success_rate"] = self.strict_success_tracker.get_success_rate()
         self.metrics["terrain_bank_id"] = self._terrain_bank_ids.float()
+        self.metrics["terrain_bank_gate_success_rate"].fill_(self._terrain_bank_gate_success_rate)
+        self.metrics["terrain_bank_gate_full_fraction"].fill_(self._terrain_bank_gate_full_fraction)
+        self.metrics["terrain_bank_scheduled_id"].fill_(float(self._scheduled_terrain_bank))
+        if self.cfg.report_dynamic_env_success:
+            dynamic_envs = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+            if obstacles_enabled and obstacle_manager is not None:
+                dynamic_envs = obstacle_manager.curriculum_envs
+            static_envs = ~dynamic_envs
+            legacy_rates = self.success_tracker.get_success_rate()
+            strict_rates = self.strict_success_tracker.get_success_rate()
+
+            def _group_mean(values: torch.Tensor, mask: torch.Tensor) -> float:
+                if not bool(mask.any().item()):
+                    return 0.0
+                return float(values[mask].mean().item())
+
+            self.metrics["success_rate_static_envs"].fill_(_group_mean(legacy_rates, static_envs))
+            self.metrics["success_rate_dynamic_envs"].fill_(_group_mean(legacy_rates, dynamic_envs))
+            self.metrics["strict_success_rate_static_envs"].fill_(_group_mean(strict_rates, static_envs))
+            self.metrics["strict_success_rate_dynamic_envs"].fill_(_group_mean(strict_rates, dynamic_envs))
+            self.metrics["dynamic_env_fraction"].fill_(float(dynamic_envs.float().mean().item()))
 
     def reset(self, env_ids: Sequence[int] | None = None) -> dict[str, float]:
         """Reset command generator and compute episode metrics."""

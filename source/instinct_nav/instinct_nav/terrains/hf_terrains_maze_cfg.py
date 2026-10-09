@@ -116,6 +116,9 @@ class HfMazeTerrainCfg(HfTerrainBaseCfg):
     dynamic_obstacles: bool = False
     """Enable pit/trough obstacles. Defaults to False."""
 
+    bridge_width_cells: int = 2
+    """Width of pit-trench bridges in maze cells. Defaults to the legacy two cells."""
+
     terrain_feature: str = "default"
     """Primary terrain pattern: ``default`` or ``blocks``."""
 

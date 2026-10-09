@@ -39,7 +39,7 @@ from .terrain_constants import (
 # Terrain generation (requires Isaac Sim)
 from .hf_terrains_maze_cfg import HfMazeTerrainCfg
 from .hf_terrains_maze import maze_terrain
-from .maze_config import MAZE_TERRAIN_CFG, RICH_MAZE_TERRAIN_CFG
+from .maze_config import HUMAN_SCALE_RICH_MAZE_TERRAIN_CFG, MAZE_TERRAIN_CFG, RICH_MAZE_TERRAIN_CFG
 
 __all__ = [
     # Patches
@@ -59,6 +59,7 @@ __all__ = [
     "HfMazeTerrainCfg",
     "MAZE_TERRAIN_CFG",
     "RICH_MAZE_TERRAIN_CFG",
+    "HUMAN_SCALE_RICH_MAZE_TERRAIN_CFG",
     # Terrain functions
     "maze_terrain",
 ]

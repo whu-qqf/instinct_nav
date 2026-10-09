@@ -5,6 +5,8 @@
 
 """Configuration for maze terrains."""
 
+import copy
+
 from isaaclab.terrains.terrain_generator_cfg import TerrainGeneratorCfg
 
 from .hf_terrains_maze_cfg import HfMazeTerrainCfg
@@ -164,3 +166,15 @@ RICH_MAZE_TERRAIN_CFG = TerrainGeneratorCfg(
     },
 )
 """Expanded navigation terrain with variable stairs and InstinctLab-inspired features."""
+
+
+HUMAN_SCALE_RICH_MAZE_TERRAIN_CFG = copy.deepcopy(RICH_MAZE_TERRAIN_CFG)
+for _sub_terrain in HUMAN_SCALE_RICH_MAZE_TERRAIN_CFG.sub_terrains.values():
+    _sub_terrain.grid_size = (20, 20)
+    _sub_terrain.cell_size = 1.5
+HUMAN_SCALE_RICH_MAZE_TERRAIN_CFG.sub_terrains["pits"].bridge_width_cells = 1
+for _terrain_name in ("variable_stairs", "traversal_mix"):
+    _stairs_cfg = HUMAN_SCALE_RICH_MAZE_TERRAIN_CFG.sub_terrains[_terrain_name]
+    _stairs_cfg.stair_num_steps_range = (3, 5)
+    _stairs_cfg.stair_step_depth_range = (0.28, 0.30)
+"""30 m rich terrain with denser 1.5 m topology and single-cell pit bridges for G1."""

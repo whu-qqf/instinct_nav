@@ -6,6 +6,64 @@
 
 ---
 
+## 2026-09-20 SRU visibility-BEV 受控消融：Static3000 + Mixed50
+
+- 新增一对严格对照任务：纯 SRU NoBEV 与 5D visibility BEV。两者均从零训练 5000 iterations，前 3000 纯静态，后 2000 使用固定约 50% 动态环境；奖励、单地形、5 个 1.6 m 障碍、difficulty 1、PPO 和 seed 均一致。
+- NoBEV 完全移除 actor/critic scene tokens 和 cross-attention，obs `2576/5713`；BEV 保留 current-to-history 5D tokens，obs `2896/6033`。两者 SRU 输入均为 `80/144`，无独立 mask CNN。
+- 两个 32-env、1-iteration smoke 均通过。新增串行后台脚本 `scripts/run_ablation_sru_sequential.sh`：NoBEV 正常完成后才启动 BEV，均为 4096 env、seed 72、W&B project `ablation_sru`。
+- 启动审计发现训练入口此前只把 `--seed` 传给 PPO runner，环境与 terrain seed 为 null。已修正为同步设置 environment/terrain/runner seed；同时给本消融启用精确 cohort，4096 env 中固定选取 2048 个动态候选环境，而不是 Bernoulli 近似 50%。早期 `v1/v2` 启动审计 run 作废；正式 run 为 `sru_nobev_static3000_mixed50_v3_seed72_exact50`，之后自动接续 `sru_bev_static3000_mixed50_v3_seed72_exact50`。
+
+---
+
+## 2026-09-20 单地形连续课程：Static5000 + Mixed50
+
+- 新增 `DynamicRiskBEV-Static5000-Mixed50-SingleTerrain` train/dev/play 任务；仅完成任务实现和配置审计，按用户要求未启动训练。
+- 总训练长度按最新要求设为 7000 iterations：前 5000 iteration 障碍完全关闭，后 2000 iteration 在固定随机 50% env 中启用动态障碍；网络、优化器和 mask-to-BEV 预处理全程不切换。
+- 网络恢复旧 5D DynamicMapCross：actor/critic obs `2896/6033`、scene token `64 x 5`、SRU `80/144`、PPO mini-batches 4，无 MaskCNN 或额外 mask observation。
+- 只生成一个 30-column RichTerrain bank（`terrain_bank_count=1`），不做地形切换。动态阶段保持 5 个、1.6 m 高、difficulty 1 的 encounter 障碍和分时激活逻辑。
+- 同帧 delayed mask/depth 被严格拆分：非 mask depth 更新持久 visibility；mask depth 只生成 current-only BEV risk，膨胀 0.3 m 后把有效 visibility 变黑。动态像素不写入历史，避免黑色风险拖影和移动物体的白色可见性残影。
+- 静态阶段关闭 false-positive mask 扰动，确保无障碍时 BEV risk 严格为零。动态阶段开始时仅清空统计 tracker，不重置网络/优化器。
+- 新增按环境类型统计的 legacy/strict success：`success_rate_{static,dynamic}_envs`、`strict_success_rate_{static,dynamic}_envs`，并记录 `dynamic_env_fraction`。
+- 验证：`py_compile`、`git diff --check`、success/gate 纯逻辑测试通过；Isaac headless 配置审计确认 cols 30、bank 1、7000 iter、5000 switch、50% dynamic、difficulty 1、5 obstacles、height 1.6、5D token、无 mask branch。未执行 PPO smoke/正式训练。
+
+---
+
+## 2026-09-20 DynamicRiskBEV：恢复旧 SRU，mask 合并为黑色风险区
+
+- 按用户决定终止 `2026-09-19_10-15-22_g1_sru_maskcnn32_concat_maskfix_bank2000_legacy_success_v1`；停止时约 iteration 2207，保留 `model_2000.pt` 和全部日志。
+- 新增 `DynamicRiskBEV-Encounter-RestoredRewards-SuccessBanks` train/dev/play 任务。移除独立 MaskCNN；actor/critic obs 恢复 `2896/6033`，scene token 保持 `64 x 5`，actor/critic SRU 输入恢复 `80/144`。
+- GT mask 与 delayed depth 同帧投影到 robot-local `64 x 64` BEV。动态占据膨胀 3 cells 后作为 current-only 黑色高风险覆盖层，压低现有 history/current visibility 特征，不追加第六维，也不污染持久 visibility memory；`velocity_into_unobserved` 同时读取该风险覆盖图。
+- terrain bank 不再按固定 iteration 切换。每个 bank 至少 95% 环境填满 10-episode success window 且 legacy/sru_ref success >= 0.90 后顺序切到下一 bank；迁移完成后清空 tracker，避免跨 bank 指标污染，最后一个 bank 不循环。
+- 32-env、1-iteration Isaac smoke 通过：obs `2896/6033`、SRU `80/144`、5D tokens、`use_dynamic_mask=false`；`bev_token_positive_rate=0.0797`，生成 46 MB `model_0.pt`。门控判定单测 4 项通过。
+
+---
+
+## 2026-09-16 MaskCNN32 小维度拼接消融
+
+- 用户决定及时停止 MaskCNN64-GatedAdd 正式训练；约 iteration 3310 停止，保留原日志和最新周期 checkpoint `model_3000.pt`，未产生最终评估结果。依赖 `model_5999.pt` 的旧评估队列同时取消。
+- 新增独立 `MaskCNN32-Concat-Encounter-RestoredRewards-Banks` train/dev/play 任务。mask+masked-depth CNN/self-attention 输出 32D，直接拼接到 SRU 输入，不使用门控相加和融合 LayerNorm；actor/critic SRU 输入 `112/176`，obs 仍 `7504/10641`。
+- 奖励、4 terrain banks、5 障碍分时激活、初始难度 1、100% 环境和 1.6 m 高度均继承刚停止的任务，只改变网络融合。32-env、1-iter smoke 通过并生成 `model_0.pt`；4 个纯 PyTorch 网络测试通过。
+- 正式训练从零启动：4096 env、6000 iterations、seed 72，run 为 `logs/rsl_rl/g1_instinct_navigation_ppo_vismap/2026-09-16_23-13-27_g1_sru_mask_cnn32_concat_hard_allenv_height16_v1/`。首轮约 1647 steps/s，`model_0.pt` 已生成且 168 个状态张量无非有限值；日志确认 obs `7504/10641`、SRU `112/176`、difficulty `1.0`、curriculum env fraction `1.0`。
+
+## 2026-09-15 评估成功率口径对齐 sru_ref
+
+- `source/instinct_nav/scripts/eval.py` 默认按 `sru_ref` evaluator 的方式读取每个结束环境在 `SuccessRateTracker` 中的最新记录，JSON 中标记为 `sru_ref_success_tracker_latest`。
+- `--sru_ref_success` 可显式声明该默认口径；旧参数名 `--legacy_tracker_success` 保留为兼容别名。
+- `--exclusive_outcome_success` 保留物理失败优先的排他 episode 判定，仅用于 tracker 审计和失败分析，不作为论文主成功率。
+- 因此 `model_5999.pt` 当前正式结果按 sru_ref 口径报告：静态 `85.47%`，动态难度 0 `84.09%`；同时保留 termination breakdown 说明稳定性失败来源。
+
+## 2026-09-15 MaskCNN64 门控相加消融
+
+- 新增 `MaskCNN64-GatedAdd-Encounter-RestoredRewards-Banks` train/dev/play 任务；初版复用完成的 128D concat run 的奖励和 encounter 时序，旧任务和 checkpoint 不变。
+- mask CNN 输出由 128D 降为 64D，经 actor/critic 独立 `64 -> 64` adapter 和初始值 0.1 的 sigmoid gate，分别残差加到对应 depth-attention 64D 后做 LayerNorm。
+- mask 不再扩张 SRU 输入：actor `208 -> 80`，critic `272 -> 144`，恢复 sru_ref 原始 recurrent 宽度；hidden 仍为 512，SRU 后 64D scene query 不变。
+- 新增 `Policy/mask_gate_actor`、`Policy/mask_gate_critic` 日志。5 个纯 PyTorch 测试通过；最终 32-env 1-iter smoke 确认 obs `7504/10641`、SRU `80/144` 并生成有限参数的 `model_0.pt`，首次更新后的 actor/critic gate 为 `0.0896/0.0911`（初始 `0.1`）。
+- 新任务进一步固定动态障碍难度为 `1.0`、覆盖 `100%` 环境，并将 5 个 cuboid 高度从 `0.8 m` 改为 `1.6 m`；首次 `1-2 s`、后续每 `1.5 s` 激活的时序不变。独立 32-env smoke 实测 `difficulty=1.0`、`curriculum_env_frac=1.0`，落盘尺寸均为 `0.5 x 0.5 x 1.6 m`。
+- 按原论文 Figure 3 的视觉语言重绘最新网络结构图，完整展示 depth backbone、MaskCNN64 gated-add、visibility-memory late query、actor SRU、训练期 privileged critic 与 frozen 低层控制器；输出 SVG/PDF/4K PNG 到 `docs/figures/mask_cnn64_gated_add_paper_architecture*`。
+- 正式训练已于 2026-09-15 启动：4096 env、6000 iterations、seed 72、从零训练，run `2026-09-15_11-24-02_g1_sru_mask_cnn64_gated_add_hard_allenv_height16_v1`。首轮生成 `model_0.pt`，早期吞吐约 1687 steps/s、显存约 56.4 GB；运行指标确认 difficulty 1.0、curriculum env fraction 1.0。
+- 2026-09-16 约 iter 2760：最近 100 轮训练窗口成功率约 0.603，满难度表现低于目标，姿态相关终止高于障碍碰撞。由于旧 run 在难度 0、部分环境和 0.8 m 几何上训练，不能用曲线差直接归因于网络。新增评估前置覆盖与队列脚本，在不暂停当前训练的条件下，待其结束后串行跑新旧模型的静态/同配置满难度评估，以及新模型 zero-mask 消融；脚本见 `scripts/eval_maskcnn64_controlled.sh`，结果将写入 `logs/eval_maskcnn64_controlled_20260916/`。
+- 评估队列的 8192 episodes 只覆盖 terrain bank 0（切换间隔为 1000 PPO iterations）；这是首轮受控诊断，不作为四个 terrain bank 的总体结论。
+
 ## 2026-08/09 动态障碍课程与分割 mask 工作
 
 **动态障碍避障课程（AvoidReact / Demote）**：在 `-Centerline-Unobserved-` 基础上叠加重平衡避障奖励（proximity −2.0 / approach −1.0 / 前瞻 TTC −0.5）+ 能力驱动分级课程（`dynamic_obstacles.py`）。
@@ -22,6 +80,29 @@
 - 新 task `-AvoidReact-DynamicMask-Banks-{v0,Dev,Play}`（`lambda_mask=0.2`），默认关、旧 task 逐字节不变。
 - 注意：原始 depth 是 **36×64**（共享低层相机 `height=36`），不是 40×64；`mask_input_dims=(1,36,64)`。旧 checkpoint `strict=True` 加载会因新增 mask 头 mismatch → DynamicMask 需从头训。
 - `train_senior.py`/`train.py` 的 `_to_legacy_obs` 已改为透传 `mask_label` 观测组（此前被丢弃导致 mask loss 恒 0）。
+- 2026-09-05 follow-up：mask bbox rasterizer 改为按 obstacle 循环、对全部 env/pixel 做 GPU 广播，移除 4096-env 下的 Python env 循环与 CUDA `.item()` 同步；同时增加屏幕相交检查。
+- 障碍历史容量由 `max_delay_depth + 1` 推导，并补存 `curriculum_envs` 历史；新增 `Loss/mask_pred_positive_rate` 与 `Loss/mask_soft_iou` 监控稀疏标签下的全背景塌缩。
+- 验证：32-env 4-iter smoke 中 label 正像素率从 0 增至 1.94%；4096-env 1-iter smoke 完成并产出 `model_0.pt`，吞吐 1047 steps/s（collection 24.47s / learning 38.10s）；非 mask 旧 task 回归 smoke 保持 2896/6033 obs 并通过。
+
+**DirectMask（2026-09-05，早期方案，现保留为消融）**：根据部署方案，将分割感知与导航控制解耦；训练时直接输入仿真 mask，部署时由 YOLO segmentation 提供。
+
+- 新增 `-AvoidReact-DirectMask-Banks-{v0,Dev,Play}`，mask 与 delayed depth 同帧，max-pool 到 `9 x 16` 后以 144 维 row-major 特征直接进入 actor/critic SRU。
+- 不实例化 `_DynamicMaskHead`，不创建 `mask_label` observation group，`lambda_mask=0`；actor/critic obs 为 `3040/6177`。
+- 训练 mask 模拟 YOLO 误差：8% frame dropout、5% positive-pixel dropout、false-positive blob、随机腐蚀/膨胀和最多 1 cell 平移；同一步 actor/critic 共享缓存结果。
+- 部署契约：YOLO mask 必须先与 depth 时间戳/FOV 对齐，合并需避让类别并二值化，再按相同方式降为 `9 x 16`。
+- 验证：32-env、1-iter smoke 通过；新增输入监控实测首轮 `clean_positive_rate=0`、扰动后 `input_positive_rate=1.09%`（false-positive 模拟已生效）。4096-env、1-iter smoke 产出 `model_0.pt`，吞吐 2326 steps/s（collection 20.98s / learning 7.19s），所有 `Loss/mask*` 为 0。obs manager 仅 5 groups，网络配置确认 `direct_mask`、`mask_head=None`、`lambda_mask=0`。
+- 同机参考：旧 CNN DynamicMask 的 4096-env 单轮为 1047 steps/s（collection 24.47s / learning 38.10s）；DirectMask 主要消除了分割 CNN 在 PPO 多轮更新中的开销。旧 DynamicMask 模式另跑 32-env 回归并通过。
+
+**DynamicMapMask（2026-09-05，修正后的推荐方案）**：用户确认目标不是把 mask 作为 standalone observation，而是让 visibility map 带入动态障碍信息。
+
+- 新增 `-AvoidReact-DynamicMapMask-Banks-{v0,Dev,Play}`。mask 与 delayed depth 同帧，用相同 camera -> world -> robot-local BEV 几何和 cell index 投影。
+- 原 5D DynamicMapCross token `[history_score,current_hit,current_depth,current_edge,visibility_delta]` 扩为 6D，在末尾追加 current-only `dynamic_presence`；`64 x 6=384`，actor/critic obs 为 `2960/6097`。
+- 动态通道按每个 `8 x 8` BEV patch 做 max-pool，明确不写入 persistent visibility history，防止移动物体留下旧位置残影。网络 history projector 仍只处理第 1 维，current projector 从 4 维泛化为 `scene_token_dim-1=5`。
+- 不使用 mask CNN、`mask_label` observation 或辅助 loss；训练时保留 frame/pixel dropout、false positive、腐蚀/膨胀与像素位移。YOLO 留到部署阶段，当前未实现。
+- 新增 `Metrics/dynamic_mask/bev_token_positive_rate`，并修复 direct-mask cache 命中时 clean/input 指标可能未恢复的问题。
+- 验证：py_compile 与 `git diff --check` 通过；32-env 新任务 smoke 为 `2960/6097`，BEV token 正率 3.34%，产出 `model_0.pt`；旧 5D 回归保持 `2896/6033` 并产出 `model_0.pt`；4096-env 新任务 smoke 产出 `model_0.pt`，1479 steps/s（collection 35.98s / learning 8.30s），BEV token 正率 2.92%，无 OOM。
+- DirectMask 与旧 CNN DynamicMask 均保留为命名 ablation，不覆盖已验证任务。
+- 2026-09-05 训练配置调整：关闭 `stair_centerline`（weight 0）；动态障碍从 iteration 0 开启；难度仅在 success >= 0.90 时增加 0.2；4 个 terrain bank 继续每 1000 PPO iteration 切换。任务 ID 增加 `NoCenterline`，避免配置名误导。
 
 ---
 
@@ -3054,3 +3135,441 @@ slightly between conditions.
 logs/rsl_rl/g1_instinct_navigation_ppo_vismap/2026-08-12_22-42-54_g1_sru_dynamic_map_cross_corridor_v1/eval_static_model_5999_1000ep.json
 logs/rsl_rl/g1_instinct_navigation_ppo_vismap/2026-08-12_22-42-54_g1_sru_dynamic_map_cross_corridor_v1/eval_dynamic_model_5999_1000ep.json
 ```
+
+
+## 2026-09-05 DynamicMapMask YOLOv9 + SAM deployment adapter
+
+- Added an optional article-aligned `YoloV9SamSegmentation` provider: GELAN-C boxes prompt SAM ViT-H masks. Training remains GT-mask based and does not import or execute either model.
+- RealSense RGB is registered to depth, converted from RGB to the BGR convention used by Ultralytics NumPy inputs, and carried in the synchronized `SensorPacket`.
+- Added deployment-equivalent DynamicMapMask token construction: `[history_score,current_hit,current_depth,current_edge,visibility_delta,dynamic_presence]`. Mask pixels and depth use the same stride, valid-depth gate, camera geometry, and BEV indices; `dynamic_presence` remains current-only.
+- ONNX export manifests now record `scene_token_layout`. A DynamicMapMask runtime refuses to start without a mask provider and refuses policy steps without RGB instead of silently feeding a zero mask.
+- Downloaded the article repositories and official weights locally (Git-ignored): `gelan-c.pt` and `sam_vit_h_4b8939.pth`; SHA256 values are recorded in `deploy/README.md` provenance notes. Added `deploy/requirements-yolo.txt`, CLI arguments, and RGB/mask debug dumps.
+- Real-weight smoke succeeded. At 480x270 on RTX PRO 6000, steady inference is about 0.33 s/frame (2.66 FPS), below the 5 Hz target. The synchronous backend is dry-run-only and rejects `--nodryrun` until perception is isolated from the 50 Hz control callback.
+
+## 2026-09-05 DynamicMapMask YOLO11-seg replacement
+
+- Replaced the two-stage GELAN-C + SAM ViT-H provider with single-stage Ultralytics `YOLO11s-seg`; training remains GT-mask based.
+- The deployment contract is unchanged: selected instance masks are unioned into one registered RGB mask, then projected with depth into current-only BEV `dynamic_presence` tokens.
+- Removed YOLOv9 repository, Segment Anything repository, and SAM checkpoint requirements from the active deploy path. The default local checkpoint is `artifacts/deploy_models/yolo11_seg/yolo11s-seg.pt`.
+- The provider remains blocked from powered `--nodryrun` use until synchronous latency is measured on target hardware or perception is isolated from the 50 Hz control callback.
+- Pinned `ultralytics==8.4.140`, downloaded the official 20 MB `yolo11s-seg.pt` checkpoint (SHA256 recorded in `deploy/README.md`), and isolated local verification in `.venv-yolo11` because Isaac Sim pins an incompatible `filelock` version.
+- Real-weight person-mask inference passed at the deployment RGB shape: binary `(270, 480)` output, 12.72% positive pixels on the test frame, and 25.62 ms/frame (39.03 FPS) on CPU after warm-up. GPU benchmarking was intentionally skipped while PPO training occupied the GPU.
+
+## 2026-09-06 DynamicMapMask recurrent fusion ablation
+
+- Added named `DynamicMapMask-RecurrentFusion-Banks` train/dev/play tasks without changing the running DynamicMapMask baseline or its `2960/6097` observation contract.
+- The sixth `dynamic_presence` channel gates a learned attention pool over the same `64 x 6` BEV tokens. A learned null token handles frames with no dynamic detections; the resulting 64D context enters both actor and critic SRUs.
+- Existing SRU-hidden scene query attention remains in place, so dynamic information has an early recurrent path for motion history and a late spatial path for immediate action selection.
+- Actor SRU input changes from 80D to 144D and critic SRU input from 144D to 208D. This ablation must train from scratch.
+- Updated the deployment checkpoint loader and ONNX actor exporter to detect and reproduce the recurrent-fusion branch.
+- CPU network checks passed for inference, PPO sequence shapes, dynamic-context sensitivity, backward gradients, checkpoint architecture detection, and ONNX parity (`max_abs=5.96e-08`). The Isaac smoke result is recorded in the following entry after the prior 8192-env baseline was stopped.
+
+## 2026-09-06 RecurrentFusion five-obstacle staggered training
+
+- Isolated the new schedule to the RecurrentFusion train/dev/play environment configs. Existing DynamicMapMask and older tasks retain their original obstacle behavior.
+- Each participating environment now owns five ray-castable obstacles at every difficulty. The first activates after a random `1–2 s` delay and the remaining four activate every `1.5 s`; difficulty no longer changes obstacle count.
+- Added per-obstacle activation state and delay history, so motion, collision distance, rewards, and delayed DynamicMapMask labels ignore obstacles that are still parked.
+- Added `Metrics/dynamic_obstacles/active_count_mean` to monitor the staggered schedule.
+- The 32-env, one-iteration Isaac smoke passed with actor/critic obs `2960/6097`, actor/critic SRU inputs `144/208`, nonzero DynamicMapMask rates, and a 50 MB `model_0.pt`. Saved config confirms `num_obstacles=5`, `spawn_interval_s=1.5`, and count scaling disabled.
+
+## 2026-09-07 MaskCNN with retained visibility BEV
+
+- Corrected MaskCNN to retain inherited 64 x 5 visibility patches and map-query attention. Dynamic masks use a separate 2 x 36 x 64 mask/masked-depth input, spatial CNN and positional attention, producing 128D before SRU.
+- Actor/critic observations are 7504/10641; SRU inputs are 208/272. Exploration inherits baseline settings; no auxiliary segmentation loss.
+- Added opt-in encounter-gated crossing activation, fixed five available slots, spacing/capacity/goal/terrain screening. This first version does not implement mixed encounter behaviors or guarantee full route feasibility.
+- CPU encounter test and network gradient check passed. 32-env one-update smoke produced `logs/rsl_rl/g1_instinct_navigation_mask_cnn_banks_dev/2026-09-07_10-59-55_mask_cnn_visibility_encounter_smoke/model_0.pt`.
+- Details: `docs/mask_cnn_visibility.md`. Fresh formal training and deployment adaptation remain required.
+
+## 2026-09-14 Restored-rewards evaluation and live diagnostic
+
+- Completed model_5999 static/dynamic-d0 evaluations for the September 11
+  restored-rewards run: 4096 environments and 8192 episodes per condition.
+  Legacy success: 85.4736% / 84.0942%; episode-outcome audit: 81.5186% /
+  79.6997%. Static/dynamic tracker missing writes: 878 / 1000. Historical
+  headline scores remain unchanged; the audit discrepancy requires repair.
+- Added opt-in live RGB, raw depth, contact-history and terrain-ray diagnostic
+  capture without pose replay. Diagnostic mode enables PhysX scene queries
+  and does not emit a shortened-run benchmark summary.
+- A 60-frame approximate ep_0010 reconstruction saved live imagery but did
+  not reproduce the original upward launch. Its PhysX records are invalid
+  because of a callback API mismatch. Fixed object-field access and explicit
+  callback-error propagation, plus the earlier camera CPU/CUDA device error.
+- Three diagnostic unit tests and the existing tracker-audit test pass;
+  edited Python modules compile and git diff whitespace check passes.
+  Runtime verification returned 45/45 terrain hits with maximum height delta
+  2.37e-6 m, but exposed stale first-frame scans and an early episode reset
+  after approximate manifest relocation. This is tool validation, not evidence
+  that the original failure area's geometry is correct.
+- No new training or changes to network, rewards, obstacle schedule, or
+  checkpoint files in this diagnostic phase. Evidence and next gates:
+  `docs/ep0010_diagnostic.md`.
+
+## 2026-09-15 exactly-once tracking and mask-zero ablation
+
+- Replaced termination-local success writes with one centralized pre-reset
+  classification in `NavigationEnv`: physical failures take precedence over
+  goal completion, and every finished episode writes exactly one tracker value.
+  A 32-episode Isaac evaluation and both 8192-episode formal ablations report
+  zero missing, multiple, stale, or disagreeing tracker records.
+- Added observable curriculum gates: instantaneous gate success, threshold,
+  check step, decision, mean success-window fill, and full-window fraction.
+  The 32-env PPO smoke retained actor/critic observations 7504/10641 and SRU
+  inputs 208/272, completed one update, and wrote a 56 MB `model_0.pt`.
+- Added `eval.py --zero_dynamic_mask_input`. Its corrected implementation runs
+  the normal mask/corruption path before zeroing the final input, preserving RNG
+  consumption. The initial early-return evaluation is explicitly invalid.
+- Corrected 4096-env, 8192-episode, seed-72 results: static 78.3936% with zero
+  mask versus 81.5186% normal; dynamic-d0 81.7017% zero versus 79.6997% normal.
+  In dynamic evaluation, zeroing raises obstacle collisions from 0.4761% to
+  1.0742%, while orientation failures fall from 12.2070% to 10.0098%.
+- Conclusion: the mask stream clearly contributes to avoidance, but direct
+  injection into the main SRU also perturbs navigation stability. The next
+  architecture should preserve dynamic recurrence behind a bounded residual or
+  late-fusion gate instead of deleting the mask input.
+
+## 2026-09-18 Dynamic mask cuboid geometry correction
+
+- Stopped the running NoMask hard-all-env control at iteration 935 on request. Its
+  logs and `model_500.pt` remain intact; no formal training was restarted.
+- Dynamic-mask rasterization now reads the cuboid XY half-width and Z half-height
+  from `DynamicObstacleManager`. The 1.6 m obstacle task previously projected a
+  0.8 m-tall mask because the label function defaulted to a 0.4 m half-height.
+  Explicit geometry overrides remain available.
+- The new geometry regression test passed in Isaac Sim. A 32-env, one-iteration
+  MaskCNN32 dev smoke completed with policy/critic obs `7504/10641` and saved
+  `model_0.pt` in the `mask_geometry_height_fix_smoke_20260918` run. The full
+  visual-packet test file still has one unrelated visibility-history assertion
+  failure with `decay=0.995`; the other two tests pass.
+
+## 2026-09-18 MaskCNN32 terrain-bank interval
+
+- Set the MaskCNN32 train/dev/play terrain-bank switch interval to 2000 PPO
+  iterations. NoMask control inherits the same schedule; older MaskCNN tasks
+  retain their 1000-iteration schedule.
+- The 32-env, one-iteration dev smoke saved `model_0.pt` and an `env.yaml` with
+  `terrain_bank_switch_interval: 2000` and `terrain_bank_env_steps_per_iteration: 16`.
+  Formal training remains stopped.
+
+## 2026-09-18 MaskCNN32 mask-geometry training restart
+
+- Audited the formal task after the mask-cuboid geometry fix. A 32-env, one-update
+  smoke completed and saved `model_0.pt`; actor/critic observations remain
+  `7504/10641` and actor/critic SRU inputs remain `112/176`.
+- Raised the MaskCNN32 runner default from 6000 to 8000 iterations so all four
+  terrain banks receive 2000 iterations each. Compared the new formal saved
+  configs with the September 16 run: the environment differs only in the
+  terrain-bank interval, and the agent differs only in max iterations and run
+  name. The mask geometry correction is in observation code, not serialized YAML.
+- Started a fresh 4096-env, seed-72, 8000-iteration W&B run:
+  `2026-09-18_20-04-44_g1_sru_maskcnn32_concat_maskfix_bank2000_hard_allenv_height16_v1`.
+  Dynamic obstacles enabled at iteration 0, `model_0.pt` exists, and training
+  continues in detached screen `maskcnn32_bank2000_v1`. Existing checkpoints
+  were not loaded or overwritten.
+
+## 2026-09-19 Legacy SRU success-rate restoration
+
+- Restored `Metrics/robot_goal/success_rate` to the original SRU write semantics:
+  timeout records success after any goal-radius visit, while goal/contact/pitch/
+  terrain/obstacle termination terms write their result independently. This
+  intentionally restores the historical metric, including possible multiple
+  writes for one episode when termination terms overlap.
+- Preserved the September 15 physical-failure-priority, exactly-once result in a
+  separate `Metrics/robot_goal/strict_success_rate` tracker. Network, rewards,
+  obstacle schedule, mask geometry, and terrain-bank configuration are unchanged.
+- Python compilation, three tracking/audit unit tests, a one-update smoke, and a
+  10-update smoke passed. Both metric tags are present and finite.
+- The prior mask-fix run was already no longer running and remains intact at
+  iteration 1277. Started a fresh 4096-env, 8000-iteration, seed-72 run named
+  `g1_sru_maskcnn32_concat_maskfix_bank2000_legacy_success_v1` in detached screen
+  `maskcnn32_legacy_success_v1` so one W&B curve never mixes metric definitions.
+
+## 2026-09-28 Human-scale navigation terrain
+
+- Added an isolated HumanScale20 rich-terrain configuration for G1. The tile
+  remains 30 m square, while the topology changes from `15x15 @ 2.0 m` to
+  `20x20 @ 1.5 m`; pit bridges are one cell wide instead of two.
+- Preserved the frozen low-level locomotion distribution: wall and stair
+  heights are unchanged, and variable stairs use 3-5 steps with 0.28-0.30 m
+  treads so the 1.5 m cell does not compress seven steps into unsafe treads.
+- Added NoBEV and 5D visibility-BEV train/dev/play task families. Network,
+  rewards, 3000-static + 2000-mixed50 obstacle schedule, and seed remain the
+  same as the completed controlled ablation.
+- Both 32-env one-update smoke tests passed and wrote `model_0.pt`. NoBEV kept
+  observations `2576/5713`; BEV kept `2896/6033`; both kept SRU inputs `80/144`.
+- Static zero-shot calibration on 1024 identical initial cases gave SRU-ref /
+  strict success of `77.83% / 77.05%` for the prior NoBEV model and
+  `75.49% / 74.90%` for the prior BEV model. This confirms usable headroom
+  without collapsing frozen low-level traversal; it is not the retrained result.
+
+## 2026-09-29 HardEncounterV2 dynamic-risk ablation
+
+- Stopped the prior HumanScale20 formal run without deleting its checkpoints.
+  Added a fixed three-stage schedule shared by all treatments: 1000 static
+  iterations, 1500 iterations with three local active obstacles at 0.35-0.75
+  m/s, then 2500 iterations with four at 0.45-1.0 m/s. All environments are
+  dynamic after the switch; six physical slots are recycled on fixed world
+  trajectories without pursuing the robot.
+- Added three isolated task families: pure NoBEV SRU, current-mask occupancy in
+  the original 5D visibility BEV, and a velocity-aware predicted-risk sector in
+  the same 5D BEV. The two BEV tasks retain observations `2896/6033`, token
+  shape `64x5`, and SRU inputs `80/144`; NoBEV remains `2576/5713` with the same
+  SRU inputs. No policy-network code or recurrent dimensions changed.
+- The sector branch uses delayed obstacle position and velocity aligned to the
+  visual packet, but renders a sector only when the corresponding corrupted GT
+  mask instance is visible. This avoids leaking invisible simulator state and
+  keeps dynamic risk current-only rather than writing moving-object trails into
+  persistent visibility memory.
+- UEREBot (arXiv:2602.07363) motivates prediction and explicit threat handling,
+  but its 0.5-4.0 m/s attacks are paired with 50 Hz prediction, a separate
+  reflex policy, continuous threat-aware handoff, and a CBF shield. This
+  ablation intentionally caps training at 1.0 m/s so it measures BEV
+  representation rather than the reaction limit of the approximately 5 Hz
+  high-level policy. Higher-speed sweeps and a fast reflex layer remain a
+  separate follow-up experiment.
+- Python compilation and all three 32-env, one-update smokes passed and saved
+  `model_0.pt`. Sector diagnostics were nonzero (`sector_positive_rate=0.0376`,
+  `visible_instances=1.2207`), confirming that delayed mask, tracking state, and
+  predicted risk are connected. Formal A/B/C runs use 4096 environments, seed
+  72, 5000 iterations each, W&B project `ablation_sru`, and run sequentially via
+  `scripts/run_hard_encounter_v2_ablation_sequential.sh`.
+
+## 2026-09-30 HardEncounterV3 learned temporal-BEV query fusion
+
+- Stopped the partial HardEncounterV2 sequential run and preserved all existing
+  logs/checkpoints. Added a separate V3 task family instead of changing V2.
+- Replaced V3 obstacle assets with six `0.5 m` diameter, `1.6 m` tall cylinders.
+  The V2 schedule, speeds, counts, rewards, geometric collision termination,
+  terrain, frozen low-level controller, and seed remain the controlled constants.
+- Replaced handcrafted 5D/sector tokens with a `6x32x32` observation containing
+  static visibility, current depth hit/depth, and three dynamic-mask BEV frames.
+  Past masks are ego-motion compensated and current-only; no GT obstacle velocity
+  or predicted risk sector is supplied to the policy.
+- A shared trainable CNN produces `8x8x64` learned spatial tokens. Actor and critic
+  independently query them using `SRU hidden + proprio/goal`, then fuse the 64D
+  result after their SRUs. Recurrent inputs remain the baseline `80/144`.
+- LearnedBEV observations are `8720/11857`; the paired NoBEV control remains
+  `2576/5713`. The learned path adds 238,288 parameters: 29,648 shared CNN/position,
+  71,488 actor query, 71,488 critic query, and 65,664 late-fusion input weights.
+- Python compilation and eight rsl_rl tests passed. Both 32-env one-update smokes
+  completed and saved `model_0.pt`; the learned smoke reported nonzero mask and
+  BEV rates, confirming the delayed mask-to-BEV path is active.
+- Added `scripts/run_hard_encounter_v3_learned_bev_ablation_sequential.sh` for the
+  future 4096-env, seed-72 NoBEV -> LearnedBEV controlled run.
+- Updated the final V3 schedule before formal training: each model now runs 6000
+  iterations, with 3000 static followed by 3000 dynamic iterations in an exact
+  50% environment cohort. Following review of the G1 navigation speed, V3 no
+  longer advances to a hard tier: all dynamic iterations use at most three active
+  cylinders per dynamic environment at `0.20-0.50 m/s`.
+- Re-ran the 32-env LearnedBEV smoke after the schedule change. It completed,
+  saved `model_0.pt`, and reported `curriculum_env_frac=0.5000` with
+  `hard_stage=1`, confirming the exact mixed cohort and shifted tier boundary.
+- Re-ran it again after removing the hard tier and lowering obstacle speed. The
+  saved config records both stage ranges as `0.20-0.50 m/s`, both capacities as
+  three, and an unreachable tier-2 iteration; runtime remained at
+  `curriculum_env_frac=0.5000`, `local_capacity=3`, and `hard_stage=1`.
+- Started the formal paired run in detached screen
+  `hard_v3_learned_bev_ablation`. NoBEV runs first as
+  `2026-09-30_09-56-26_hard_v3_cylinder_nobev_static3000_dynamic3000_mixed50_seed72`;
+  iteration 0 completed and wrote `model_0.pt`. The sequential script will start
+  LearnedBEV from scratch only after all 6000 NoBEV iterations complete.
+
+### 2026-10-05: Eval dynamic-obstacle perception and GIF audit
+
+- Found that the GIF visibility panel recomputed legacy visibility/scene-token
+  observations instead of reading the LearnedBEV policy's six-channel input.
+  Those calls also mutated the live visibility manager during evaluation.
+  Earlier LearnedBEV headline eval numbers must be rechecked with read-only
+  visualization; existing result files and checkpoints are preserved.
+- Fixed LearnedBEV visualization to read its observation cache and display S0,
+  S1, S2, D0, D1, D2. NoBEV no longer synthesizes maps/tokens in its GIFs.
+- Removed a second delay from the GIF depth pipeline: the shared visual packet
+  returned by `_get_noisy_depth_sample` is already noisy and delayed.
+- Snapshot/replay now saves and restores obstacle root poses and velocities,
+  alongside the robot, so cylinders do not disappear after episode reset.
+- Added opt-in debug-dump ray hit IDs using the actual GroupedRayCaster geometry,
+  plus the policy depth/BEV arrays. The 64-env dynamic audit recorded real
+  cylinder hits and nonzero dynamic policy inputs. At env 0, step 19, 211 camera
+  pixels hit cylinders and D0 contains 110 nonzero BEV cells. Current raw hits
+  and delayed BEV are intentionally different timestamps.
+- Evidence: `logs/perception_check_20261005/perception_evidence.png`, debug arrays,
+  and two full failure GIFs in that directory. No network, training configuration,
+  checkpoint, or previous evaluation artifact was changed. `py_compile` passed;
+  14 focused eval override/visualization tests passed.
+
+### 2026-10-05: MotionBEV query foundation (not formally trained)
+
+- Added new MotionBEVQuery and NoBEVRewardMatched HardV3 task families; existing
+  completed experiments keep their task/network defaults.
+- MotionBEV keeps six channels and 64D late query attention. Dynamic occupancy
+  history uses 0.4/0.8-second offsets instead of 0.2/0.4 at the actual 5 Hz policy
+  rate. A configurable history buffer is warped with ego motion and reset with
+  episodes. Native occupancy dilation changes from 7x7 to 3x3.
+- Opt-in spatial-preserving CNN uses strides 2/2/1, yielding a real 8x8 feature
+  grid from 32x32 instead of expanding a 4x4 grid back to 8x8. Legacy flag defaults
+  to false. Feature width, token count and parameter shapes are unchanged.
+- Both new tasks remove velocity_into_unobserved. All other HardV3 terrain,
+  obstacle, reward and formal 3000-static/3000-mixed50 settings are inherited.
+  The prediction auxiliary task remains pending scope confirmation; this change
+  does not add forecast labels, forecasting losses, or YOLO.
+- Validation: py_compile and diff-check passed, 29 focused tests passed (network
+  inference/gradients, temporal lag/cache, ego compensation, reset, eval). Two
+  32-env one-update PPO smokes completed with model_0.pt under
+  `logs/rsl_rl/g1_sru_motion_bev_hard_v3_dev/`. MotionBEV obs are 8720/11857;
+  NoBEV obs are 2576/5713. Both SRU inputs are 80/144, one layer, hidden size 512.
+  MotionBEV reported clean/input/BEV rates 0.0320/0.0235/0.0146; both smokes have
+  an exact 0.5 dynamic cohort and local capacity three.
+- Prepared `scripts/run_motion_bev_hard_v3_ablation.sh` with timestamped runs,
+  4096 envs, seed 72, WandB ablation_sru. No formal training was launched.
+
+### 2026-10-05: Confirmed future occupancy auxiliary task
+
+- Added the separate MotionBEVFuture-HardV3 task family without changing the
+  previously registered MotionBEVQuery or completed baseline task definitions.
+- Actor BEV CNN is shared with a training-only, 41,042-parameter occupancy
+  decoder for 0.4/0.8-second horizons. Actor/critic obs remain 8720/11857; SRU
+  input remains 80/144, hidden size 512, one layer, with late query fusion.
+- Added a 27D teacher observation group and forwarded it through both legacy
+  training wrappers to PPO storage, never into actor or critic inputs. Labels
+  come from actual future cylinder positions, not velocity extrapolation, in
+  the source robot frame. Only source-observed objects intersecting the local
+  BEV are tracked. Reset-crossing/recycled slots and rollout tails are excluded.
+- Pure static/unobserved samples do not train the forecast head. Training uses
+  coefficient 0.05, positive-weight-20 BCE + Dice, and 256 source samples per
+  PPO minibatch. Sparse teacher storage and on-demand rasterization avoid
+  allocating dense full-rollout future labels. PPO update returns are unchanged.
+- Added Loss/future_* and Metrics/future/* logs. Valid fraction is conditional
+  on sampled source-observed windows, not all environments/steps.
+- Smoke uncovered and fixed two integration issues: static initialization
+  returns a zero-length detector instance list, and training wrappers initially
+  filtered out the new teacher group. Failed smoke artifacts were retained.
+- Final 32-env, two-update smoke completed at
+  `logs/rsl_rl/g1_sru_motion_bev_hard_v3_dev/2026-10-05_16-35-53_motion_bev_future_smoke_final_20261005/`,
+  saved model_0.pt/model_1.pt. Iteration-1 future loss 1.564459, label positive
+  rate 0.010093, prediction positive rate 0.013782, soft IoU 0.018076, validity
+  0.963477. These are integration checks, not evidence of final learning benefit.
+- Validation: 41 focused tests passed, py_compile, shell syntax and diff-check
+  passed. Tests cover geometry/yaw/source-frame alignment, source visibility,
+  recycle/reset boundaries, static loss gating, wrapper forwarding, actor-only
+  forecast gradients, legacy signatures, temporal BEV/cache and older networks.
+- Prepared `scripts/run_motion_bev_future_hard_v3.sh`: 4096 envs, 6000 updates,
+  seed 72, WandB ablation_sru, timestamped run/log. Formal training has not
+  started. Export of the forecast-enabled checkpoint remains unverified.
+
+### 2026-10-05: MotionBEVFuture formal launch preflight
+
+- Rechecked saved configs and reran the integration tests. The obstacle setup
+  matches the completed LearnedBEV run: collision forces are disabled, while
+  geometric obstacle_collision termination is enabled. This is not physical
+  cylinder contact; retaining it avoids changing the obstacle treatment in this
+  experiment. No old run or checkpoint was overwritten.
+- First formal startup saved model_0.pt but exposed a WandB logging defect:
+  metadata/scalar calls committed the step before other same-iteration metrics.
+  TensorBoard remained intact. Stopped that startup and retained its artifacts
+  (`...seed72_20261005_173010`) instead of continuing with incomplete online logs.
+- Fixed WandbSummaryWriter to accumulate metadata, scalars and videos with
+  commit=False, advancing on the next iteration. Added a regression test for
+  same-step metrics and unchanged TensorBoard writes; all 42 focused tests pass.
+- Restarted from scratch in detached screen motion_bev_future_20261005_fixed,
+  using the unchanged task, 4096 envs, seed 72 and 6000 iterations. Background
+  stdout is now unbuffered; log is
+  logs/background/motion_bev_future_static3000_dynamic3000_mixed50_seed72_20261005_173708.log.
+- Restart verification: iteration 0 completed, model_0.pt saved in
+  logs/rsl_rl/g1_sru_motion_bev_hard_v3/2026-10-05_17-40-58_motion_bev_future_static3000_dynamic3000_mixed50_seed72_20261005_173708/.
+  Actor/critic obs 8720/11857; initial value loss 0.777386, noise std 0.991084,
+  future loss 0 and obstacles disabled as required by the static phase. WandB
+  run ID 0ayx5lay; no same-step discard warnings in the restarted startup.
+
+### 2026-10-08: MotionBEVFuture completed and evaluation launched
+
+- Completed 6000 updates; model_5999.pt saved at 01:03. Final 100-update
+  training means: overall success 0.74128, static 0.84205, dynamic 0.63372,
+  strict success 0.66918, obstacle_collision 0.10435, future soft IoU 0.12972.
+  Training-window values are not headline evaluation results.
+- Added scripts/eval_motion_bev_future.sh for separate static and dynamic100
+  evaluations: 4096 envs, 19200 episodes each, SRU-ref tracker success. Then
+  collect ten full failure GIFs per condition using separate 64-env runs.
+  Uses the formal task terrain, not the reduced Play terrain.
+- Fixed future-task inference: retain the prediction head for strict checkpoint
+  loading, but set lambda_future=0 and remove future_teacher observations.
+  Evaluation does not train or use privileged future states for policy actions.
+- Found that the older eval --seed did not seed the custom terrain generator.
+  Added opt-in --terrain_seed without changing existing default behavior. New
+  runs explicitly set environment/terrain seeds 72/72. Earlier evaluation files
+  without controlled terrain seeds are not a paired comparison for this run.
+- Retained the initial unseeded startup in logs/motion_bev_future_eval_20261008;
+  stopped it before episode aggregation. Seeded evaluation runs in detached
+  screen motion_bev_future_eval_seeded_20261008; output directory
+  logs/motion_bev_future_eval_seeded_20261008, orchestration log
+  logs/background/motion_bev_future_eval_seeded_20261008.log.
+- Validation: 17 eval override/visualization tests passed; py_compile, shell
+  syntax and diff-check passed. Do not alter cylinder collision behavior in eval.
+- Startup verified: strict model loading succeeded at checkpoint iteration 5999,
+  dynamic obstacles explicitly disabled for the static case, and the 4096-env
+  evaluation loop started. GPU utilization sampled at 83%; final statistics and
+  GIF collection remain pending in the detached sequence.
+
+### 2026-10-08: Evaluation statistics-only visualization fix and retry
+
+- At 11:01 the seeded eval process/screen had exited with no summary JSON and
+  no Python traceback. Container memory.events records one OOM kill, but provides
+  no timestamp/process identity; the exact exit cause is not established.
+- Found a definite avoidable cost: default include_observations rendered and
+  cached panels for every one of 4096 environments even without visual outputs.
+  Both eval loops now create panels only when a GIF/RGB/local-map consumer exists.
+  Failure GIF collection remains enabled and separate from headline statistics.
+- Changed progress printing from exact modulo matching to threshold crossings,
+  so batches of finished episodes cannot skip every progress message.
+- Validation: 18 focused tests pass, py_compile, shell syntax and diff-check pass.
+  Restarted unchanged evaluation conditions in detached screen
+  motion_bev_future_eval_retry_20261008. Output logs/motion_bev_future_eval_retry_20261008;
+  orchestration log logs/background/motion_bev_future_eval_retry_20261008.log now
+  records the sequence exit status. Earlier startup logs are preserved.
+
+### 2026-10-08: Completed evaluation and spatial temporal BEV ablation
+
+- Previous MotionBEVFuture evaluation completed: 19,200 episodes per condition,
+  SRU-reference success static 0.837396 and dynamic100 0.618229; ten complete
+  failure GIFs each in logs/motion_bev_future_eval_retry_20261008. Historical
+  unseeded-terrain results do not establish a strictly paired benefit.
+- Added separate MotionBEVConvLSTM-HardV3-OfficialParkour task family, without
+  starting formal training or changing existing task architectures/checkpoints.
+- Actor static CNN preserves spatial features. Dynamic D0/D1/D2 use a small
+  CNN and one 32-channel 8x8 ConvLSTM with ego-warped hidden/cell states. Its
+  projected 64-channel features join static features before unchanged query
+  fusion. Future decoding uses only temporal dynamic features. Critic is unchanged.
+- Actor gains three odometry values used only for spatial warp (8723/11857
+  observations); navigation SRU stays 80/144, one 512D layer. Adds 91,072
+  trainable parameters. Exact simulation pose must be replaced by measured
+  odometry for deployment; ONNX/deployment validation remains separate work.
+- PPO stores spatial initial states and replays sequences, including episode
+  resets, for both navigation and actual-future occupancy supervision. No
+  independent-frame ConvLSTM loss. Auxiliary replay deduplicates sampled envs
+  and does not alter online hidden states. Existing PPO return signature retained.
+- Rewards, cylinder geometry/collision semantics, terrain and formal curriculum
+  remain 3000 static + 3000 mixed50. First 32-env smoke completed an update,
+  saved model_0.pt, and logged nonzero future loss / positive labels. Final
+  two-update smoke saved model_0.pt/model_1.pt; CNN, ConvLSTM and decoder weights
+  all updated. Independent actor/critic state storage avoids dummy critic states;
+  an additional 32-env smoke verified that storage path and saved model_0.pt in
+  logs/rsl_rl/g1_sru_motion_bev_hard_v3_dev/2026-10-08_13-58-23_convlstm_storage_validation_20261008/.
+- Validation: 51 focused regression/unit tests passed, including online/replay
+  equality, warp geometry, resets, navigation gradients, forecasting history
+  gradients, dynamic-only supervision and real PPO updates. py_compile and
+  diff-check passed. Formal training remains unstarted; smoke is not evidence
+  of a navigation-performance gain.
+
+### 2026-10-08: ConvLSTM formal training started
+
+- User authorized training. GPU was idle and no other train/eval process was
+  active. Added scripts/run_motion_bev_convlstm_hard_v3.sh and started detached
+  screen motion_bev_convlstm_20261008 at 15:24:06 local time.
+- Task MotionBEVConvLSTM-HardV3-OfficialParkour-v0, from zero (no resume):
+  4096 envs, 6000 updates, seed 72, 3000 static then 3000 mixed50; rewards,
+  terrain and cylinder settings unchanged. WandB ablation_sru, run maf3gdnr.
+- Run directory:
+  logs/rsl_rl/g1_sru_motion_bev_hard_v3/2026-10-08_15-28-36_motion_bev_convlstm_static3000_dynamic3000_mixed50_seed72_20261008_152406/.
+  Stdout logs/background/motion_bev_convlstm_static3000_dynamic3000_mixed50_seed72_20261008_152406.log.
+- Startup verified actual actor/critic obs 8723/11857 and SRU inputs 80/144.
+  PPO update 0 completed in 41.09 s and saved model_0.pt; obstacle enabled and
+  active count metrics both zero, as required during the static phase. This is
+  startup validation only; early training metrics are not performance evidence.

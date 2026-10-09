@@ -53,6 +53,8 @@ class OnboardConfig:
     command_max: tuple[float, float, float] = (1.0, 0.0, 1.0)
     visibility_decay: float = 1.0
     visibility_score_alpha_up: float = 0.15
+    scene_token_layout: str = "scene_risk"
+    """One of scene_risk, dynamic_map_cross, or dynamic_map_mask."""
     camera: CameraConfig = CameraConfig()
     layout: ObservationLayout = ObservationLayout()
 

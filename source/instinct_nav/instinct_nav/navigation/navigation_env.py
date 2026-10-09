@@ -8,9 +8,12 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import torch
+
 from isaaclab.envs import ManagerBasedRLEnv
 
 from instinct_nav.navigation.mdp.delay_manager import ObservationDelayManager
+from instinct_nav.navigation.success_tracking import classify_navigation_success
 
 if TYPE_CHECKING:
     from instinct_nav.navigation.navigation_env_cfg import NavigationEnvCfg
@@ -42,3 +45,19 @@ class NavigationEnv(ManagerBasedRLEnv):
 
         # Now load all other managers
         super().load_managers()
+
+    def _reset_idx(self, env_ids):
+        """Record the strict outcome separately from the legacy SRU success metric."""
+        if hasattr(self, "termination_manager") and hasattr(self, "command_manager"):
+            ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
+            result_ids, results = classify_navigation_success(
+                self.termination_manager._term_dones,
+                list(self.termination_manager.active_terms),
+                ids,
+            )
+            if result_ids.numel() > 0:
+                goal = self.command_manager._terms.get("robot_goal")
+                tracker = getattr(goal, "strict_success_tracker", None)
+                if tracker is not None:
+                    tracker.record_values(results, result_ids)
+        super()._reset_idx(env_ids)
